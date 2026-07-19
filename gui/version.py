@@ -1,4 +1,4 @@
 #!/usr/bin/python3
 """Single package-version source for every Python component."""
 
-VERSION = "1.8.0-27"
+VERSION = "1.8.0-28"

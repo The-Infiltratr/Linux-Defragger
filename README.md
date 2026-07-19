@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-27
+# Linux Defragger 1.8.0-28
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -11,7 +11,9 @@ The user-visible operations are deliberately separate:
 
 ## EXT4 Compact boundary
 
-EXT4 Compact packs movable regular-file extents into lower free ranges. An unmounted EXT4 filesystem still has physically allocated block-group descriptors, bitmaps, inode tables, journal blocks and directory data. Those structures are part of the filesystem format rather than activity caused by mounting, and the kernel regular-file extent-exchange interface cannot relocate all of them. The allocation map therefore identifies them separately as reserved or directory allocation instead of claiming that every physical gap can be removed at the existing filesystem geometry.
+EXT4 Compact packs movable regular-file extents into lower free ranges. The privileged collector counts `f_bfree`, so it includes EXT4's root-reserved free-block pool instead of leaving those blocks as unreachable white gaps. It still leaves a 64 MiB safety floor for journal and extent-tree metadata work, and its fallocate retry path backs off if the filesystem cannot provide every reported block.
+
+An unmounted EXT4 filesystem still has physically allocated block-group descriptors, bitmaps, inode tables, journal blocks and directory data. Those structures are part of the filesystem format rather than activity caused by mounting, and the kernel regular-file extent-exchange interface cannot relocate all of them. The allocation map identifies them as **Filesystem metadata/reserved** or directory allocation. Metadata colour is blended according to the proportion of each sampled cell, so one metadata block no longer turns an entire multi-block map pixel black.
 
 
 ## FAT and exFAT Growth Defrag
@@ -56,9 +58,9 @@ Each ext4 move uses `EXT4_IOC_MOVE_EXT`; each supported XFS move uses the atomic
 
 During ext4/XFS Compact, each completed exchange sends a physical source/destination range to the GUI. The cached allocation samples are updated and redrawn immediately without rereading the raw device. This live view shows used/free movement; the exact fragmentation overlay is deliberately rebuilt by the final read-only analysis because a compact move may split a file.
 
-EXT filesystems contain fixed structures distributed through block groups. The analyser marks known superblock/descriptor areas, block and inode bitmaps, inode tables, and low-numbered system-inode allocations as **Bad/reserved**, while directory extents remain purple. These allocations can remain as islands inside the free tail because the online regular-file extent-exchange interface cannot relocate them. Compact therefore packs all movable regular-file data as low as those fixed structures permit rather than claiming that every allocated block can be made contiguous.
+EXT filesystems contain fixed structures distributed through block groups. The analyser marks known superblock/descriptor areas, block and inode bitmaps, inode tables, and low-numbered system-inode allocations as **Filesystem metadata/reserved**, while directory extents remain purple. The renderer blends these categories by cell density rather than painting a whole cell from a single metadata block. These allocations can remain as islands inside the free tail because the online regular-file extent-exchange interface cannot relocate them. Compact nevertheless includes the privileged free-block reserve and packs all movable regular-file data as low as those fixed structures permit.
 
-Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses filtered native balance transactions to relocate high physical chunks into lower unallocated device gaps. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each balance transaction and stops if the allocator no longer moves the boundary.
+Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses a native online shrink-and-restore transaction to force high physical chunks below a temporary boundary, then restores the original filesystem size. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each resize cycle and stops when the chunk boundary no longer improves.
 
 ### FAT and exFAT Compact semantics
 

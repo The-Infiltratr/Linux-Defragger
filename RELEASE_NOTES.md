@@ -1,4 +1,10 @@
-# Linux Defragger 1.8.0-27
+# Linux Defragger 1.8.0-28
+
+- Fixes EXT4 Compact leaving the filesystem's root-reserved free blocks as white holes. The privileged collector now uses `f_bfree` (all free blocks) instead of `f_bavail` (only blocks available to an unprivileged process), while retaining the 64 MiB transaction-safety floor.
+- Reports how much privileged reserve was included in each collector pass, so the operation log shows when those formerly unreachable gaps are being used.
+- Corrects the allocation-map rendering of EXT metadata. A cell containing a small amount of bitmap, inode-table or journal allocation is now blended by density instead of being painted entirely black.
+- Renames the map category from **Bad/reserved** to **Filesystem metadata/reserved** and updates the tooltip, avoiding the false implication that normal EXT metadata is damaged.
+- Adds regression coverage proving that the collector targets `f_bfree` rather than `f_bavail`, and preserves the existing fallocate back-off safety path.
 
 - Restores the native Compact command-line parser that was accidentally omitted from revision 26. EXT4, XFS and Btrfs Compact can again accept the GUI command ABI instead of failing immediately with `NameError: parse_args is not defined`.
 - Adds a regression test that executes the exact argument sequence sent by the GUI, so the native Compact engine cannot be packaged without its parser again.
@@ -14,7 +20,7 @@
 - Uses the collector's already allocated low extents directly as exchange donors for both ext4 and XFS. No hole punch or second `fallocate` is performed after the collector pass.
 - Preserves the collector file descriptor, logical offset and physical offset for every reserved range and re-verifies that mapping immediately before each exchange.
 - Copies staged file data into the exact collector logical range, passes the nonzero donor offset to `EXT4_IOC_MOVE_EXT` or `XFS_IOC_EXCHANGE_RANGE`, and leaves the old high extent owned by the collector until final cleanup.
-- Raises the untouched free-space floor from 4 MiB to 64 MiB and uses `f_bavail` accounting, leaving room for filesystem metadata and kernel transactions.
+- Raises the untouched free-space floor from 4 MiB to 64 MiB. Revision 28 later corrects the collector accounting from `f_bavail` to `f_bfree` so root-reserved EXT4 blocks are included.
 - Adds focused regression tests for collector mapping preservation, nonzero donor offsets, direct-donor request packing and the absence of the failed second-allocation path.
 
 # Revision 23

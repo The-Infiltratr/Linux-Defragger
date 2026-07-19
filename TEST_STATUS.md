@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-27 test status
+# Linux Defragger 1.8.0-28 test status
 
 Passed focused tests:
 
@@ -9,10 +9,12 @@ Passed focused tests:
 - Single-pass Btrfs inode/file-extent and extent/metadata tree scans.
 - Existing Btrfs synthetic allocation and fragmentation analysis.
 - Existing EXT4/XFS collector, donor-offset, live-map and fixed-point planner tests.
+- EXT4 collector accounting uses total `f_bfree` blocks and includes the privileged reserve while retaining its transaction floor.
+- GUI metadata rendering blends by density and labels normal filesystem structures separately from bad media.
 
 Physical EXT4 and Btrfs write-path validation remains dependent on the removable-media test volumes.
 
-# Test status for 1.8.0-27
+# Test status for 1.8.0-28
 
 Validated in this build environment:
 
@@ -22,7 +24,7 @@ Validated in this build environment:
 - Python syntax checks for the native compact engine, GUI and privileged helper.
 - Existing synthetic Btrfs and XFS analyser tests, including corrected Btrfs leaf offsets and multi-level XFS trees.
 - Existing focused FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper, Growth Defrag and GUI tests remain present.
-- Unified version reporting and package metadata identify revision `1.8.0-27`.
+- Unified version reporting and package metadata identify revision `1.8.0-28`.
 
 
 Revision-24 regression coverage additionally validates:

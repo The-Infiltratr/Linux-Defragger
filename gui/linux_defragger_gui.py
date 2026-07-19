@@ -315,21 +315,31 @@ class DiskMap(Gtk.DrawingArea):
 
     def _cell_colour(self, cell: dict[str, int]) -> tuple[float, float, float]:
         known_total = max(1, cell["free"] + cell["used"])
-        if cell.get("bad", 0):
-            return self.COLORS["bad"]
-        if cell.get("fragmented", 0):
-            density = cell["fragmented"] / known_total
-            return self._mix(self.COLORS["used"], self.COLORS["fragmented"], 0.55 + 0.45 * density)
-        if cell.get("directory", 0):
-            density = cell["directory"] / known_total
-            return self._mix(self.COLORS["used"], self.COLORS["directory"], 0.45 + 0.45 * density)
         used_ratio = cell["used"] / known_total
-        known_colour = self._mix(self.COLORS["free"], self.COLORS["used"], used_ratio)
+        colour = self._mix(self.COLORS["free"], self.COLORS["used"], used_ratio)
+
+        # Overlay categories according to how much of the sampled cell they
+        # actually occupy.  The former any-nonzero rule painted an entire map
+        # pixel black when only one of its many filesystem blocks was metadata,
+        # greatly exaggerating ext4's distributed inode tables and bitmaps.
+        directory = cell.get("directory", 0)
+        if directory:
+            colour = self._mix(colour, self.COLORS["directory"],
+                               min(1.0, (directory / known_total) ** 0.5))
+        fragmented = cell.get("fragmented", 0)
+        if fragmented:
+            colour = self._mix(colour, self.COLORS["fragmented"],
+                               min(1.0, (fragmented / known_total) ** 0.5))
+        metadata = cell.get("bad", 0)
+        if metadata:
+            colour = self._mix(colour, self.COLORS["bad"],
+                               min(1.0, (metadata / known_total) ** 0.5))
+
         unknown = cell.get("unknown", 0)
         total = cell["free"] + cell["used"] + unknown
         if unknown and total:
-            return self._mix(known_colour, self.COLORS["unknown"], unknown / total)
-        return known_colour
+            colour = self._mix(colour, self.COLORS["unknown"], unknown / total)
+        return colour
 
     def _draw(self, widget: Gtk.Widget, cr: Any) -> bool:
         allocation = widget.get_allocation()
@@ -387,7 +397,7 @@ class DiskMap(Gtk.DrawingArea):
         tooltip.set_text(
             f"{self.unit_label.capitalize()} {cell['start']:,}–{cell['end']:,}\n"
             f"Used {cell['used']:,} · Free {cell['free']:,} · Unknown {cell.get('unknown', 0):,}\n"
-            f"Fragmented {cell['fragmented']:,} · Directory {cell['directory']:,} · Bad {cell.get('bad', 0):,}"
+            f"Fragmented {cell['fragmented']:,} · Directory {cell['directory']:,} · Metadata/reserved {cell.get('bad', 0):,}"
         )
         return True
 
@@ -576,7 +586,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Fragmented", DiskMap.COLORS["fragmented"]),
             ("Directory", DiskMap.COLORS["directory"]),
             ("Unknown", DiskMap.COLORS["unknown"]),
-            ("Bad/reserved", DiskMap.COLORS["bad"]),
+            ("Filesystem metadata/reserved", DiskMap.COLORS["bad"]),
         ):
             item = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
             swatch = Gtk.DrawingArea()

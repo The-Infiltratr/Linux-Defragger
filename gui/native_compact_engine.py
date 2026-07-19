@@ -57,6 +57,10 @@ from version import VERSION  # noqa: E402
 EXIT_STOPPED = 130
 MAX_TRANSACTION_BYTES = 256 * 1024 * 1024
 COPY_BUFFER = 8 * 1024 * 1024
+# Keep enough unallocated blocks for extent-tree splits, journal credits and
+# filesystem housekeeping while the collector owns the rest of the free map.
+# The collector runs as root, so it must count f_bfree (all free blocks), not
+# f_bavail (only the blocks offered to an unprivileged process).
 COLLECTOR_FLOOR = 64 * 1024 * 1024
 MAX_NO_PROGRESS = 8
 MAX_EXTENT_COMPACT_PASSES = 32
@@ -304,7 +308,13 @@ class SpaceCollector:
         current = 0
         while True:
             stats = os.statvfs(self.mountpoint)
-            available = stats.f_bavail * stats.f_frsize
+            # Compact is executed by the privileged helper.  f_bavail excludes
+            # ext4's root-reserved pool and previously left those blocks as
+            # visible white holes that could never be selected as destinations.
+            # f_bfree is the total free-block count; fallocate remains the final
+            # authority and the retry loop safely backs off when a filesystem
+            # cannot make every reported block available to this file.
+            available = stats.f_bfree * stats.f_frsize
             target = max(0, available - COLLECTOR_FLOOR)
             target -= target % self.block_size
             if target < self.block_size:
@@ -695,15 +705,26 @@ def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
     result = ExtentPassResult()
     collector = SpaceCollector(mountpoint, block_size)
     try:
+        before = os.statvfs(mountpoint)
+        total_free_before = before.f_bfree * before.f_frsize
+        ordinary_free_before = before.f_bavail * before.f_frsize
+        privileged_reserve = max(0, total_free_before - ordinary_free_before)
         allocated, collector_ops = collector.fill_available()
         gaps = collector.owned_extents(device_bytes)
         total_target = sum(item.length for item in gaps)
         print(
             f"{filesystem.upper()} Compact pass {pass_number}: temporary space collector "
-            f"mapped {allocated / (1024**3):.2f} GiB of accessible free space in "
+            f"mapped {allocated / (1024**3):.2f} GiB of total free space in "
             f"{collector_ops} fallocate operations and {len(gaps):,} physical ranges.",
             flush=True,
         )
+        if privileged_reserve:
+            print(
+                f"The collector included up to {privileged_reserve / (1024**3):.2f} GiB "
+                "from the filesystem's privileged reserve instead of leaving it as "
+                "unusable low-map gaps.",
+                flush=True,
+            )
         print(
             "Compact will exchange file mappings directly with those reserved low ranges; "
             "it will not allocate a second donor file.",
@@ -925,10 +946,11 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
     if final_reason:
         print(f"Compaction reached its current online boundary: {final_reason}.", flush=True)
     print(
-        "All movable regular-file extents have been packed as low as the filesystem's "
-        "fixed metadata and directory allocations permit. Remaining islands in the free "
-        "tail can be directories, journals, allocation metadata, inode structures or "
-        "other mappings that the online extent-exchange interface cannot relocate.",
+        "All movable regular-file extents, including moves into ext4's privileged "
+        "free-block reserve, have been packed as low as the filesystem's fixed metadata "
+        "and directory allocations permit. Remaining allocated islands in the free tail "
+        "are filesystem structures or mappings that EXT4_IOC_MOVE_EXT/XFS exchange "
+        "cannot relocate.",
         flush=True,
     )
     print("100.00 percent completed", flush=True)

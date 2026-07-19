@@ -117,6 +117,40 @@ def test_gui_and_helper_dispatch_are_wired():
     assert 'native-compact-engine' in helper
 
 
+def test_collector_uses_total_free_blocks_including_privileged_reserve():
+    collector = object.__new__(n.SpaceCollector)
+    collector.block_size = 4096
+    collector.mountpoint = '/fake'
+    collector._new_unlinked_file = lambda _prefix: 7
+    allocations = []
+    collector._fallocate = lambda fd, mode, offset, length: allocations.append(
+        (fd, mode, offset, length)
+    )
+
+    class Stats:
+        def __init__(self, free, available):
+            self.f_bfree = free
+            self.f_bavail = available
+            self.f_frsize = 4096
+
+    responses = iter((Stats(10, 2), Stats(1, 1)))
+    original_statvfs = n.os.statvfs
+    original_fsync = n.os.fsync
+    original_floor = n.COLLECTOR_FLOOR
+    try:
+        n.os.statvfs = lambda _path: next(responses)
+        n.os.fsync = lambda _fd: None
+        n.COLLECTOR_FLOOR = 4096
+        allocated, transactions = collector.fill_available()
+    finally:
+        n.os.statvfs = original_statvfs
+        n.os.fsync = original_fsync
+        n.COLLECTOR_FLOOR = original_floor
+
+    assert allocated == 9 * 4096
+    assert transactions == 1
+    assert allocations == [(7, 0, 0, 9 * 4096)]
+
 def test_collector_extents_keep_fd_and_logical_offsets():
     collector = object.__new__(n.SpaceCollector)
     collector.fds = [17]
