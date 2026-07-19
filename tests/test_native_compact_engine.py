@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -264,25 +265,68 @@ def test_extent_compactor_repeats_until_fixed_point_and_gui_applies_live_ranges(
     assert 'fragmentation recalculated at completion' in gui
 
 
-def test_btrfs_compact_uses_resize_not_balance():
+def test_btrfs_compact_uses_balance_then_resize():
     source = (ROOT / 'gui' / 'native_compact_engine.py').read_text()
     assert 'BTRFS_IOC_RESIZE' in source
-    assert 'BTRFS_IOC_BALANCE_V2' not in source
-    assert 'online shrink-and-restore transaction' in source
+    assert 'BTRFS_IOC_BALANCE_V2' in source
+    assert '_run_btrfs_balance' in source
+    assert 'balance-and-shrink repack' in source
     targets = n._candidate_shrink_targets(15 * 1024**3, 1024**3, 22 * 1024**3)
     assert targets and all(15 * 1024**3 < value < 22 * 1024**3 for value in targets)
     assert targets == sorted(targets, reverse=True)
+    request = n._btrfs_balance_request(7, 100)
+    assert len(request) == 1024
+    assert struct.unpack_from('=Q', request, 0)[0] == (
+        n.BTRFS_BALANCE_DATA | n.BTRFS_BALANCE_METADATA
+    )
+    for offset in (n.BTRFS_BALANCE_DATA_OFFSET, n.BTRFS_BALANCE_META_OFFSET):
+        assert struct.unpack_from('=Q', request, offset + 8)[0] == 100
+        assert struct.unpack_from('=Q', request, offset + 16)[0] == 7
+        assert struct.unpack_from('=Q', request, offset + 64)[0] == (
+            n.BTRFS_BALANCE_ARGS_USAGE | n.BTRFS_BALANCE_ARGS_DEVID
+        )
 
 
 
+def test_btrfs_balance_worker_reports_progress():
+    original_ioctl = n.fcntl.ioctl
+    original_stop = n._stop_requested
+    progress_calls = 0
 
-def test_ext4_compact_shrinks_to_minimum_then_restores_original_size():
+    def fake_ioctl(fd, request_code, request, mutate=True):
+        nonlocal progress_calls
+        assert fd == 17
+        if request_code == n.BTRFS_IOC_BALANCE_V2:
+            time.sleep(0.08)
+            return 0
+        if request_code == n.BTRFS_IOC_BALANCE_PROGRESS:
+            progress_calls += 1
+            struct.pack_into('=QQQ', request, n.BTRFS_BALANCE_PROGRESS_OFFSET, 4, 4, min(4, progress_calls))
+            return 0
+        raise AssertionError(hex(request_code))
+
+    try:
+        n.fcntl.ioctl = fake_ioctl
+        n._stop_requested = False
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert n._run_btrfs_balance(17, 1, 1)
+    finally:
+        n.fcntl.ioctl = original_ioctl
+        n._stop_requested = original_stop
+    assert progress_calls >= 1
+    assert 'Btrfs data/metadata balance completed.' in output.getvalue()
+
+
+
+def test_ext4_compact_iterates_shrink_and_regular_file_packing():
     state = {'blocks': 1000}
     commands = []
     original_assert = n._assert_unmounted
     original_which = n.shutil.which
     original_geometry = n.ext4_compact_geometry
     original_run = n._run_ext4_tool
+    original_extent = n._run_extent_compaction
     original_stop = n._stop_requested
     try:
         n._assert_unmounted = lambda _device: None
@@ -296,6 +340,7 @@ def test_ext4_compact_shrinks_to_minimum_then_restores_original_size():
                 state['blocks'] = 1000
             return 0
         n._run_ext4_tool = fake_run
+        n._run_extent_compaction = lambda *_args, **_kwargs: n.ExtentCompactSummary()
         n._stop_requested = False
         output = io.StringIO()
         with redirect_stdout(output):
@@ -305,17 +350,19 @@ def test_ext4_compact_shrinks_to_minimum_then_restores_original_size():
         n.shutil.which = original_which
         n.ext4_compact_geometry = original_geometry
         n._run_ext4_tool = original_run
+        n._run_extent_compaction = original_extent
         n._stop_requested = original_stop
     assert state['blocks'] == 1000
     assert [item[0] for item in commands] == [
-        ('/usr/sbin/e2fsck', '-f', '-p', '/dev/test'),
+        ('/usr/sbin/e2fsck', '-f', '-D', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-p', '/dev/test', '1000'),
-        ('/usr/sbin/e2fsck', '-f', '-p', '/dev/test'),
+        ('/usr/sbin/e2fsck', '-f', '-n', '/dev/test'),
     ]
     report = output.getvalue()
-    assert 'offline filesystem-wide repack' in report
-    assert 'All file and directory allocations fit below block 419' in report
+    assert 'iterative offline filesystem-wide repack' in report
+    assert 'reached a fixed point after round 1' in report
+    assert 'fit below block 419' in report
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-30
+# Linux Defragger 1.8.0-31
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -11,9 +11,11 @@ The user-visible operations are deliberately separate:
 
 ## EXT4 Compact boundary
 
-EXT4 Compact packs movable regular-file extents into lower free ranges. The privileged collector counts `f_bfree`, so it includes EXT4's root-reserved free-block pool instead of leaving those blocks as unreachable white gaps. It still leaves a 64 MiB safety floor for journal and extent-tree metadata work, and its fallocate retry path backs off if the filesystem cannot provide every reported block.
+EXT4 Compact is an iterative filesystem-wide operation. It first runs an offline `e2fsck -D` pass to optimise directory indexes, shrinks the filesystem to its minimum valid size, and restores the exact original filesystem size. That shrink forces ordinary files, directory blocks, the journal and relocatable metadata out of the physical tail.
 
-An unmounted EXT4 filesystem still has physically allocated block-group descriptors, bitmaps, inode tables, journal blocks and directory data. Those structures are part of the filesystem format rather than activity caused by mounting, and the kernel regular-file extent-exchange interface cannot relocate all of them. The allocation map identifies them as **Filesystem metadata/reserved** or directory allocation. Metadata colour is blended according to the proportion of each sampled cell, so one metadata block no longer turns an entire multi-block map pixel black.
+A minimum-size shrink alone can still leave lower holes inside the temporary minimum image. After each restore, Linux Defragger privately mounts the volume and uses `EXT4_IOC_MOVE_EXT` to exchange higher regular-file extents into those lower holes. It then shrinks and restores again so directory and metadata allocations can be relocated around the denser file layout. The rounds stop when a complete regular-file pass moves nothing, with a fixed safety limit and an additional final shrink after the last productive pass.
+
+The partition table is never changed. The final verification is read-only so it cannot allocate fresh directory or metadata blocks in the restored tail. Any allocations beyond the reported packed boundary are block-group structures required by the restored full-size EXT4 geometry, not ordinary file or directory data. The allocation map labels those structures **Filesystem metadata/reserved** and blends their colour by cell density.
 
 
 ## FAT and exFAT Growth Defrag
@@ -46,23 +48,20 @@ The operation refuses to start unless the volume has enough free clusters for bo
 - Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
 - NTFS: analyse, map, native offline compact, native offline defragment and recover.
 - EXT2/3/4: read-only allocation maps and file/directory fragmentation analysis. Actual ext4 extent-format volumes also support native Compact; ext2, ext3 and ext4 bigalloc remain analysis-only.
-- Btrfs: genuine native physical allocation maps, file-fragmentation analysis and chunk-level Compact for single-device filesystems using non-striped local profiles. Multi-device and striped RAID profiles remain conservatively unsupported.
+- Btrfs: genuine native physical allocation maps, file-fragmentation analysis and balance-and-shrink Compact for single-device filesystems using non-striped local profiles. Multi-device and striped RAID profiles remain conservatively unsupported.
 - XFS: genuine native physical allocation maps, file/directory fragmentation analysis and range-level Compact on kernels that provide `XFS_IOC_EXCHANGE_RANGE` (Linux 6.10 or newer). Realtime-file data on a separate realtime device is reported but is not moved by Compact.
 - UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
 
 ### Native ext4, XFS and Btrfs Compact semantics
 
-EXT4 Compact is a filesystem-wide offline repack. It runs `e2fsck`, uses `resize2fs -M` to shrink the complete filesystem to its minimum valid size, then restores the exact original block count. Shrinking forces ordinary files, directory blocks, the journal and every relocatable metadata allocation out of the physical tail. The partition table and partition size are never changed. After the grow-back, ext4 may recreate block-group metadata required by the restored full-size geometry, but ordinary file and directory allocations remain below the packed minimum boundary. This path requires the `e2fsprogs` package.
+EXT4 Compact combines two kernel-supported mechanisms. Offline `resize2fs -M` rounds relocate the complete filesystem below the smallest currently valid boundary. Between those rounds, a private kernel mount reserves the free map in an unlinked collector and uses `EXT4_IOC_MOVE_EXT` to exchange high regular-file extents directly into verified low collector ranges. The collector counts all `f_bfree` blocks, including the privileged reserve, while retaining a 64 MiB transaction-safety floor. Completed exchanges are journalled by EXT4 and are sent to the GUI as live physical source/destination updates.
 
-XFS Compact uses the mounted kernel filesystem driver rather than editing live metadata structures itself. The GUI still requires the volume to be unmounted; the privileged engine mounts it privately and reserves accessible free extents in unlinked collector files. Each lowest collector extent is then used directly as the donor for an exchange with a high regular-file extent. The operation does not punch that range free and does not request a second allocation after the collector has reserved the free-space map. This avoids a self-inflicted `ENOSPC` failure and keeps the exact physical destination under verification before every exchange. The operation is deliberately allowed to split files and increase fragmentation. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsupported extents are left in place. Filesystem metadata is not moved.
+XFS Compact retains the range-exchange collector design. It requires a kernel providing `XFS_IOC_EXCHANGE_RANGE`, verifies every donor mapping immediately before exchange, repeats collector passes to a fixed point, and reports live physical updates. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsafe extents are left unchanged.
 
-Each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. The collector files are unlinked and held only by open descriptors. After an exchange they own the old high blocks; closing them at the end releases those blocks together at the physical tail. The engine then creates a fresh collector and repeats automatically until a complete pass moves no more regular-file data. A safe Stop exits between completed kernel-journalled exchanges or between complete collector passes.
+Btrfs Compact cannot safely exchange arbitrary file extents because they are copy-on-write and back-referenced. It therefore runs a native `BTRFS_IOC_BALANCE_V2` data/metadata balance to consolidate partially used block groups and release chunks, with live progress and cancellation through the balance-control ioctl. It then performs progressively tighter `BTRFS_IOC_RESIZE` shrink-and-restore cycles so the surviving chunks are forced toward the physical beginning. Up to three balance-and-shrink rounds are attempted before declaring a fixed point. File defragmentation is not invoked.
 
-During XFS Compact, each completed exchange sends a physical source/destination range to the GUI. The cached allocation samples are updated and redrawn immediately without rereading the raw device. The exact fragmentation overlay is rebuilt by the final read-only analysis because a compact move may split a file.
+The Btrfs analyser uses the kernel `TREE_SEARCH_V2` interface. Revision 31 increases each request from 4,096 to 131,072 items, uses a 16 MiB result buffer, and avoids copying payloads for unwanted intermediate key types. This substantially reduces analysis time on extent trees containing many records while preserving the exact single-device physical map.
 
-EXT allocation maps classify superblock/descriptor areas, block and inode bitmaps, inode tables, journal allocations and reserved system structures as **Filesystem metadata/reserved**, while directory extents remain purple. The renderer blends these categories by cell density rather than painting a whole cell from a single metadata block.
-
-Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses a native online shrink-and-restore transaction to force high physical chunks below a temporary boundary, then restores the original filesystem size. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each resize cycle and stops when the chunk boundary no longer improves.
 
 ### FAT and exFAT Compact semantics
 
@@ -78,7 +77,10 @@ NTFS support is implemented inside Linux Defragger and has no NTFS-3G runtime de
 
 ### NTFS Compact
 
-NTFS Compact fills every low gap it can from higher supported file and directory-index streams. It can move only part of a high extent into a small gap, and it may split or join physical extents because removing internal free space takes priority over preserving the current fragment count. One awkward gap no longer stops the rest of the pass; Compact records it and continues packing later gaps. Core NTFS system records, the boot area and other protected metadata remain fixed and are shown as **Filesystem metadata/reserved**, not as ordinary files.
+NTFS Compact fills the lowest internal free gaps from supported higher ordinary-file and directory-index streams. A source extent may be split across smaller lower gaps, and a one-cluster gap can be filled from a one-cluster slice. Increasing the file's fragment count is permitted because physical free-space packing is the purpose of Compact; Defragment remains the separate operation that rebuilds files contiguously.
+
+Each completed journalled slice transaction emits exact physical source and destination ranges. The GTK allocation map updates immediately during NTFS Compact instead of waiting for the final analysis. The fragmentation overlay is recalculated after completion because a packing move may deliberately split a stream.
+
 
 ### NTFS Defragment
 
@@ -88,7 +90,7 @@ NTFS Defragment finds supported ordinary files that have more than one physical 
 
 Every NTFS move uses an external journal. Data is copied first, destination clusters are reserved, the MFT record is switched, old clusters are released, and the original clean volume flags are restored. Recover inspects the actual on-disk MFT record and completes the transaction forward or restores the original record and bitmap state.
 
-The current native writer moves ordinary unnamed file data and supported directory `$INDEX_ALLOCATION` streams. It deliberately leaves core NTFS system records, named data streams, compressed/sparse/encrypted streams, `$ATTRIBUTE_LIST` extension streams and malformed MFT records unchanged. Those protected allocations are classified as filesystem metadata/reserved on the map so any remaining tail islands are not mistaken for user files.
+The current native writer deliberately leaves NTFS system files, unsupported directory metadata, named data streams, compressed/sparse/encrypted streams, `$ATTRIBUTE_LIST` extension streams and malformed MFT records unchanged. Supported directory `$INDEX_ALLOCATION` streams participate in Compact.
 
 ## Interface
 

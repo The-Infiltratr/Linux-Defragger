@@ -33,6 +33,7 @@ try:
     import gi
 
     gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
     from gi.repository import Gdk, GLib, Gtk
 except (ImportError, ValueError) as exc:
     print(
@@ -1509,8 +1510,15 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.disk_map.set_cells(cells)
                 moved_total = int(delta.get("moved_total_bytes", 0))
                 pass_number = int(delta.get("pass", 1))
+                current = getattr(self, "_helper_current", None)
+                purpose = current[0] if current else "compact"
+                display_name = {
+                    "compact": "Compact",
+                    "defrag": "Defragment",
+                    "growth-defrag": "Growth Defrag",
+                }.get(purpose, purpose.capitalize())
                 self.status_label.set_text(
-                    f"Live allocation update · Compact pass {pass_number} · "
+                    f"Live allocation update · {display_name} pass {pass_number} · "
                     f"{human_bytes(moved_total)} moved · fragmentation recalculated at completion"
                 )
             except Exception as exc:

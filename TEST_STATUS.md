@@ -1,12 +1,18 @@
-# Linux Defragger 1.8.0-30 test status
+# Linux Defragger 1.8.0-31 test status
 
-Validated in this build environment:
+Passed in this build environment:
 
-- EXT4 offline Compact command sequence: forced check, minimum shrink, exact-size restore, final check and automatic size restoration after an interrupted shrink.
-- Native NTFS partial-extent packing, including one-cluster gaps, mapping-pair growth limits, multiple journalled slice moves, payload verification and recovery.
-- Native NTFS directory `$INDEX_ALLOCATION` relocation and map classification of protected NTFS metadata.
-- Existing FAT Growth Defrag blocker evacuation, FAT/exFAT compact and growth-layout tests.
-- Existing Btrfs resize planning, EXT/XFS collector planning, allocation backends, GUI dispatch and version checks.
-- Python syntax checks and native engine build.
+- Python syntax and import checks for every GUI/backend engine.
+- Native Compact ABI parser and ioctl-number/layout checks.
+- Btrfs balance request layout against the installed Linux `btrfs.h` structure offsets and ioctl values.
+- Btrfs balance worker progress polling, fixed-point shrink target planning, kernel tree-search pagination and intermediate-key filtering.
+- EXT4 iterative shrink/restore and embedded regular-file packing orchestration, including directory optimisation and read-only final verification.
+- NTFS split-run live allocation events, disabled-live-map behaviour, partial-extent compaction, payload integrity and independent `ntfsresize --check` validation where NTFS utilities are available.
+- GTK live range handling, operation-aware live status text and Gdk version declaration.
+- Existing focused FAT12/16/32, exFAT, NTFS, EXT, Btrfs, XFS, swap, allocation mapper, Growth Defrag and GUI tests.
 
-The container cannot mount loop devices or perform destructive ext4/Btrfs/XFS block-device tests, and it does not provide the external e2fsprogs executables. The EXT4 physical shrink-and-restore path is therefore covered with mocked command/geometry tests here and requires validation on the removable test volume. Real NTFS tests run automatically when `mkntfs`, `ntfscp`, `ntfscat` and `ntfsresize` are available; otherwise those independent-tool checks report that they were skipped.
+Physical EXT4 and Btrfs mutation still requires a real block-device partition and `CAP_SYS_ADMIN`, which this container does not provide. Shannon's removable test partitions remain the physical validation environment. The code restores the original filesystem size in cleanup paths and stops between complete kernel-journalled transactions.
+
+## Long-suite status
+
+The complete historical `tests/run_tests.sh` suite ran for ten minutes and reached the journal-recovery tests without reporting a failure, but it did not finish before the execution limit. The focused revision-31 tests and all directly affected backend tests completed successfully.

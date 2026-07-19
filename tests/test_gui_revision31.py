@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static regression checks for revision 30 GUI behaviour."""
+"""Static regression checks for revision 31 GUI behaviour."""
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 gui=(ROOT/'gui/linux_defragger_gui.py').read_text()
@@ -7,7 +7,8 @@ version=(ROOT/'gui/version.py').read_text()
 exfat=(ROOT/'gui/backends/exfat.py').read_text()
 helper=(ROOT/'gui/privileged_helper.py').read_text()
 
-assert 'VERSION = "1.8.0-30"' in version
+assert 'VERSION = "1.8.0-31"' in version
+assert 'gi.require_version("Gdk", "3.0")' in gui
 assert '(metadata / known_total) ** 0.5' in gui
 assert 'Filesystem metadata/reserved' in gui
 assert 'if cell.get("bad", 0):\n            return self.COLORS["bad"]' not in gui
@@ -23,5 +24,5 @@ assert 'Create fragmented test data…' in gui
 assert 'CAP_GROWTH_DEFRAG' in exfat
 assert '"growth-defrag"' in helper
 assert 'range_prefix = "@@LIVE_RANGE "' in gui
-assert 'Live allocation update · Compact pass' in gui
-print('revision 30 GUI regression checks passed')
+assert 'Live allocation update · {display_name} pass' in gui
+print('revision 31 GUI regression checks passed')

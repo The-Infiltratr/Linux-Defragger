@@ -85,7 +85,7 @@ _IOC_READ = 2
 _SEARCH_KEY_SIZE = 104
 _SEARCH_ARGS_V2_SIZE = 112
 _SEARCH_HEADER = struct.Struct("=QQQII")
-_SEARCH_BUFFER = 4 * 1024 * 1024
+_SEARCH_BUFFER = 16 * 1024 * 1024
 _U64_MAX = (1 << 64) - 1
 
 
@@ -522,6 +522,7 @@ class _KernelTreeSearch:
         self.calls = 0
         self.items_returned = 0
         self.payload_bytes = 0
+        self.filtered_items = 0
 
     @staticmethod
     def _next_key(key: _Key) -> _Key | None:
@@ -566,7 +567,7 @@ class _KernelTreeSearch:
                 _U64_MAX,
                 current.type,
                 maximum.type,
-                4096,
+                131072,
                 0,
                 0, 0, 0, 0,
             )
@@ -607,13 +608,18 @@ class _KernelTreeSearch:
                     current.objectid, current.type, current.offset
                 ):
                     raise BackendError("Btrfs tree search returned keys out of order")
-                payload = bytes(request[position:end])
                 position = end
                 last_key = item_key
                 self.items_returned += 1
                 self.payload_bytes += length
                 if returned_type in wanted:
-                    yield _TreeItem(item_key, payload)
+                    # Most lexicographic key ranges necessarily include item
+                    # types that the caller does not need. Avoid allocating and
+                    # copying their payloads; on heavily populated extent trees
+                    # this removes the dominant Python-side analysis cost.
+                    yield _TreeItem(item_key, bytes(request[end - length:end]))
+                else:
+                    self.filtered_items += 1
 
             if last_key is None:
                 break
@@ -649,6 +655,7 @@ def kernel_chunk_layout(fd: int, total_bytes: int, devid: int) -> tuple[_Mapper,
         "tree_search_calls": search.calls,
         "tree_search_items": search.items_returned,
         "tree_search_payload_bytes": search.payload_bytes,
+        "tree_search_filtered_items": search.filtered_items,
     }
 
 
@@ -885,6 +892,7 @@ def _kernel_map(path: str, cells: int) -> dict:
                 "tree_search_calls": search.calls,
                 "tree_search_items": search.items_returned,
                 "tree_search_payload_bytes": search.payload_bytes,
+                "tree_search_filtered_items": search.filtered_items,
             })
             return result
         finally:

@@ -180,6 +180,7 @@ def test_kernel_tree_search_parser() -> None:
         nonlocal calls
         assert fd == 9
         assert request_code == btrfs.BTRFS_IOC_TREE_SEARCH_V2
+        assert struct.unpack_from("=I", request, 64)[0] == 131072
         if calls == 0:
             struct.pack_into("=I", request, 64, 1)
             struct.pack_into("=QQQII", request, 112, 7, 256, DATA_LOGICAL, 228, len(payload))
@@ -212,6 +213,7 @@ def test_kernel_tree_search_filters_intermediate_item_types_and_advances_full_ke
     def fake_ioctl(fd, request_code, request, mutate=True):
         nonlocal calls
         assert request_code == btrfs.BTRFS_IOC_TREE_SEARCH_V2
+        assert struct.unpack_from("=I", request, 64)[0] == 131072
         if calls == 0:
             struct.pack_into('=I', request, 64, 2)
             pos = 112
@@ -236,6 +238,7 @@ def test_kernel_tree_search_filters_intermediate_item_types_and_advances_full_ke
     assert [item.key.type for item in items] == [228]
     assert items[0].key.objectid == 256
     assert search.calls == 2
+    assert search.filtered_items == 1
 
 def main() -> int:
     test_kernel_tree_search_parser()

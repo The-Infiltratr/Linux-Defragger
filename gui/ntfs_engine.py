@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-30"
+ENGINE_VERSION = "1.8.0-31"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -1953,10 +1953,55 @@ def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
     _move_extent(layout, candidate, move, journal_path, diagnostic)
 
 
+def _iter_physical_move_slices(source_runs: Iterable[Run],
+                               destination_runs: Iterable[Run]) -> Iterator[tuple[int, int, int]]:
+    """Yield source/destination cluster slices in the order copied on disk."""
+    sources = [run for run in source_runs if run.length]
+    destinations = [run for run in destination_runs if run.length]
+    source_index = destination_index = 0
+    source_offset = destination_offset = 0
+    while source_index < len(sources) and destination_index < len(destinations):
+        source = sources[source_index]
+        destination = destinations[destination_index]
+        if source.lcn is None or destination.lcn is None:
+            raise NtfsCompactError("live map cannot describe sparse NTFS move runs")
+        take = min(source.length - source_offset, destination.length - destination_offset)
+        if take <= 0:
+            raise NtfsCompactError("invalid zero-length NTFS live-map slice")
+        yield int(source.lcn) + source_offset, int(destination.lcn) + destination_offset, take
+        source_offset += take
+        destination_offset += take
+        if source_offset == source.length:
+            source_index += 1
+            source_offset = 0
+        if destination_offset == destination.length:
+            destination_index += 1
+            destination_offset = 0
+    if source_index != len(sources) or destination_index != len(destinations):
+        raise NtfsCompactError("NTFS live-map source and destination lengths disagree")
+
+
+def _emit_live_move(move: ExtentMove, cluster_size: int,
+                    moved_total_clusters: int, live_cells: int,
+                    pass_number: int = 1) -> None:
+    if live_cells <= 0:
+        return
+    for source_lcn, destination_lcn, clusters in _iter_physical_move_slices(
+        move.source_runs, move.destination_runs
+    ):
+        payload = {
+            "source_start_byte": source_lcn * cluster_size,
+            "destination_start_byte": destination_lcn * cluster_size,
+            "length_bytes": clusters * cluster_size,
+            "moved_total_bytes": moved_total_clusters * cluster_size,
+            "pass": pass_number,
+        }
+        print("@@LIVE_RANGE " + json.dumps(payload, separators=(",", ":")), flush=True)
 
 
 def compact(device: str, journal_path: Path,
-            diagnostic_path: Path | None = None) -> int:
+            diagnostic_path: Path | None = None,
+            live_cells: int = 0) -> int:
     """Pack supported NTFS file and directory streams toward the beginning.
 
     Compact fills low free gaps even when that requires splitting a physical
@@ -2067,6 +2112,9 @@ def compact(device: str, journal_path: Path,
             moved_streams.add(owner.key)
             moved_transactions += 1
             moved_clusters += move.clusters
+            _emit_live_move(
+                move, volume.cluster_size, moved_clusters, live_cells, pass_number=1
+            )
             _update_moved_stream(plan, owner, move.new_runs)
 
             # Only rescan downward when the released source touched the current
@@ -2174,7 +2222,8 @@ def compact(device: str, journal_path: Path,
 
 
 def defragment(device: str, journal_path: Path,
-               diagnostic_path: Path | None = None) -> int:
+               diagnostic_path: Path | None = None,
+               live_cells: int = 0) -> int:
     """Rebuild supported fragmented NTFS files as one contiguous extent.
 
     Only ordinary unnamed, uncompressed, non-sparse and non-encrypted streams
@@ -2300,6 +2349,9 @@ def defragment(device: str, journal_path: Path,
             _move_extent(layout, candidate, move, journal_path, diagnostic)
             moved_files += 1
             moved_clusters += candidate.clusters
+            _emit_live_move(
+                move, volume.cluster_size, moved_clusters, live_cells, pass_number=1
+            )
             processed_clusters += info.clusters
 
             progress = 100.0 * processed_clusters / max(1, total_clusters)
@@ -2368,7 +2420,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--journal", required=True)
     parser.add_argument("--ram-buffer", default="auto")
     parser.add_argument("--workers", default="auto")
-    parser.add_argument("--live-map-cells")
+    parser.add_argument("--live-map-cells", type=int, default=0)
     parser.add_argument("--diagnostic-log", help="optional detailed per-stream move log")
     args = parser.parse_args(argv)
     try:
@@ -2376,10 +2428,10 @@ def main(argv: list[str] | None = None) -> int:
         journal = Path(args.journal)
         if args.operation == "compact":
             diagnostic = Path(args.diagnostic_log) if args.diagnostic_log else None
-            return compact(args.device, journal, diagnostic)
+            return compact(args.device, journal, diagnostic, args.live_map_cells)
         if args.operation == "defrag":
             diagnostic = Path(args.diagnostic_log) if args.diagnostic_log else None
-            return defragment(args.device, journal, diagnostic)
+            return defragment(args.device, journal, diagnostic, args.live_map_cells)
         return recover(args.device, journal)
     except (NtfsCompactError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr, flush=True)

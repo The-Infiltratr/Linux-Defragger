@@ -17,10 +17,10 @@ exchange. The collector occupies existing free runs; low collector extents are
 used as donors for exchanges with the highest movable file extents.
 
 Btrfs cannot exchange arbitrary physical file extents because every extent is
-copy-on-write and back-referenced.  Its compactor therefore uses the native
-online resize transaction: temporarily shrinking the filesystem forces chunks
-above the new boundary into lower free chunk ranges, then the original size is
-restored.  This changes physical chunk placement without invoking file defrag.
+copy-on-write and back-referenced. Its compactor first runs a native filtered
+balance to repack data and metadata into fewer block groups, then uses the
+native online resize transaction to force the surviving chunks toward the
+physical beginning before restoring the exact original filesystem size.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import shutil
 from dataclasses import dataclass
@@ -64,6 +65,8 @@ COPY_BUFFER = 8 * 1024 * 1024
 COLLECTOR_FLOOR = 64 * 1024 * 1024
 MAX_NO_PROGRESS = 8
 MAX_EXTENT_COMPACT_PASSES = 32
+MAX_EXT4_REPACK_ROUNDS = 4
+MAX_BTRFS_COMPACT_ROUNDS = 3
 
 # Generic inode flags returned by FS_IOC_FSGETXATTR.
 FS_XFLAG_REALTIME = 0x00000001
@@ -130,6 +133,21 @@ FS_IOC_FSGETXATTR = _ioc(_IOC_READ, "X", 31, 28)
 EXT4_IOC_MOVE_EXT = _ioc(_IOC_READ | _IOC_WRITE, "f", 15, 40)
 XFS_IOC_EXCHANGE_RANGE = _ioc(_IOC_WRITE, "X", 129, 40)
 BTRFS_IOC_RESIZE = _ioc(_IOC_WRITE, 0x94, 3, 4096)
+BTRFS_IOC_BALANCE_V2 = _ioc(_IOC_READ | _IOC_WRITE, 0x94, 32, 1024)
+BTRFS_IOC_BALANCE_CTL = _ioc(_IOC_WRITE, 0x94, 33, 4)
+BTRFS_IOC_BALANCE_PROGRESS = _ioc(_IOC_READ, 0x94, 34, 1024)
+
+BTRFS_BALANCE_DATA = 1 << 0
+BTRFS_BALANCE_SYSTEM = 1 << 1
+BTRFS_BALANCE_METADATA = 1 << 2
+BTRFS_BALANCE_ARGS_USAGE = 1 << 1
+BTRFS_BALANCE_ARGS_DEVID = 1 << 2
+BTRFS_BALANCE_CTL_CANCEL = 2
+BTRFS_BALANCE_ARG_SIZE = 136
+BTRFS_BALANCE_DATA_OFFSET = 16
+BTRFS_BALANCE_META_OFFSET = BTRFS_BALANCE_DATA_OFFSET + BTRFS_BALANCE_ARG_SIZE
+BTRFS_BALANCE_SYS_OFFSET = BTRFS_BALANCE_META_OFFSET + BTRFS_BALANCE_ARG_SIZE
+BTRFS_BALANCE_PROGRESS_OFFSET = BTRFS_BALANCE_SYS_OFFSET + BTRFS_BALANCE_ARG_SIZE
 
 _stop_requested = False
 _active_btrfs_fd: int | None = None
@@ -149,6 +167,16 @@ class ExtentPassResult:
     transactions: int = 0
     runtime_skipped: int = 0
     blocked_reason: str = ""
+    stopped: bool = False
+
+
+@dataclass
+class ExtentCompactSummary:
+    moved_bytes: int = 0
+    transactions: int = 0
+    runtime_skipped: int = 0
+    productive_passes: int = 0
+    final_reason: str = ""
     stopped: bool = False
 
 
@@ -510,13 +538,14 @@ def _run_ext4_tool(command: list[str], accepted: set[int] | None = None) -> int:
 
 
 def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
-    """Pack the entire ext4 filesystem by shrinking to minimum and restoring it.
+    """Iteratively pack ext4 data, directories and relocatable metadata.
 
-    resize2fs owns all inode, directory, journal and block-group relocation. The
-    partition is never resized; only the filesystem's temporary internal block
-    count changes, and the original count is restored before return.
+    A minimum-size shrink clears the physical tail and relocates directory and
+    metadata blocks. After each restore, the regular-file extent exchanger fills
+    the lower holes left inside that minimum image. Shrinking again can then move
+    the remaining directory and metadata allocations below the newly lowered
+    file boundary. The process stops at a fixed point.
     """
-    del live_cells  # resize2fs reports its own phase progress; the GUI refreshes after completion.
     _assert_unmounted(device)
     e2fsck = shutil.which("e2fsck")
     resize2fs = shutil.which("resize2fs")
@@ -527,12 +556,17 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
 
     block_size, original_bytes = ext4_compact_geometry(device)
     original_blocks = original_bytes // block_size
-    restored = False
-    shrunk_blocks = original_blocks
+    restored = True
+    final_boundary = original_blocks
+    total_file_moved = 0
+    total_transactions = 0
+    rounds_completed = 0
+
     print(
-        "EXT4 Compact is performing an offline filesystem-wide repack. It will "
-        "shrink the filesystem to its minimum valid size so directory blocks and "
-        "all relocatable metadata move with file data, then restore the original size.",
+        "EXT4 Compact is performing an iterative offline filesystem-wide repack. "
+        "Each round shrinks the filesystem to its minimum valid size, restores it, "
+        "then fills the remaining low holes with higher regular-file extents. The "
+        "next shrink relocates directories and metadata around that denser file layout.",
         flush=True,
     )
     print(
@@ -543,59 +577,130 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
     print("2.00 percent completed", flush=True)
 
     try:
-        print("EXT4 Compact phase 1/4: mandatory offline filesystem check.", flush=True)
-        # e2fsck exit 1 means errors were corrected successfully.
-        _run_ext4_tool([e2fsck, "-f", "-p", device], {0, 1})
-        if _stop_requested:
-            print("Stop requested before filesystem resizing began.", flush=True)
-            return EXIT_STOPPED
-        print("10.00 percent completed", flush=True)
-
         print(
-            "EXT4 Compact phase 2/4: shrinking to the minimum valid filesystem size. "
-            "This is the relocation phase that moves files, directories, the journal and "
-            "relocatable metadata out of the physical tail.",
+            "EXT4 Compact phase 1: mandatory offline filesystem check and directory optimisation.",
             flush=True,
         )
-        _run_ext4_tool([resize2fs, "-M", "-p", device])
-        _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
-        shrunk_blocks = shrunk_bytes // block_size
-        if shrunk_blocks > original_blocks:
-            raise CompactError("resize2fs reported a filesystem larger than its original size")
-        print(
-            f"EXT4 minimum packed boundary: {shrunk_blocks:,} blocks "
-            f"({shrunk_bytes / (1024**3):.2f} GiB).",
-            flush=True,
-        )
-        print("72.00 percent completed", flush=True)
+        # -D rebuilds/optimises directory indexes and can collapse avoidable
+        # directory-block fragmentation before the packing rounds begin.
+        _run_ext4_tool([e2fsck, "-f", "-D", "-p", device], {0, 1})
+        print("8.00 percent completed", flush=True)
 
-        print(
-            "EXT4 Compact phase 3/4: restoring the original filesystem size while leaving "
-            "the relocated file and directory allocations at the beginning.",
-            flush=True,
-        )
-        _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
-        restored = True
-        print("92.00 percent completed", flush=True)
+        previous_boundary: int | None = None
+        need_final_shrink = False
+        for round_number in range(1, MAX_EXT4_REPACK_ROUNDS + 1):
+            if _stop_requested:
+                print("Stop requested before the next EXT4 repack round.", flush=True)
+                return EXIT_STOPPED
 
-        print("EXT4 Compact phase 4/4: verifying the restored filesystem.", flush=True)
-        _run_ext4_tool([e2fsck, "-f", "-p", device], {0, 1})
+            print(
+                f"EXT4 repack round {round_number}/{MAX_EXT4_REPACK_ROUNDS}: shrinking to "
+                "the minimum valid filesystem size so every allocation above that boundary "
+                "is relocated lower.",
+                flush=True,
+            )
+            restored = False
+            _run_ext4_tool([resize2fs, "-M", "-p", device])
+            _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
+            shrunk_blocks = shrunk_bytes // block_size
+            if shrunk_blocks > original_blocks:
+                raise CompactError("resize2fs reported a filesystem larger than its original size")
+            final_boundary = shrunk_blocks
+            print(
+                f"EXT4 round {round_number} minimum boundary: {shrunk_blocks:,} blocks "
+                f"({shrunk_bytes / (1024**3):.2f} GiB).",
+                flush=True,
+            )
+
+            print(
+                f"EXT4 repack round {round_number}: restoring the exact original filesystem "
+                "size without changing the partition.",
+                flush=True,
+            )
+            _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
+            restored = True
+            rounds_completed = round_number
+
+            if _stop_requested:
+                print("Stop requested after the filesystem was restored safely.", flush=True)
+                return EXIT_STOPPED
+
+            print(
+                f"EXT4 repack round {round_number}: filling lower free holes with higher "
+                "regular-file extents before the next offline shrink.",
+                flush=True,
+            )
+            file_summary = _run_extent_compaction(
+                device, "ext4", live_cells, embedded=True
+            )
+            total_file_moved += file_summary.moved_bytes
+            total_transactions += file_summary.transactions
+            if file_summary.stopped:
+                return EXIT_STOPPED
+
+            percent = min(88.0, 8.0 + 80.0 * round_number / MAX_EXT4_REPACK_ROUNDS)
+            print(f"{percent:.2f} percent completed", flush=True)
+
+            boundary_stable = previous_boundary is not None and shrunk_blocks >= previous_boundary
+            previous_boundary = shrunk_blocks
+            if file_summary.moved_bytes == 0:
+                print(
+                    f"EXT4 reached a fixed point after round {round_number}: no ordinary file "
+                    "extent can be moved into any lower free range.",
+                    flush=True,
+                )
+                need_final_shrink = False
+                break
+            need_final_shrink = True
+            if boundary_stable:
+                print(
+                    "The minimum boundary did not fall in this round, but file allocations "
+                    "were still moved lower; one more offline shrink is required to relocate "
+                    "directory and metadata blocks around the new layout.",
+                    flush=True,
+                )
+        else:
+            print(
+                f"EXT4 reached the safety limit of {MAX_EXT4_REPACK_ROUNDS} repack rounds.",
+                flush=True,
+            )
+
+        if need_final_shrink:
+            print(
+                "EXT4 final consolidation: applying one last minimum-size shrink after the "
+                "last productive regular-file packing pass.",
+                flush=True,
+            )
+            restored = False
+            _run_ext4_tool([resize2fs, "-M", "-p", device])
+            _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
+            final_boundary = shrunk_bytes // block_size
+            _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
+            restored = True
+
+        print("EXT4 final read-only verification.", flush=True)
+        # Do not let the verifier allocate anything on the restored full-size
+        # geometry. All corrective and directory-optimisation work happened
+        # before the packing rounds; this final pass is deliberately read-only.
+        _run_ext4_tool([e2fsck, "-f", "-n", device])
         final_block_size, final_bytes = ext4_compact_geometry(device)
         if final_block_size != block_size or final_bytes != original_bytes:
             raise CompactError(
                 "ext4 verification completed, but the original filesystem size was not restored"
             )
-        moved_tail = max(0, original_blocks - shrunk_blocks) * block_size
+
+        cleared_tail = max(0, original_blocks - final_boundary) * block_size
         print(
-            f"EXT4 filesystem-wide Compact completed. All file and directory allocations "
-            f"fit below block {shrunk_blocks - 1:,}; {moved_tail / (1024**3):.2f} GiB of "
-            "physical tail was cleared before the filesystem was expanded back to its original size.",
+            f"EXT4 filesystem-wide Compact completed after {rounds_completed:,} repack round(s). "
+            f"Regular-file packing moved {total_file_moved / (1024**3):.2f} GiB in "
+            f"{total_transactions:,} kernel-journalled exchanges. All ordinary file and "
+            f"directory allocations now fit below block {max(0, final_boundary - 1):,}; "
+            f"{cleared_tail / (1024**3):.2f} GiB of physical tail was cleared.",
             flush=True,
         )
         print(
-            "Only ext4 block-group structures created or required across the restored full-size "
-            "filesystem may remain beyond that packed allocation boundary; ordinary file and "
-            "directory data has been forced below it.",
+            "Allocations beyond that boundary can only be ext4 block-group structures "
+            "created or required by the restored full-size filesystem, not ordinary files.",
             flush=True,
         )
         print("100.00 percent completed", flush=True)
@@ -618,7 +723,6 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
                     f"automatic restoration failed: {restore_exc}",
                     file=sys.stderr, flush=True,
                 )
-
 
 def xfs_compact_geometry(device: str) -> tuple[int, int]:
     with Reader(device) as reader:
@@ -833,7 +937,7 @@ def _xfs_exchange(source_fd: int, donor_fd: int, source_offset: int,
 
 def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
                          device_bytes: int, live_cells: int, pass_number: int,
-                         moved_before_pass: int) -> ExtentPassResult:
+                         moved_before_pass: int, emit_progress: bool = True) -> ExtentPassResult:
     result = ExtentPassResult()
     collector = SpaceCollector(mountpoint, block_size)
     try:
@@ -976,7 +1080,8 @@ def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
                     f"overall {moved_total / (1024**3):.2f} GiB.",
                     flush=True,
                 )
-                print(f"{percent:.2f} percent completed", flush=True)
+                if emit_progress:
+                    print(f"{percent:.2f} percent completed", flush=True)
             if result.blocked_reason:
                 break
 
@@ -991,7 +1096,8 @@ def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
         collector.close()
 
 
-def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0) -> int:
+def _run_extent_compaction(device: str, filesystem: str, live_cells: int = 0,
+                           *, embedded: bool = False) -> ExtentCompactSummary:
     if filesystem == "ext4":
         block_size, device_bytes = ext4_compact_geometry(device)
     elif filesystem == "xfs":
@@ -999,28 +1105,25 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
     else:
         raise CompactError(f"unsupported extent filesystem: {filesystem}")
 
-    print(
-        f"{filesystem.upper()} Compact will paste the highest movable regular-file extents "
-        "into the lowest accessible free ranges. It does not try to reduce fragmentation.",
-        flush=True,
-    )
-    print(
-        "The engine now repeats collector passes automatically until another pass can no "
-        "longer move any regular-file allocation lower.",
-        flush=True,
-    )
+    if not embedded:
+        print(
+            f"{filesystem.upper()} Compact will paste the highest movable regular-file extents "
+            "into the lowest accessible free ranges. It does not try to reduce fragmentation.",
+            flush=True,
+        )
+        print(
+            "The engine repeats collector passes automatically until another pass can no "
+            "longer move any regular-file allocation lower.",
+            flush=True,
+        )
 
-    total_moved = 0
-    total_transactions = 0
-    total_runtime_skipped = 0
-    final_reason = ""
-    passes_with_moves = 0
-
+    summary = ExtentCompactSummary()
     with PrivateMount(device, filesystem) as mountpoint:
         for pass_number in range(1, MAX_EXTENT_COMPACT_PASSES + 1):
             if _stop_requested:
                 print("Stop requested before the next Compact pass.", flush=True)
-                return EXIT_STOPPED
+                summary.stopped = True
+                return summary
             result = _compact_extent_pass(
                 mountpoint,
                 filesystem,
@@ -1028,12 +1131,13 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                 device_bytes,
                 live_cells,
                 pass_number,
-                total_moved,
+                summary.moved_bytes,
+                emit_progress=not embedded,
             )
-            total_moved += result.moved_bytes
-            total_transactions += result.transactions
-            total_runtime_skipped += result.runtime_skipped
-            final_reason = result.blocked_reason
+            summary.moved_bytes += result.moved_bytes
+            summary.transactions += result.transactions
+            summary.runtime_skipped += result.runtime_skipped
+            summary.final_reason = result.blocked_reason
 
             print(
                 f"{filesystem.upper()} Compact pass {pass_number} moved "
@@ -1043,20 +1147,18 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
             )
 
             if result.stopped:
+                summary.stopped = True
                 print(
                     f"{filesystem.upper()} Compact stopped safely after moving "
-                    f"{total_moved / (1024**3):.2f} GiB in {total_transactions:,} "
-                    "completed kernel-journalled transactions.",
+                    f"{summary.moved_bytes / (1024**3):.2f} GiB in "
+                    f"{summary.transactions:,} completed kernel-journalled transactions.",
                     flush=True,
                 )
-                return EXIT_STOPPED
+                return summary
             if result.moved_bytes <= 0:
                 break
 
-            passes_with_moves += 1
-            # Closing the pass collector releases the old high source extents.
-            # A new collector pass can then use the changed free-space topology
-            # without requiring the user to press Compact again.
+            summary.productive_passes += 1
             if hasattr(os, "syncfs"):
                 root_fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -1064,29 +1166,35 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                 finally:
                     os.close(root_fd)
         else:
-            final_reason = (
+            summary.final_reason = (
                 f"the automatic safety limit of {MAX_EXTENT_COMPACT_PASSES} passes was reached"
             )
 
-    print(
-        f"{filesystem.upper()} Compact moved {total_moved / (1024**3):.2f} GiB in "
-        f"{total_transactions:,} kernel-journalled transactions across "
-        f"{passes_with_moves:,} productive passes; {total_runtime_skipped:,} additional "
-        "source extents were skipped at runtime.",
-        flush=True,
-    )
-    if final_reason:
-        print(f"Compaction reached its current online boundary: {final_reason}.", flush=True)
-    print(
-        "All movable regular-file extents, including moves into ext4's privileged "
-        "free-block reserve, have been packed as low as the filesystem's fixed metadata "
-        "and directory allocations permit. Remaining allocated islands in the free tail "
-        "are filesystem structures or mappings that EXT4_IOC_MOVE_EXT/XFS exchange "
-        "cannot relocate.",
-        flush=True,
-    )
+    if not embedded:
+        print(
+            f"{filesystem.upper()} Compact moved {summary.moved_bytes / (1024**3):.2f} GiB in "
+            f"{summary.transactions:,} kernel-journalled transactions across "
+            f"{summary.productive_passes:,} productive passes; "
+            f"{summary.runtime_skipped:,} additional source extents were skipped at runtime.",
+            flush=True,
+        )
+        if summary.final_reason:
+            print(
+                f"Compaction reached its current online boundary: {summary.final_reason}.",
+                flush=True,
+            )
+        print(
+            "All movable regular-file extents have been packed as low as the current "
+            "filesystem metadata and directory allocations permit.",
+            flush=True,
+        )
+    return summary
+
+
+def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0) -> int:
+    summary = _run_extent_compaction(device, filesystem, live_cells)
     print("100.00 percent completed", flush=True)
-    return 0
+    return EXIT_STOPPED if summary.stopped else 0
 
 def _btrfs_super_geometry(device: str) -> tuple[int, int, int]:
     with Reader(device) as reader:
@@ -1138,18 +1246,135 @@ def _align_up(value: int, alignment: int) -> int:
 
 def _candidate_shrink_targets(allocated: int, largest_chunk: int,
                               highwater: int) -> list[int]:
-    alignment = 256 * 1024 * 1024
-    conservative_reserve = max(2 * 1024**3, largest_chunk * 2, allocated // 10)
-    tighter_reserve = max(1024**3, largest_chunk, allocated // 20)
-    targets: list[int] = []
-    for reserve in (conservative_reserve, tighter_reserve):
-        target = _align_up(1024 * 1024 + allocated + reserve, alignment)
-        target = min(target, highwater - 64 * 1024 * 1024)
-        if target > allocated and target < highwater:
-            targets.append(target)
-    # Keep order while removing duplicates.
-    return list(dict.fromkeys(targets))
+    """Return progressively tighter chunk-boundary targets.
 
+    The first target is deliberately only one allocation-group step below the
+    current high-water mark. Later targets approach the theoretical packed
+    chunk size while retaining at least one large chunk of relocation workspace.
+    """
+    alignment = 256 * 1024 * 1024
+    minimum = _align_up(1024 * 1024 + allocated, alignment)
+    targets: list[int] = []
+
+    for step in (64 * 1024 * 1024, alignment, 512 * 1024 * 1024, 1024**3):
+        target = highwater - step
+        target = (target // alignment) * alignment
+        if minimum < target < highwater:
+            targets.append(target)
+
+    for reserve in (
+        max(1024**3, largest_chunk * 2),
+        max(512 * 1024 * 1024, largest_chunk),
+        max(256 * 1024 * 1024, largest_chunk),
+    ):
+        target = _align_up(1024 * 1024 + allocated + reserve, alignment)
+        if minimum < target < highwater:
+            targets.append(target)
+
+    return sorted(set(targets), reverse=True)
+
+
+def _btrfs_balance_request(devid: int, usage: int = 100) -> bytearray:
+    request = bytearray(1024)
+    struct.pack_into("=Q", request, 0, BTRFS_BALANCE_DATA | BTRFS_BALANCE_METADATA)
+    for offset in (BTRFS_BALANCE_DATA_OFFSET, BTRFS_BALANCE_META_OFFSET):
+        struct.pack_into("=Q", request, offset + 8, usage)
+        struct.pack_into("=Q", request, offset + 16, devid)
+        struct.pack_into(
+            "=Q", request, offset + 64,
+            BTRFS_BALANCE_ARGS_USAGE | BTRFS_BALANCE_ARGS_DEVID,
+        )
+    return request
+
+
+def _btrfs_balance_progress(fd: int) -> tuple[int, int, int] | None:
+    request = bytearray(1024)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_BALANCE_PROGRESS, request, True)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTCONN, errno.ENOENT, errno.EINVAL):
+            return None
+        raise
+    return struct.unpack_from("=QQQ", request, BTRFS_BALANCE_PROGRESS_OFFSET)
+
+
+def _btrfs_cancel_balance(fd: int) -> None:
+    try:
+        fcntl.ioctl(
+            fd, BTRFS_IOC_BALANCE_CTL,
+            bytearray(struct.pack("=i", BTRFS_BALANCE_CTL_CANCEL)), True,
+        )
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTCONN, errno.ENOENT, errno.EINVAL):
+            raise
+
+
+def _run_btrfs_balance(fd: int, devid: int, round_number: int) -> bool:
+    """Run a full native data/metadata balance with live progress and cancellation."""
+    request = _btrfs_balance_request(devid, 100)
+    outcome: dict[str, BaseException | int] = {}
+
+    def worker() -> None:
+        try:
+            outcome["result"] = fcntl.ioctl(fd, BTRFS_IOC_BALANCE_V2, request, True)
+        except BaseException as exc:  # propagated in the caller thread
+            outcome["error"] = exc
+
+    print(
+        f"Btrfs Compact round {round_number}: repacking all data and metadata block groups "
+        "with the native balance ioctl so partially used chunks can be released.",
+        flush=True,
+    )
+    thread = threading.Thread(target=worker, name="linux-defragger-btrfs-balance", daemon=True)
+    thread.start()
+    cancel_sent = False
+    last_completed = -1
+    last_percent = -1.0
+    while thread.is_alive():
+        thread.join(0.35)
+        if _stop_requested and not cancel_sent:
+            print("Stop requested; cancelling the active Btrfs balance transaction…", flush=True)
+            _btrfs_cancel_balance(fd)
+            cancel_sent = True
+        try:
+            progress = _btrfs_balance_progress(fd)
+        except OSError:
+            progress = None
+        if progress is not None:
+            expected, considered, completed = progress
+            if completed != last_completed:
+                print(
+                    f"Btrfs balance progress: {completed:,} of {expected:,} selected chunks "
+                    f"relocated; {considered:,} considered.",
+                    flush=True,
+                )
+                last_completed = completed
+            if expected:
+                local = min(100.0, 100.0 * completed / expected)
+                overall = min(89.0, 5.0 + (round_number - 1) * 28.0 + local * 0.20)
+                if overall - last_percent >= 0.25:
+                    print(f"{overall:.2f} percent completed", flush=True)
+                    last_percent = overall
+
+    error = outcome.get("error")
+    if error is not None:
+        if isinstance(error, OSError):
+            if _stop_requested and error.errno in (errno.ECANCELED, errno.EINTR):
+                return False
+            if error.errno == errno.ENOSPC:
+                print(
+                    "Btrfs balance could not repack every selected chunk because temporary "
+                    "workspace was exhausted; Compact will still attempt boundary shrinking "
+                    "with the chunks that were released.",
+                    flush=True,
+                )
+                return True
+            raise CompactError(f"Btrfs balance failed: {os.strerror(error.errno)}") from error
+        raise error
+    if hasattr(os, "syncfs"):
+        os.syncfs(fd)
+    print("Btrfs data/metadata balance completed.", flush=True)
+    return not _stop_requested
 
 def compact_btrfs(device: str) -> int:
     global _active_btrfs_fd
@@ -1158,140 +1383,175 @@ def compact_btrfs(device: str) -> int:
         raise CompactError("Btrfs filesystem size exceeds the block device")
 
     print(
-        "Btrfs Compact uses an online shrink-and-restore transaction. Shrinking forces "
-        "chunks above a temporary boundary into lower free chunk ranges; restoring the "
-        "original size leaves the released space at the physical tail. File extents are "
-        "not defragmented.",
+        "Btrfs Compact performs a native balance-and-shrink repack. The balance stage "
+        "consolidates live extents into fewer data and metadata chunks; the resize stage "
+        "then forces those chunks toward the physical beginning before restoring the "
+        "exact original filesystem size. File defragmentation is not invoked.",
         flush=True,
     )
 
     with PrivateMount(device, "btrfs") as mountpoint:
         fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         _active_btrfs_fd = fd
-        total_reduction = 0
-        cycles = 0
         restored = True
+        total_cycles = 0
         try:
             gaps, highwater, allocated, largest_chunk, stats = _btrfs_layout(
                 fd, original_size, devid
             )
             initial_highwater = highwater
+            initial_allocated = allocated
             initial_gap_bytes = sum(gap.length for gap in gaps)
-            if not gaps:
-                print(
-                    "Btrfs Compact: allocated chunks are already packed from the beginning "
-                    "of the device.",
-                    flush=True,
-                )
-                print("100.00 percent completed", flush=True)
-                return 0
-
             print(
-                f"Btrfs Compact: {len(gaps):,} internal physical chunk gaps total "
-                f"{initial_gap_bytes / (1024**3):.2f} GiB below chunk high-water byte "
-                f"{highwater:,}.",
+                f"Btrfs initial physical chunk layout: {allocated / (1024**3):.2f} GiB "
+                f"allocated in {len(gaps):,} internal gap(s), high-water byte {highwater:,}. "
+                f"Read through {stats.get('tree_search_calls', 0):,} kernel tree-search calls.",
                 flush=True,
             )
-            print(
-                f"Current chunk layout was read through {stats.get('tree_search_calls', 0):,} "
-                "kernel tree-search calls.",
-                flush=True,
-            )
+            print("3.00 percent completed", flush=True)
 
-            for target in _candidate_shrink_targets(allocated, largest_chunk, highwater):
-                if target >= highwater:
-                    continue
+            previous_highwater = highwater
+            previous_allocated = allocated
+            for round_number in range(1, MAX_BTRFS_COMPACT_ROUNDS + 1):
                 if _stop_requested:
-                    print("Stop requested before the next Btrfs resize transaction.", flush=True)
                     return EXIT_STOPPED
+                balance_completed = _run_btrfs_balance(fd, devid, round_number)
+                if not balance_completed and _stop_requested:
+                    return EXIT_STOPPED
+
+                gaps, highwater, allocated, largest_chunk, stats = _btrfs_layout(
+                    fd, original_size, devid
+                )
                 print(
-                    f"Btrfs Compact cycle {cycles + 1}: temporarily shrinking from "
-                    f"{original_size / (1024**3):.2f} GiB to {target / (1024**3):.2f} GiB.",
+                    f"Btrfs round {round_number} after balance: allocated chunk space "
+                    f"{previous_allocated / (1024**3):.2f} -> {allocated / (1024**3):.2f} GiB; "
+                    f"chunk high-water byte {previous_highwater:,} -> {highwater:,}.",
                     flush=True,
                 )
-                shrunk = False
-                try:
-                    _btrfs_resize(fd, devid, target)
-                    shrunk = True
-                    restored = False
-                    if hasattr(os, "syncfs"):
-                        os.syncfs(fd)
-                    new_gaps, new_highwater, new_allocated, new_largest, new_stats = _btrfs_layout(
-                        fd, original_size, devid
-                    )
-                    reduction = max(0, highwater - new_highwater)
-                    gap_reduction = max(
-                        0, sum(gap.length for gap in gaps) - sum(gap.length for gap in new_gaps)
-                    )
-                    total_reduction += reduction
-                    cycles += 1
+
+                round_reduction = 0
+                shrink_attempted = False
+                for target in _candidate_shrink_targets(allocated, largest_chunk, highwater):
+                    if _stop_requested:
+                        return EXIT_STOPPED
+                    shrink_attempted = True
                     print(
-                        f"Btrfs Compact cycle {cycles}: chunk high-water byte "
-                        f"{highwater:,} -> {new_highwater:,}; internal chunk gaps reduced by "
-                        f"{gap_reduction / (1024**3):.2f} GiB.",
+                        f"Btrfs Compact shrink cycle {total_cycles + 1}: temporarily reducing "
+                        f"the filesystem from {original_size / (1024**3):.2f} GiB to "
+                        f"{target / (1024**3):.2f} GiB.",
                         flush=True,
                     )
-                    highwater = new_highwater
-                    gaps = new_gaps
-                    allocated = new_allocated
-                    largest_chunk = new_largest
-                    stats = new_stats
-                except OSError as exc:
-                    if exc.errno in (errno.ENOSPC, errno.EFBIG):
+                    shrunk = False
+                    try:
+                        _btrfs_resize(fd, devid, target)
+                        shrunk = True
+                        restored = False
+                        if hasattr(os, "syncfs"):
+                            os.syncfs(fd)
+                        new_gaps, new_highwater, new_allocated, new_largest, new_stats = _btrfs_layout(
+                            fd, original_size, devid
+                        )
+                        reduction = max(0, highwater - new_highwater)
+                        gap_reduction = max(
+                            0,
+                            sum(gap.length for gap in gaps)
+                            - sum(gap.length for gap in new_gaps),
+                        )
+                        total_cycles += 1
+                        round_reduction += reduction
                         print(
-                            f"Btrfs could not reach the temporary {target / (1024**3):.2f} GiB "
-                            "boundary because insufficient relocation workspace remained. "
-                            "No tighter boundary will be attempted.",
+                            f"Btrfs shrink cycle {total_cycles}: chunk high-water byte "
+                            f"{highwater:,} -> {new_highwater:,}; internal chunk gaps reduced "
+                            f"by {gap_reduction / (1024**3):.2f} GiB.",
                             flush=True,
                         )
-                        break
-                    if _stop_requested and exc.errno in (errno.EINTR, errno.ECANCELED):
-                        return EXIT_STOPPED
-                    raise CompactError(f"Btrfs resize failed: {os.strerror(exc.errno)}") from exc
-                finally:
-                    if shrunk:
-                        try:
-                            _btrfs_resize(fd, devid, original_size)
-                            if hasattr(os, "syncfs"):
-                                os.syncfs(fd)
-                            restored = True
-                        except OSError as grow_exc:
-                            restored = False
-                            raise CompactError(
-                                "Btrfs data relocation completed but restoring the original "
-                                f"filesystem size failed: {os.strerror(grow_exc.errno)}"
-                            ) from grow_exc
+                        gaps = new_gaps
+                        highwater = new_highwater
+                        allocated = new_allocated
+                        largest_chunk = new_largest
+                        stats = new_stats
+                    except OSError as exc:
+                        if exc.errno in (errno.ENOSPC, errno.EFBIG):
+                            print(
+                                f"Btrfs could not reach the temporary "
+                                f"{target / (1024**3):.2f} GiB boundary. The preceding balance "
+                                "did not release enough lower chunk workspace for this target.",
+                                flush=True,
+                            )
+                            break
+                        if _stop_requested and exc.errno in (errno.EINTR, errno.ECANCELED):
+                            return EXIT_STOPPED
+                        raise CompactError(
+                            f"Btrfs resize failed: {os.strerror(exc.errno)}"
+                        ) from exc
+                    finally:
+                        if shrunk:
+                            try:
+                                _btrfs_resize(fd, devid, original_size)
+                                if hasattr(os, "syncfs"):
+                                    os.syncfs(fd)
+                                restored = True
+                            except OSError as grow_exc:
+                                restored = False
+                                raise CompactError(
+                                    "Btrfs data relocation completed but restoring the original "
+                                    f"filesystem size failed: {os.strerror(grow_exc.errno)}"
+                                ) from grow_exc
 
-                if not gaps or total_reduction <= 0:
+                    if round_reduction > 0:
+                        # Re-read and rebalance from the new lower boundary rather than
+                        # trying stale targets calculated from the old chunk layout.
+                        break
+
+                print(
+                    f"{min(94.0, 12.0 + round_number * 27.0):.2f} percent completed",
+                    flush=True,
+                )
+                improved = (
+                    highwater < previous_highwater or allocated < previous_allocated
+                )
+                previous_highwater = highwater
+                previous_allocated = allocated
+                if not improved and (not shrink_attempted or round_reduction == 0):
+                    print(
+                        f"Btrfs reached a fixed point after round {round_number}; another full "
+                        "balance did not free a lower chunk slot or reduce the physical boundary.",
+                        flush=True,
+                    )
                     break
 
-            final_gaps, final_highwater, _final_allocated, _largest, final_stats = _btrfs_layout(
+            final_gaps, final_highwater, final_allocated, _largest, final_stats = _btrfs_layout(
                 fd, original_size, devid
             )
             final_gap_bytes = sum(gap.length for gap in final_gaps)
             actual_reduction = max(0, initial_highwater - final_highwater)
+            chunk_reduction = max(0, initial_allocated - final_allocated)
             print(
-                f"Btrfs Compact completed {cycles} shrink-and-restore cycle(s). Chunk "
-                f"high-water byte {initial_highwater:,} -> {final_highwater:,}, a physical "
-                f"tail reduction of {actual_reduction / (1024**3):.2f} GiB.",
+                f"Btrfs Compact completed {total_cycles:,} shrink-and-restore cycle(s). "
+                f"Allocated chunk space {initial_allocated / (1024**3):.2f} -> "
+                f"{final_allocated / (1024**3):.2f} GiB; chunk high-water byte "
+                f"{initial_highwater:,} -> {final_highwater:,}, a physical tail reduction "
+                f"of {actual_reduction / (1024**3):.2f} GiB.",
                 flush=True,
             )
             print(
                 f"Internal chunk gaps: {initial_gap_bytes / (1024**3):.2f} GiB -> "
-                f"{final_gap_bytes / (1024**3):.2f} GiB. Final layout required "
+                f"{final_gap_bytes / (1024**3):.2f} GiB; released chunk capacity "
+                f"{chunk_reduction / (1024**3):.2f} GiB. Final layout required "
                 f"{final_stats.get('tree_search_calls', 0):,} kernel tree-search calls.",
                 flush=True,
             )
-            if actual_reduction == 0:
+            if actual_reduction == 0 and chunk_reduction == 0:
                 print(
-                    "No effective Btrfs physical compaction was achieved; the kernel could "
-                    "not move the current chunk boundary lower without more workspace.",
+                    "No effective Btrfs compaction was possible: every remaining chunk is "
+                    "needed by the current data/metadata profile and no lower replacement "
+                    "slot could be created.",
                     flush=True,
                 )
             elif final_gaps:
                 print(
-                    "Btrfs remains partially compacted because fixed or profile-constrained "
-                    "chunk allocations still separate some free physical ranges.",
+                    "Btrfs is physically denser, but profile-constrained chunk allocations "
+                    "still separate some free physical ranges.",
                     flush=True,
                 )
             else:
