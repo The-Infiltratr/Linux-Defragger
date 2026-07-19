@@ -1,21 +1,10 @@
-# Linux Defragger 1.7.0
+# Linux Defragger 1.8.0
 
-Author: Shannon Smith
-
-## Apple filesystem backends
-
-- Added native read-only Apple HFS allocation-bitmap mapping.
-- Added native read-only HFS+ and HFSX allocation-bitmap mapping.
-- HFS+ reads the catalog and extents-overflow B-trees when their special files
-  are represented by the volume-header extents, providing file, directory and
-  fragmentation counts plus fragmented/directory map overlays.
-- Added conservative APFS container detection and geometry mapping. APFS blocks
-  are marked unknown except for the container superblock until the checkpoint
-  and spaceman trees are implemented.
-- HFS, HFS+, HFSX and APFS advertise Analyse and Map only. No Apple filesystem
-  write operation is enabled in this release.
-
-## Safety
-
-All Apple backends open volumes read-only and contain no mutation entry point.
-Existing FAT, exFAT and Amiga write engines are unchanged.
+- Added journalled Compact, Defragment and Recover support for classic HFS.
+- Added journalled Compact, Defragment and Recover support for HFS+ and HFSX ordinary data and resource forks.
+- Added exact classic-HFS file and fragmentation counts through the bundled HFS scanner.
+- Corrected HFS+ fragmentation detection so adjacent extent descriptors count as one physical fragment.
+- Added Apple-engine routing through the persistent privileged helper.
+- Added committed-transaction live map refreshes for HFS+ and HFSX.
+- Bundled and statically linked hfsutils 3.2.6; no installed HFS utility is required.
+- APFS remains Analyse/Map only.

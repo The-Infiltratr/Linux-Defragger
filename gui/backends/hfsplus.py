@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Read-only HFS+/HFSX allocation and fragmentation analysis.
+# Purpose: HFS+/HFSX analysis, compaction, defragmentation and recovery.
 
-"""Native read-only HFS+ and HFSX backend.
+"""Native HFS+ and HFSX analysis backend.
 
 The backend reads the volume header, allocation bitmap, catalog B-tree and
 extents-overflow B-tree directly.  It never mounts or modifies the volume.
@@ -15,11 +15,12 @@ import struct
 from dataclasses import dataclass
 
 from .base import (
-    BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, Reader, aggregate_bitmap,
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, CAP_COMPACT, CAP_DEFRAG, CAP_RECOVER, CAP_LIVE_MAP, Reader, aggregate_bitmap,
     u16be, u32be, u64be,
 )
 
-INFO = BackendInfo("hfsplus", "Apple HFS+/HFSX", ("hfsplus", "hfs+", "hfsx"), CAP_ANALYSE | CAP_MAP, "exact")
+INFO = BackendInfo("hfsplus", "Apple HFS+/HFSX", ("hfsplus", "hfs+", "hfsx"),
+                   CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER | CAP_LIVE_MAP, "exact")
 
 
 @dataclass(frozen=True)
@@ -183,10 +184,17 @@ def _catalog_summary(reader: Reader, block_size: int, catalog_tuple, overflow):
             file_id = u32be(raw, data_off + 8)
             data_extents = _fork_extents(raw, data_off + 88, file_id, 0, overflow)
             resource_extents = _fork_extents(raw, data_off + 168, file_id, 0xFF, overflow)
-            all_extents = [e for e in data_extents + resource_extents if e.count]
-            if len(all_extents) > 1:
+            def fork_fragmented(values):
+                values = [e for e in values if e.count]
+                return any(left.start + left.count != right.start
+                           for left, right in zip(values, values[1:]))
+            data_fragmented = fork_fragmented(data_extents)
+            resource_fragmented = fork_fragmented(resource_extents)
+            if data_fragmented or resource_fragmented:
                 fragmented_files += 1
-                for extent in all_extents:
+                for extent in data_extents if data_fragmented else []:
+                    fragment_blocks.update(range(extent.start, extent.start + extent.count))
+                for extent in resource_extents if resource_fragmented else []:
                     fragment_blocks.update(range(extent.start, extent.start + extent.count))
     # The catalog fork itself contains directory metadata.
     for extent in extents:

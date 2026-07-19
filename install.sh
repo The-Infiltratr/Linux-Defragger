@@ -11,6 +11,8 @@ install -Dm755 "$ROOT/gui/allocation_mapper.py" /usr/lib/linux-defragger/allocat
 install -Dm755 "$ROOT/gui/privileged_helper.py" /usr/lib/linux-defragger/privileged_helper.py
 install -Dm755 "$ROOT/gui/exfat_engine.py" /usr/lib/linux-defragger/exfat_engine.py
 install -Dm755 "$ROOT/gui/affs_engine.py" /usr/lib/linux-defragger/affs_engine.py
+install -Dm755 "$ROOT/gui/apple_engine.py" /usr/lib/linux-defragger/apple_engine.py
+install -Dm755 "$ROOT/build/hfs_engine" /usr/lib/linux-defragger/hfs_engine
 mkdir -p /usr/lib/linux-defragger/vendor
 cp -a "$ROOT/vendor/amitools" /usr/lib/linux-defragger/vendor/
 mkdir -p /usr/lib/linux-defragger/backends

@@ -1,10 +1,11 @@
-import os, struct, json, sys
+import os, struct, json, sys, tempfile
 from pathlib import Path
-root=Path('/mnt/data/applework/linux-defragger-1.6.0')
+root=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(root/'gui'))
+sys.path.insert(0,str(root/'vendor'))
 from backends.registry import Registry
 
-out=Path('/mnt/data/applework/apple-tests'); out.mkdir(exist_ok=True)
+out=Path(tempfile.mkdtemp(prefix='linux-defragger-apple-'))
 # Classic HFS: 100 allocation blocks of 4096, bitmap at sector 3.
 hfs=out/'hfs.img'; data=bytearray(1024*1024)
 m=1024; data[m:m+2]=b'BD'; struct.pack_into('>H',data,m+14,3); struct.pack_into('>H',data,m+18,100); struct.pack_into('>I',data,m+20,4096); struct.pack_into('>H',data,m+34,90)

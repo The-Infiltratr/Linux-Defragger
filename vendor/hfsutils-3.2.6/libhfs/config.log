@@ -1,0 +1,42 @@
+This file contains any messages produced by compilers while
+running configure, to aid debugging if configure makes a mistake.
+
+configure:543: checking whether make sets ${MAKE}
+configure:572: checking for gcc
+configure:649: checking whether the C compiler (gcc -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration ) works
+configure:663: gcc -o conftest -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration   conftest.c  1>&5
+configure:683: checking whether the C compiler (gcc -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration ) is a cross-compiler
+configure:688: checking whether we are using GNU C
+configure:712: checking whether gcc accepts -g
+configure:769: checking for a BSD compatible install
+configure:821: checking for ranlib
+configure:848: checking whether ln -s works
+configure:870: checking how to run the C preprocessor
+configure:932: checking whether gcc needs -traditional
+configure:980: checking for ANSI C header files
+configure:1087: checking for unistd.h
+configure:1087: checking for fcntl.h
+configure:1126: checking for size_t
+configure:1159: checking whether struct tm is in sys/time.h or time.h
+configure:1172: gcc -c -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration  conftest.c 1>&5
+configure:1194: checking for working const
+configure:1271: checking for 8-bit clean memcmp
+configure:1289: gcc -o conftest -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration   conftest.c  1>&5
+configure: In function 'main':
+configure:1284:3: warning: incompatible implicit declaration of built-in function 'exit' [-Wbuiltin-declaration-mismatch]
+ 1284 |   exit(memcmp(&c0, &c2, 1) < 0 && memcmp(&c1, &c2, 1) < 0 ? 0 : 1);
+      |   ^~~~
+configure:1280:1: note: include '<stdlib.h>' or provide a declaration of 'exit'
+ 1279 | #include "confdefs.h"
+  +++ |+#include <stdlib.h>
+ 1280 | 
+configure:1284:25: warning: 'memcmp' argument 3 type is 'int' where 'long unsigned int' is expected in a call to built-in function declared without prototype [-Wbuiltin-declaration-mismatch]
+ 1284 |   exit(memcmp(&c0, &c2, 1) < 0 && memcmp(&c1, &c2, 1) < 0 ? 0 : 1);
+      |                         ^
+<built-in>: note: built-in 'memcmp' declared here
+configure:1284:52: warning: 'memcmp' argument 3 type is 'int' where 'long unsigned int' is expected in a call to built-in function declared without prototype [-Wbuiltin-declaration-mismatch]
+ 1284 |   exit(memcmp(&c0, &c2, 1) < 0 && memcmp(&c1, &c2, 1) < 0 ? 0 : 1);
+      |                                                    ^
+<built-in>: note: built-in 'memcmp' declared here
+configure:1309: checking for mktime
+configure:1337: gcc -o conftest -O2 -std=gnu89 -Wno-implicit-int -Wno-implicit-function-declaration   conftest.c  1>&5

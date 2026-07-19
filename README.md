@@ -1,22 +1,32 @@
-# Linux Defragger 1.5.3
+# Linux Defragger 1.8.0
 
-**Author:** Shannon Smith  
+Linux Defragger is a modular GTK allocation-map viewer and offline defragmenter.
 
-Linux Defragger is a self-contained GTK allocation-map and FAT-family defragmentation application.
+## Write-capable backends
 
-## Administrator session
+- FAT12, FAT16 and FAT32: analyse, map, compact, defragment and recover.
+- exFAT: analyse, map, compact, defragment and recover.
+- Amiga OFS/FFS variants: analyse, map, compact, defragment and recover.
+- Classic Apple HFS: analyse, map, compact, defragment and recover.
+- Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
 
-The GUI requests administrator authentication immediately after launch. A private privileged helper remains alive for the GUI session and is reused by Analyse, Compact, Defragment, Recover, Unmount, and automatic refresh operations. Closing the GUI terminates the helper.
+NTFS, ext2/3/4, Btrfs, XFS, UFS, ZFS, APFS, swap and Minix remain analysis backends according to their advertised capabilities.
 
-## Filesystem support
+## Apple filesystem implementation
 
-FAT12, FAT16, FAT32 and exFAT provide analyse, map, compact, defragment and recovery operations. NTFS and the other registered filesystems remain read-only analysers unless their backend explicitly advertises mutation capabilities.
+Classic HFS uses the bundled GPLv2 libhfs source from hfsutils 3.2.6, statically linked into a private engine. It relocates complete data and resource forks, updates the volume bitmap, catalogue and extents-overflow B-tree, and uses an external recovery journal.
 
-## Amiga OFS/FFS
+HFS+ and HFSX use a native Python engine. It relocates complete ordinary data and resource forks, updates allocation-file bits, inline and overflow extent descriptors, primary and alternate volume-header free counts, and uses an external recovery journal. The allocation, catalogue, extents-overflow and other special filesystem files remain fixed.
 
-Version 1.6.0 adds exact allocation analysis and journalled Compact, Defragment and Recover operations for Amiga DOS\0 through DOS\7 volumes. The bundled amitools filesystem library supplies validated OFS/FFS structure parsing; Linux Defragger supplies the relocation planner and external recovery journal.
+All mutation commands refuse mounted volumes. The source allocation remains allocated until the catalogue metadata durably points to the destination.
 
+## Build
 
-## Apple filesystems
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
 
-Version 1.7.0 adds read-only Apple HFS, HFS+/HFSX and APFS backends. HFS and HFS+ allocation maps are exact. APFS currently provides a conservative container summary and marks undecoded physical allocation as unknown.
+## Author
+
+Shannon Smith
