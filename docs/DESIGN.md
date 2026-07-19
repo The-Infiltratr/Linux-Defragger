@@ -9,10 +9,11 @@ extents per file. Growth Defrag is a FAT/exFAT policy layout that deliberately
 creates proportional free gaps after regular files. A backend advertises each
 operation separately through the capability manifest.
 
-The native NTFS backend enforces this separation strictly: Compact preserves
-the fragment count of every moved file, while Defragment rebuilds supported
-fragmented files as one contiguous extent in the highest suitable free run
-anywhere on the volume.
+The native NTFS backend never increases fragmentation in either operation.
+Compact relocates complete streams into lower contiguous gaps and may reduce an
+already fragmented stream to one extent. Defragment rebuilds supported
+fragmented streams as one contiguous extent in the lowest suitable free run,
+then settles any temporarily staged streams downward.
 The FAT and exFAT Compact planners deliberately move allocation from the physical tail into the lowest holes, even when that increases a file's fragment count. Growth Defrag uses separate complete-object preparation planners before rebuilding every object contiguously.
 
 ## Filesystem invariants
@@ -161,21 +162,23 @@ depend on NTFS-3G at runtime.
 
 ### NTFS Compact
 
-The planner finds the lowest internal free run and searches higher supported
-streams for one complete physical extent that fits. The replacement is rejected
-if it would split an extent, join logical neighbours, change the stream's
-physical fragment count or exceed the existing MFT record's mapping-pair
-capacity. One complete extent is copied per journalled transaction.
+The planner finds the lowest internal free run and searches all higher supported
+streams for the largest complete stream that fits. Every physical source extent
+for that stream is copied in logical order into one contiguous destination run.
+The move is rejected if any source allocation lies below the destination gap or
+if the single-run replacement cannot fit the existing MFT record. Small gaps
+that cannot hold a complete higher stream remain free; Compact never splits a
+file to consume them.
 
 ### NTFS Defragment
 
-The defragmenter scans for supported streams with more than one physical extent.
-It allocates the largest files first and selects the highest suitable contiguous
-free run from the complete volume map. All source extents are copied in logical
-order to one contiguous destination. Source holes are not returned to the
-destination pool during that pass, keeping Defragment separate from Compact.
-An occupied physical tail therefore does not disable defragmentation when a
-sufficiently large internal free run exists.
+The defragmenter scans for supported streams with more than one physical extent,
+allocates larger streams first, and selects the lowest suitable contiguous free
+run from the complete volume map. All source extents are copied in logical order
+to one contiguous destination. If the only available run is higher than the
+source, it acts as temporary staging. Freed source space is immediately visible
+to later work, and bounded settling passes move staged contiguous streams lower
+again. Every relocation is whole-stream and cannot increase fragment count.
 
 ### NTFS transaction order
 

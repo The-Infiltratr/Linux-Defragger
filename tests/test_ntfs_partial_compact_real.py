@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Validate real NTFS partial-extent packing and data integrity.
+# Purpose: Validate real NTFS whole-stream Compact and data integrity.
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def main() -> None:
     tools = {name: shutil.which(name) for name in
              ("mkntfs", "ntfscp", "ntfscat", "ntfsresize")}
     if not all(tools.values()):
-        print("Real split-extent NTFS validation skipped: independent utilities unavailable")
+        print("Real whole-stream NTFS validation skipped: independent utilities unavailable")
         return
     with tempfile.TemporaryDirectory(prefix="linux-defragger-native-split-ntfs-") as directory:
         tmp = Path(directory)
@@ -115,13 +115,16 @@ def main() -> None:
         after, _largest, _total = largest_candidate(image)
         assert after.record_number == before.record_number
         after_fragments = ntfs_engine._physical_fragment_count(after.attribute.runs)
-        assert after_fragments >= before_fragments
-        assert after.highest_lcn < before_high
+        # The payload is larger than every individual lower hole. Compact must
+        # leave it intact rather than splitting it across those holes.
+        assert after.attribute.runs == before.attribute.runs
+        assert after_fragments == before_fragments
+        assert after.highest_lcn == before_high
 
         run([tools["ntfscat"], "-f", str(image), "/payload.bin"], extracted)
         assert digest(extracted) == expected
         run([tools["ntfsresize"], "--check", "--force", "--force", str(image)])
-    print("Real NTFS partial-extent compaction reduced the boundary and preserved filesystem consistency")
+    print("Real NTFS whole-stream Compact preserved contiguity, payload and filesystem consistency")
 
 
 if __name__ == "__main__":

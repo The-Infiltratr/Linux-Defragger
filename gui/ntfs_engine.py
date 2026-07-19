@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-32"
+ENGINE_VERSION = "1.8.0-33"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -964,24 +964,6 @@ def _defrag_destination_pool(bitmap: bytes | bytearray, total_clusters: int) -> 
     return result
 
 
-def _take_high_free_run(pool: list[Run], length: int) -> int | None:
-    """Reserve one contiguous destination from the highest suitable free run."""
-    if length <= 0:
-        return None
-    for index in range(len(pool) - 1, -1, -1):
-        run = pool[index]
-        if run.lcn is None or run.length < length:
-            continue
-        start = int(run.lcn) + run.length - length
-        remaining = run.length - length
-        if remaining:
-            pool[index] = Run(run.lcn, remaining)
-        else:
-            del pool[index]
-        return start
-    return None
-
-
 def _coalesce_runs(runs: Iterable[Run]) -> tuple[Run, ...]:
     merged: list[Run] = []
     for run in runs:
@@ -1416,123 +1398,85 @@ def _highest_physical_run_index(runs: tuple[Run, ...]) -> int | None:
 
 
 def _plan_compact_extent_info(info: StreamInfo, gap: Run) -> tuple[ExtentMove | None, str]:
-    """Fill a low gap from the highest suitable part of a movable stream.
+    """Relocate one complete stream into one lower contiguous gap.
 
-    Compact is deliberately allowed to split an extent. The copied physical
-    slice keeps the same logical VCN position in the stream, while its new LCN
-    is the start of the low gap. This is what lets a one-cluster hole be filled
-    instead of stopping the entire operation as revision 29 did.
+    Compact must never manufacture file fragmentation.  A stream is therefore
+    eligible only when its complete allocation fits in the selected low gap and
+    every existing physical extent lies above that gap.  Fragmented source
+    streams are rebuilt as one contiguous destination extent, so Compact can
+    preserve or reduce fragmentation but never increase it.
     """
     if gap.lcn is None or gap.length <= 0:
         return None, "the selected destination gap is invalid"
+    clusters = info.clusters
+    if clusters <= 0:
+        return None, "the selected stream has no physical allocation"
+    if clusters > gap.length:
+        return None, "the complete stream does not fit this gap"
+
     gap_start = int(gap.lcn)
     gap_end = gap_start + gap.length
-    runs = tuple(info.runs)
-    capacity = info.mapping_capacity
-    if capacity <= 0:
+    physical = tuple(run for run in info.runs if run.lcn is not None and run.length > 0)
+    if not physical:
+        return None, "the selected stream has no movable physical extents"
+    if min(int(run.lcn) for run in physical) < gap_end:
+        return None, "part of the stream is not wholly above this gap"
+
+    destination = Run(gap_start, clusters)
+    new_runs = (destination,)
+    if info.mapping_capacity <= 0:
         return None, "the replacement mapping-pair capacity is unavailable"
-
-    best: ExtentMove | None = None
-    best_source_end = -1
-    for index, source in enumerate(runs):
-        if source.lcn is None or source.length <= 0:
-            continue
-        source_start = int(source.lcn)
-        source_end = source_start + source.length
-        if source_start < gap_end:
-            continue
-
-        take = min(source.length, gap.length)
-        # Move the physical tail of the source extent. If it reaches the current
-        # high-water mark, this immediately lowers that boundary.
-        moved_start = source_end - take
-        destination = Run(gap_start, take)
-        replacement = list(runs[:index])
-        if source.length > take:
-            replacement.append(Run(source_start, source.length - take))
-        replacement.append(destination)
-        replacement.extend(runs[index + 1:])
-        new_runs = _coalesce_runs(replacement)
-        if len(_encode_runlist(new_runs)) > capacity:
-            continue
-        move = ExtentMove((Run(moved_start, take),), (destination,), new_runs)
-        if (best is None or source_end > best_source_end or
-                (source_end == best_source_end and move.clusters > best.clusters)):
-            best = move
-            best_source_end = source_end
-    if best is None:
-        return None, (
-            "no higher movable stream can map data into this gap within its existing MFT record"
-        )
-    return best, ""
+    if len(_encode_runlist(new_runs)) > info.mapping_capacity:
+        return None, "the contiguous replacement mapping does not fit the MFT record"
+    return ExtentMove(physical, new_runs, new_runs), ""
 
 
 def _select_compact_source(layout: NtfsLayout, plan: AllocationPlan, gap: Run, *,
                            max_attempts: int = SOURCE_SEARCH_LIMIT
                            ) -> tuple[StreamInfo | None, Candidate | None,
                                       ExtentMove | None, str]:
-    """Choose a high stream slice for the selected low Compact gap."""
+    """Choose the largest complete higher stream that fits the low gap.
+
+    The previous slice planner filled tiny holes by cutting extents apart.  This
+    selector deliberately considers complete streams only.  Largest-fit keeps
+    the low gap dense; the highest physical source wins ties so tail reduction
+    remains effective.  The volume sizes handled by the GUI contain only a few
+    thousand movable streams, making a direct deterministic scan inexpensive.
+    """
+    del max_attempts  # Kept in the signature for compatibility with focused tests.
     if gap.lcn is None:
         return None, None, None, "no destination gap was supplied"
-    held: list[tuple[int, int, int, int]] = []
-    gap_end = int(gap.lcn) + gap.length
+
+    best_info: StreamInfo | None = None
+    best_move: ExtentMove | None = None
     reasons: dict[str, int] = {}
-    try:
-        while len(held) < max_attempts:
-            _clean_movable_heap(plan)
-            if not plan.movable_heap:
-                break
-            entry = heapq.heappop(plan.movable_heap)
-            if not _heap_entry_current(plan, entry):
-                continue
-            info = plan.streams[(entry[1], entry[2])]
-            if info.highest_lcn <= gap_end:
-                heapq.heappush(plan.movable_heap, entry)
-                break
-            held.append(entry)
+    for info in plan.streams.values():
+        if not info.movable:
+            continue
+        move, reason = _plan_compact_extent_info(info, gap)
+        if move is None:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+        if best_info is None or (info.clusters, info.highest_lcn) > (
+                best_info.clusters, best_info.highest_lcn):
+            best_info = info
+            best_move = move
 
-        best: tuple[StreamInfo, ExtentMove] | None = None
-        for entry in held:
-            info = plan.streams[(entry[1], entry[2])]
-            move, reason = _plan_compact_extent_info(info, gap)
-            if move is not None:
-                source_end = max(int(run.lcn) + run.length for run in move.source_runs)
-                if best is None:
-                    best = (info, move)
-                else:
-                    best_end = max(int(run.lcn) + run.length for run in best[1].source_runs)
-                    if source_end > best_end or (source_end == best_end and move.clusters > best[1].clusters):
-                        best = (info, move)
-            else:
-                reasons[reason] = reasons.get(reason, 0) + 1
+    if best_info is None or best_move is None:
+        if reasons:
+            return None, None, None, max(reasons.items(), key=lambda item: item[1])[0]
+        return None, None, None, "no supported complete stream remains above the gap"
 
-        if best is not None:
-            info, move = best
-            candidate = _load_candidate(layout, info)
-            if tuple(candidate.attribute.runs) != tuple(info.runs):
-                raise NtfsCompactError(
-                    f"MFT record {info.record_number} runlist changed during offline compaction"
-                )
-            if len(_encode_runlist(move.new_runs)) > _maximum_mapping_capacity(candidate):
-                return None, None, None, (
-                    "the selected replacement mapping pairs no longer fit the MFT record"
-                )
-            return info, candidate, move, ""
-    finally:
-        for entry in held:
-            heapq.heappush(plan.movable_heap, entry)
-
-    if not held:
-        return None, None, None, "no supported movable file extent remains above the gap"
-    if len(held) >= max_attempts:
-        return None, None, None, (
-            f"the first {max_attempts:,} higher movable streams cannot encode a safe "
-            "mapping into this gap"
+    candidate = _load_candidate(layout, best_info)
+    if tuple(candidate.attribute.runs) != tuple(best_info.runs):
+        raise NtfsCompactError(
+            f"MFT record {best_info.record_number} runlist changed during offline compaction"
         )
-    if reasons:
-        return None, None, None, max(reasons.items(), key=lambda item: item[1])[0]
-    return None, None, None, "no supported movable file extent remains above the gap"
-
+    if len(_encode_runlist(best_move.new_runs)) > _maximum_mapping_capacity(candidate):
+        return None, None, None, (
+            "the selected contiguous replacement mapping no longer fits the MFT record"
+        )
+    return best_info, candidate, best_move, ""
 
 
 def _packing_progress(initial_first_gap: int | None, current_first_gap: int | None,
@@ -2016,11 +1960,12 @@ def _emit_live_move(move: ExtentMove, cluster_size: int,
 def compact(device: str, journal_path: Path,
             diagnostic_path: Path | None = None,
             live_cells: int = 0) -> int:
-    """Pack supported NTFS file and directory streams toward the beginning.
+    """Pack complete NTFS file and directory streams toward the beginning.
 
-    Compact fills low free gaps even when that requires splitting a physical
-    extent. Defragment remains the operation that later rebuilds fragmented
-    ordinary files as one contiguous extent.
+    Every transaction relocates one entire supported stream into one contiguous
+    lower gap.  Compact never splits an extent or increases a stream's physical
+    fragment count; an already fragmented source may be consolidated as part of
+    its whole-stream relocation.
     """
     if _is_mounted(device):
         raise NtfsCompactError("NTFS compaction requires an unmounted volume")
@@ -2115,8 +2060,9 @@ def compact(device: str, journal_path: Path,
                 layout, plan, first_hole
             )
             if owner is None or candidate is None or move is None:
-                # One tiny or awkward gap must not stop packing every later gap.
-                # Record it, skip past it, and continue searching the volume.
+                # A gap that cannot hold any complete higher stream is left alone.
+                # Compact never slices a file merely to consume a tiny hole, so
+                # skip this gap and continue with later usable gaps.
                 blocked_gaps.append((int(first_hole.lcn), first_hole.length, reason))
                 packed_cursor = int(first_hole.lcn) + first_hole.length
                 continue
@@ -2135,8 +2081,8 @@ def compact(device: str, journal_path: Path,
             # boundary.  Otherwise the high-water mark cannot have changed.
             if any(int(run.lcn) + run.length >= old_high for run in move.source_runs):
                 current_high = _highest_used_before(layout.bitmap, old_high)
-            # Restart at the destination gap. The selected source slice may fill
-            # it or leave a smaller remainder for another high stream slice.
+            # Restart at the destination gap. The complete stream may fill it or
+            # leave a smaller remainder for another complete higher stream.
             packed_cursor = int(first_hole.lcn)
             next_gap = _next_free_run(layout.bitmap, packed_cursor, current_high)
             current_first_gap = int(next_gap.lcn) if next_gap is not None else None
@@ -2152,7 +2098,7 @@ def compact(device: str, journal_path: Path,
                 gap_text = (f"cluster {current_first_gap:,}" if current_first_gap is not None
                             else "none")
                 print(
-                    f"Moved {moved_transactions:,} stream slices using "
+                    f"Moved {moved_transactions:,} complete streams using "
                     f"{len(moved_streams):,} file or directory streams "
                     f"({_human_bytes(moved_clusters * volume.cluster_size)} moved); "
                     f"lowest remaining gap: {gap_text}.",
@@ -2170,7 +2116,7 @@ def compact(device: str, journal_path: Path,
         filled = max(0, initial_gap_clusters - final_gap_clusters)
         print(
             f"Native NTFS compact used {len(moved_streams):,} file or directory streams in "
-            f"{moved_transactions:,} journalled slice transactions and moved {moved_clusters:,} clusters "
+            f"{moved_transactions:,} journalled whole-stream transactions and moved {moved_clusters:,} clusters "
             f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
             flush=True,
         )
@@ -2209,7 +2155,7 @@ def compact(device: str, journal_path: Path,
             first_start, first_length, first_reason = blocked_gaps[0]
             print(
                 f"{len(blocked_gaps):,} low gaps containing {blocked_clusters:,} clusters "
-                "could not be filled by the currently supported NTFS stream writer; "
+                "could not hold any complete supported higher stream without fragmenting it; "
                 f"the first is cluster {first_start:,}+{first_length:,}: {first_reason}.",
                 flush=True,
             )
@@ -2223,7 +2169,7 @@ def compact(device: str, journal_path: Path,
             print("The allocation boundary reached the theoretical packed limit.", flush=True)
         if moved_transactions == 0 and initial_gap_count:
             print(
-                "No internal NTFS gaps could be filled by any supported file or directory stream.",
+                "No internal NTFS gap was large enough for a complete supported higher file or directory stream.",
                 flush=True,
             )
         if _stop_requested:
@@ -2238,14 +2184,14 @@ def compact(device: str, journal_path: Path,
 def defragment(device: str, journal_path: Path,
                diagnostic_path: Path | None = None,
                live_cells: int = 0) -> int:
-    """Rebuild supported fragmented NTFS files as one contiguous extent.
+    """Rebuild fragmented NTFS streams contiguously at the lowest usable LCN.
 
-    Only ordinary unnamed, uncompressed, non-sparse and non-encrypted streams
-    stored in one base MFT record are currently writable. Source extents are
-    copied in logical order into the highest suitable contiguous free run
-    anywhere on the volume. Freed source extents are deliberately not reused
-    during this operation, so Defragment does not turn into another compaction
-    pass or depend on unused space beyond the current allocation boundary.
+    Each fragmented stream is written as one complete extent.  The first pass
+    always chooses the lowest free run large enough for that stream.  If the
+    only workable run is above its current allocation, that move acts as safe
+    staging; later settling passes reuse the newly released source space and
+    move the contiguous stream lower again.  No transaction creates a new file
+    fragment.
     """
     if _is_mounted(device):
         raise NtfsCompactError("NTFS defragmentation requires an unmounted volume")
@@ -2281,27 +2227,16 @@ def defragment(device: str, journal_path: Path,
             info for info in plan.streams.values()
             if not info.movable and _physical_fragment_count(info.runs) > 1
         ]
-        # Largest files are allocated first so a small file cannot consume the
-        # only free run capable of holding a much larger fragmented file.
-        supported.sort(key=lambda info: (info.clusters, info.highest_lcn), reverse=True)
-        before_high = _highest_used(layout.bitmap, volume.total_clusters)
-        destination_pool = _defrag_destination_pool(
-            layout.bitmap, volume.total_clusters
-        )
-        destination_clusters = sum(run.length for run in destination_pool)
-        largest_destination = max(
-            (run.length for run in destination_pool), default=0
-        )
-        highest_destination_end = max(
-            (int(run.lcn) + run.length for run in destination_pool
-             if run.lcn is not None),
-            default=0,
-        )
+        supported.sort(key=lambda info: (info.clusters, info.lowest_lcn), reverse=True)
+        pending = {info.key for info in supported}
         total_clusters = sum(info.clusters for info in supported)
+        free_runs = _defrag_destination_pool(layout.bitmap, volume.total_clusters)
+        free_clusters = sum(run.length for run in free_runs)
+        largest_free = max((run.length for run in free_runs), default=0)
 
         print(
-            f"Native NTFS scan found {len(supported):,} supported fragmented ordinary "
-            f"file streams containing {total_clusters:,} clusters "
+            f"Native NTFS scan found {len(supported):,} supported fragmented file or directory "
+            f"streams containing {total_clusters:,} clusters "
             f"({_human_bytes(total_clusters * volume.cluster_size)}).",
             flush=True,
         )
@@ -2318,82 +2253,158 @@ def defragment(device: str, journal_path: Path,
                 flush=True,
             )
         print(
-            f"Contiguous destination space available across the volume: "
-            f"{destination_clusters:,} clusters "
-            f"({_human_bytes(destination_clusters * volume.cluster_size)}); "
-            f"largest single free run: {largest_destination:,} clusters "
-            f"({_human_bytes(largest_destination * volume.cluster_size)}).",
+            f"Contiguous destination space available across the volume: {free_clusters:,} clusters "
+            f"({_human_bytes(free_clusters * volume.cluster_size)}); largest single free run: "
+            f"{largest_free:,} clusters ({_human_bytes(largest_free * volume.cluster_size)}).",
             flush=True,
         )
-        if highest_destination_end <= before_high:
-            print(
-                "No free run exists beyond the current allocation boundary; "
-                "Defragment will use the highest suitable internal free runs instead.",
-                flush=True,
-            )
+        print(
+            "Defragment will use the lowest suitable free run for each complete stream. "
+            "A higher run is used only as temporary staging when no lower run can hold it; "
+            "settling passes then move staged streams back down where possible.",
+            flush=True,
+        )
         print("0.00 percent completed", flush=True)
 
-        moved_files = 0
+        moved_keys: set[tuple[int, int]] = set()
+        moved_transactions = 0
         moved_clusters = 0
-        processed_clusters = 0
-        skipped_space = 0
         skipped_changed = 0
-        last_progress = 0.0
         last_report_time = time.monotonic()
+        max_placement_passes = 8
 
-        for info in supported:
-            if _stop_requested:
+        for placement_pass in range(1, max_placement_passes + 1):
+            if _stop_requested or not pending:
                 break
-            candidate = _load_candidate(layout, info)
-            if _physical_fragment_count(candidate.attribute.runs) <= 1:
-                skipped_changed += 1
-                processed_clusters += info.clusters
-                continue
-            destination = _take_high_free_run(destination_pool, candidate.clusters)
-            if destination is None:
-                skipped_space += 1
-                processed_clusters += info.clusters
-                continue
+            pass_moved = 0
+            current = [plan.streams[key] for key in pending if key in plan.streams]
+            current.sort(key=lambda info: (info.clusters, info.lowest_lcn), reverse=True)
+            for index, info in enumerate(current, 1):
+                if _stop_requested:
+                    break
+                candidate = _load_candidate(layout, info)
+                if _physical_fragment_count(candidate.attribute.runs) <= 1:
+                    pending.discard(info.key)
+                    skipped_changed += 1
+                    continue
 
-            move = ExtentMove(
-                source_runs=tuple(candidate.attribute.runs),
-                destination_runs=(Run(destination, candidate.clusters),),
-                new_runs=(Run(destination, candidate.clusters),),
-            )
-            _move_extent(layout, candidate, move, journal_path, diagnostic)
-            moved_files += 1
-            moved_clusters += candidate.clusters
-            _emit_live_move(
-                move, volume.cluster_size, moved_clusters, live_cells, pass_number=1
-            )
-            processed_clusters += info.clusters
-
-            progress = 100.0 * processed_clusters / max(1, total_clusters)
-            now = time.monotonic()
-            if progress >= 100.0 or progress - last_progress >= 0.25:
-                print(f"{progress:.2f} percent completed", flush=True)
-                last_progress = progress
-            if now - last_report_time >= REPORT_EVERY_SECONDS:
-                print(
-                    f"Defragmented {moved_files:,} files "
-                    f"({_human_bytes(moved_clusters * volume.cluster_size)} moved) into "
-                    "the highest suitable contiguous free extents.",
-                    flush=True,
+                destination = _find_free_run(
+                    layout.bitmap, candidate.clusters, max(1, volume.total_clusters - 1)
                 )
-                last_report_time = now
+                if destination is None:
+                    continue
 
-        if total_clusters and last_progress < 100.0 and not _stop_requested:
+                was_staged_high = destination >= candidate.lowest_lcn
+                move = ExtentMove(
+                    source_runs=tuple(candidate.attribute.runs),
+                    destination_runs=(Run(destination, candidate.clusters),),
+                    new_runs=(Run(destination, candidate.clusters),),
+                )
+                _move_extent(layout, candidate, move, journal_path, diagnostic)
+                moved_transactions += 1
+                moved_clusters += candidate.clusters
+                moved_keys.add(info.key)
+                pending.discard(info.key)
+                _emit_live_move(
+                    move, volume.cluster_size, moved_clusters, live_cells,
+                    pass_number=placement_pass,
+                )
+                _update_moved_stream(plan, info, move.new_runs)
+                pass_moved += 1
+
+                if was_staged_high:
+                    _detail(
+                        diagnostic,
+                        f"MFT record {info.record_number}: initial contiguous destination "
+                        f"{destination}+{candidate.clusters} is staging above its former lowest LCN "
+                        f"{candidate.lowest_lcn}",
+                    )
+                now = time.monotonic()
+                if now - last_report_time >= REPORT_EVERY_SECONDS:
+                    print(
+                        f"Defragment placement pass {placement_pass}: rebuilt "
+                        f"{len(moved_keys):,} streams contiguously "
+                        f"({_human_bytes(moved_clusters * volume.cluster_size)} moved).",
+                        flush=True,
+                    )
+                    last_report_time = now
+
+                progress = min(85.0, 85.0 * (len(supported) - len(pending)) /
+                               max(1, len(supported)))
+                print(f"{progress:.2f} percent completed", flush=True)
+
+            if pass_moved == 0:
+                break
+
+        # Reuse source runs released by the first placement phase.  Every move
+        # is strictly downward and remains one contiguous extent, so repeated
+        # passes converge and cannot oscillate or recreate fragmentation.
+        settling_transactions = 0
+        max_settling_passes = 8
+        for settle_pass in range(1, max_settling_passes + 1):
+            if _stop_requested or not moved_keys:
+                break
+            pass_moved = 0
+            current = [plan.streams[key] for key in moved_keys if key in plan.streams]
+            current.sort(key=lambda info: (info.clusters, info.lowest_lcn), reverse=True)
+            for info in current:
+                if _stop_requested:
+                    break
+                candidate = _load_candidate(layout, info)
+                if _physical_fragment_count(candidate.attribute.runs) != 1:
+                    raise NtfsCompactError(
+                        f"MFT record {info.record_number} was not contiguous after Defragment"
+                    )
+                destination = _find_free_run(
+                    layout.bitmap, candidate.clusters, candidate.lowest_lcn
+                )
+                if destination is None:
+                    continue
+                move = ExtentMove(
+                    source_runs=tuple(candidate.attribute.runs),
+                    destination_runs=(Run(destination, candidate.clusters),),
+                    new_runs=(Run(destination, candidate.clusters),),
+                )
+                _move_extent(layout, candidate, move, journal_path, diagnostic)
+                moved_transactions += 1
+                settling_transactions += 1
+                moved_clusters += candidate.clusters
+                _emit_live_move(
+                    move, volume.cluster_size, moved_clusters, live_cells,
+                    pass_number=max_placement_passes + settle_pass,
+                )
+                _update_moved_stream(plan, info, move.new_runs)
+                pass_moved += 1
+
+            progress = min(99.0, 85.0 + 14.0 * settle_pass / max_settling_passes)
+            print(f"{progress:.2f} percent completed", flush=True)
+            if pass_moved == 0:
+                break
+            print(
+                f"NTFS settling pass {settle_pass}: moved {pass_moved:,} contiguous streams "
+                "into lower suitable free runs without changing their fragment count.",
+                flush=True,
+            )
+
+        if not _stop_requested:
             print("100.00 percent completed", flush=True)
         print(
-            f"Native NTFS defragmentation rebuilt {moved_files:,} file streams as one "
-            f"contiguous extent and moved {moved_clusters:,} clusters "
+            f"Native NTFS defragmentation rebuilt {len(moved_keys):,} streams as one "
+            f"contiguous extent using {moved_transactions:,} journalled whole-stream "
+            f"transactions and moved {moved_clusters:,} clusters "
             f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
             flush=True,
         )
-        if skipped_space:
+        if settling_transactions:
             print(
-                f"{skipped_space:,} supported fragmented files were not moved because no "
-                "single contiguous free run anywhere on the volume was large enough.",
+                f"{settling_transactions:,} additional settling transactions placed staged "
+                "contiguous streams into lower free space.",
+                flush=True,
+            )
+        if pending:
+            print(
+                f"{len(pending):,} supported fragmented streams remain because no single "
+                "contiguous free run anywhere on the volume was large enough.",
                 flush=True,
             )
         if skipped_changed:
@@ -2408,7 +2419,7 @@ def defragment(device: str, journal_path: Path,
                 flush=True,
             )
         if _stop_requested:
-            print("Stopped safely after the current NTFS file transaction.", flush=True)
+            print("Stopped safely after the current NTFS whole-stream transaction.", flush=True)
         return 0
     finally:
         if diagnostic is not None:

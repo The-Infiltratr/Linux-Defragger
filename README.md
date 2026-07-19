@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-32
+# Linux Defragger 1.8.0-33
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -77,14 +77,14 @@ NTFS support is implemented inside Linux Defragger and has no NTFS-3G runtime de
 
 ### NTFS Compact
 
-NTFS Compact fills the lowest internal free gaps from supported higher ordinary-file and directory-index streams. A source extent may be split across smaller lower gaps, and a one-cluster gap can be filled from a one-cluster slice. Increasing the file's fragment count is permitted because physical free-space packing is the purpose of Compact; Defragment remains the separate operation that rebuilds files contiguously.
+NTFS Compact fills low internal free gaps using complete supported ordinary-file and directory-index streams. A stream is moved only when its entire allocation fits one lower contiguous gap and all of its current physical extents are above that gap. Each move therefore preserves a contiguous stream or consolidates a fragmented stream into one extent; Compact never splits a file or increases its fragment count merely to consume a small hole.
 
-Each completed journalled slice transaction emits exact physical source and destination ranges. The GTK allocation map updates immediately during NTFS Compact instead of waiting for the final analysis. The fragmentation overlay is recalculated after completion because a packing move may deliberately split a stream.
+Each completed journalled whole-stream transaction emits exact physical source and destination ranges. The GTK allocation map updates immediately during NTFS Compact instead of waiting for the final analysis. Gaps too small for any complete higher stream remain free rather than being filled by fragmenting a file.
 
 
 ### NTFS Defragment
 
-NTFS Defragment finds supported ordinary files that have more than one physical extent. Each file is copied in logical order into the highest suitable contiguous free run anywhere on the volume. Freed source holes are not reused during the same defragmentation pass, keeping Defragment separate from Compact.
+NTFS Defragment finds supported streams that have more than one physical extent and copies each complete stream into the lowest suitable contiguous free run. If only a higher run is large enough, it is used as temporary staging. Subsequent settling passes reuse the released source space and move the still-contiguous stream downward again wherever a lower complete run fits. No Defragment transaction creates a new fragment.
 
 ### NTFS recovery and current limits
 

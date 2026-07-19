@@ -303,8 +303,9 @@ def main() -> None:
         assert hashlib.sha256(current_directory_payload(image, 4 * CLUSTER_SIZE)).hexdigest() == directory_expected
         assert "1 movable directory index streams" in captured.getvalue()
 
-        # Compact must fill every lower hole even when doing so splits a file
-        # extent. Physical packing takes priority over preserving fragment count.
+        # Compact must not split a file merely to consume several smaller holes.
+        # With no single low run large enough for the complete stream, the file
+        # remains unchanged and contiguous rather than being fragmented.
         payload = make_image(image, split_destinations=True)
         expected = hashlib.sha256(payload).hexdigest()
         ntfs_engine._stop_requested = False
@@ -312,19 +313,13 @@ def main() -> None:
         with contextlib.redirect_stdout(captured):
             assert ntfs_engine.compact(str(image), journal) == 0
         runs = current_data_runs(image)
-        assert runs != (ntfs_engine.Run(DATA_LCN, DATA_CLUSTERS),)
-        assert sum(run.length for run in runs) == DATA_CLUSTERS
-        assert all(run.lcn is not None and int(run.lcn) < DATA_LCN for run in runs)
-        volume = ntfs_engine._open_volume(str(image), False)
-        try:
-            actual = ntfs_engine._read_stream(volume, runs, 0, len(payload))
-        finally:
-            ntfs_engine._close_volume(volume)
-        assert hashlib.sha256(actual).hexdigest() == expected
-        assert "All free clusters below the allocation boundary were eliminated" in captured.getvalue()
+        assert runs == (ntfs_engine.Run(DATA_LCN, DATA_CLUSTERS),)
+        assert ntfs_engine._physical_fragment_count(runs) == 1
+        assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
+        assert "without fragmenting it" in captured.getvalue()
 
-        # A previously fragmented file may gain or lose physical fragments while
-        # Compact fills the low map, but its logical payload must remain exact.
+        # A previously fragmented file is relocated as one complete stream, so
+        # Compact may reduce fragmentation but can never increase it.
         payload = make_image(image, fragmented_data=True)
         expected = hashlib.sha256(payload).hexdigest()
         before_runs = current_data_runs(image)
@@ -333,11 +328,12 @@ def main() -> None:
         assert ntfs_engine.compact(str(image), journal) == 0
         after_runs = current_data_runs(image)
         assert after_runs != before_runs
+        assert ntfs_engine._physical_fragment_count(after_runs) == 1
         assert max(int(run.lcn) + run.length for run in after_runs if run.lcn is not None) < DATA_LCN
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
 
         # Defragment rebuilds that same two-fragment file as one contiguous run
-        # in the highest suitable free area on the volume.
+        # in the lowest suitable free area on the volume.
         payload = make_image(image, fragmented_data=True)
         expected = hashlib.sha256(payload).hexdigest()
         ntfs_engine._stop_requested = False
@@ -345,12 +341,12 @@ def main() -> None:
         defragged_runs = current_data_runs(image)
         assert ntfs_engine._physical_fragment_count(defragged_runs) == 1
         assert defragged_runs[0].lcn is not None
-        assert int(defragged_runs[0].lcn) > DATA_LCN + 32
+        assert int(defragged_runs[0].lcn) < DATA_LCN
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
 
         # A full physical tail must not disable Defragment. The engine should
-        # choose the highest suitable internal free run and still rebuild the
-        # stream as one extent without turning the pass into Compact.
+        # choose the lowest suitable internal free run and still rebuild the
+        # stream as one extent.
         payload = make_image(image, fragmented_data=True, occupied_tail=True)
         expected = hashlib.sha256(payload).hexdigest()
         before_runs = current_data_runs(image)
@@ -366,8 +362,8 @@ def main() -> None:
         assert defragged_runs != before_runs
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
         report = captured.getvalue()
-        assert "highest suitable internal free runs" in report
-        assert "rebuilt 1 file streams" in report
+        assert "lowest suitable free run" in report
+        assert "rebuilt 1 streams" in report
 
         # An immovable high object must no longer prevent unrelated movable
         # data from filling lower gaps.  The boundary remains fixed by

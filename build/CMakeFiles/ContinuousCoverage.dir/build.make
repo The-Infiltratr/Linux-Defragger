@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/data/linux-defragger-1.8.0-32-source
+CMAKE_SOURCE_DIR = /mnt/data/ld33
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/data/linux-defragger-1.8.0-32-source/build
+CMAKE_BINARY_DIR = /mnt/data/ld33/build
 
 # Utility rule file for ContinuousCoverage.
 
@@ -85,6 +85,6 @@ CMakeFiles/ContinuousCoverage.dir/clean:
 .PHONY : CMakeFiles/ContinuousCoverage.dir/clean
 
 CMakeFiles/ContinuousCoverage.dir/depend:
-	cd /mnt/data/linux-defragger-1.8.0-32-source/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/data/linux-defragger-1.8.0-32-source /mnt/data/linux-defragger-1.8.0-32-source /mnt/data/linux-defragger-1.8.0-32-source/build /mnt/data/linux-defragger-1.8.0-32-source/build /mnt/data/linux-defragger-1.8.0-32-source/build/CMakeFiles/ContinuousCoverage.dir/DependInfo.cmake "--color=$(COLOR)"
+	cd /mnt/data/ld33/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/data/ld33 /mnt/data/ld33 /mnt/data/ld33/build /mnt/data/ld33/build /mnt/data/ld33/build/CMakeFiles/ContinuousCoverage.dir/DependInfo.cmake "--color=$(COLOR)"
 .PHONY : CMakeFiles/ContinuousCoverage.dir/depend
 

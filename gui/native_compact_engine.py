@@ -637,6 +637,17 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
             if file_summary.stopped:
                 return EXIT_STOPPED
 
+            # The private online extent-exchange mount changes filesystem state.
+            # resize2fs quite correctly refuses another offline shrink until a
+            # forced e2fsck has validated that new state.  Revision 32 omitted
+            # this check, so the final -M pass failed with "Please run e2fsck -f".
+            print(
+                f"EXT4 repack round {round_number}: validating the filesystem after "
+                "online extent packing before the next offline shrink.",
+                flush=True,
+            )
+            _run_ext4_tool([e2fsck, "-f", "-p", device], {0, 1})
+
             percent = min(82.0, 8.0 + 70.0 * round_number / MAX_EXT4_REPACK_ROUNDS)
             print(f"{percent:.2f} percent completed", flush=True)
 

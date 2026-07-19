@@ -224,7 +224,7 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
   >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
   "$TMP/growth-defrag-idempotent.txt"
-grep -q 'Growth Defrag preflight (1.8.0-32): checking' \
+grep -q 'Growth Defrag preflight (1.8.0-33): checking' \
   "$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag preflight result: the existing FAT layout already satisfies' \
   "$TMP/growth-defrag-idempotent.err"
@@ -273,7 +273,7 @@ PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_allocation_mapper.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_growth_defrag_ui.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_mounted_analysis_policy.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_swap_backend.py" >/dev/null
-PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_gui_revision32.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_gui_revision33.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_native_compact_engine.py" >/dev/null
 "$ROOT/tests/exfat/run_exfat_tests.sh" >/dev/null
 

@@ -1255,8 +1255,9 @@ class MainWindow(Gtk.ApplicationWindow):
             extra_warning = (
                 "\n\nEXT4 Compact remains fully offline. It runs a filesystem check, temporarily "
                 "shrinks the complete filesystem to its minimum valid size so files, directories, "
-                "the journal and relocatable metadata are forced toward the beginning, then expands "
-                "the filesystem back to its exact original size. The partition table is not changed."
+                "the journal and relocatable metadata are forced toward the beginning. It leaves the "
+                "verified minimum-size filesystem in place; the partition table is not changed and "
+                "the remaining physical partition tail is outside EXT4."
             )
         elif operation == "compact" and volume.normalized_fstype == "xfs":
             extra_warning = (
@@ -1274,15 +1275,15 @@ class MainWindow(Gtk.ApplicationWindow):
         elif volume.normalized_fstype == "ntfs":
             if operation == "compact":
                 extra_warning = (
-                    "\n\nNTFS Compact fills lower gaps from higher supported file and directory streams. "
-                    "It may split physical extents and increase fragmentation because consolidating "
-                    "all possible free space at the physical end is the purpose of Compact."
+                    "\n\nNTFS Compact fills lower gaps using complete higher supported file and directory "
+                    "streams. Every moved stream is written as one contiguous extent, so Compact "
+                    "never creates fragmentation merely to consume a small hole."
                 )
             elif operation == "defrag":
                 extra_warning = (
-                    "\n\nNTFS Defragment finds supported fragmented ordinary files, rebuilds "
-                    "each one as a single contiguous extent, and allocates each rebuilt file "
-                    "in the highest suitable free run anywhere on the volume."
+                    "\n\nNTFS Defragment rebuilds each supported fragmented stream as one "
+                    "contiguous extent in the lowest suitable free run. Higher free space is used "
+                    "only as temporary staging, followed by downward settling passes."
                 )
             else:
                 extra_warning = (

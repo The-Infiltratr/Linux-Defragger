@@ -1,20 +1,15 @@
-# Linux Defragger 1.8.0-32 test status
+# Linux Defragger 1.8.0-33 test status
 
-Revision 32 adds regression coverage for an ext4 filesystem smaller than its containing device, physical packed-tail rendering, indexed NTFS live-range application, redraw throttling and active-request safe-stop dispatch.
+Revision 33 adds direct regression coverage for the EXT4 post-mount filesystem check, NTFS complete-stream Compact, preservation of contiguous files when only smaller split holes exist, compaction of fragmented streams into one extent, lowest-run Defragment placement, live whole-stream movement events and recovery compatibility with older multi-extent journals.
 
 Passed in this build environment:
 
 - Python syntax and import checks for every GUI/backend engine.
-- Native Compact ABI parser and ioctl-number/layout checks.
-- Btrfs balance request layout against the installed Linux `btrfs.h` structure offsets and ioctl values.
-- Btrfs balance worker progress polling, fixed-point shrink target planning, kernel tree-search pagination and intermediate-key filtering.
-- EXT4 iterative shrink/restore and embedded regular-file packing orchestration, including the final minimum-size commit, physical partition-tail mapping and read-only verification.
-- NTFS bounded live-allocation batches, indexed GUI range application, disabled-live-map behaviour, partial-extent compaction, payload integrity and independent `ntfsresize --check` validation where NTFS utilities are available.
-- GTK live range handling, operation-aware live status text and Gdk version declaration.
-- Existing focused FAT12/16/32, exFAT, NTFS, EXT, Btrfs, XFS, swap, allocation mapper, Growth Defrag and GUI tests.
+- Native C engine compilation with the existing warning set.
+- EXT4 iterative shrink/restore orchestration, including a forced `e2fsck -f -p` after every online extent-exchange mount and before the next or final minimum-size shrink.
+- NTFS synthetic whole-stream Compact, directory-index movement, payload SHA-256 verification, bitmap updates, lower-run Defragment placement, forward recovery, rollback recovery and volume-flag preservation.
+- NTFS bounded live-allocation batches and GUI live-map regression checks.
+- Existing focused EXT, NTFS backend and native Compact ABI tests.
+- Real-image NTFS tests are retained and automatically run when `mkntfs`, `ntfscp`, `ntfscat` and `ntfsresize` are installed; those independent utilities are unavailable in this container, so those tests reported a clean skip here.
 
-Physical EXT4 and Btrfs mutation still requires a real block-device partition and `CAP_SYS_ADMIN`, which this container does not provide. Shannon's removable test partitions remain the physical validation environment. Interrupted intermediate EXT4 shrink stages restore the original filesystem size; a successful Compact deliberately leaves the verified minimum-size filesystem in place. Mutation engines stop between complete journalled transactions.
-
-## Long-suite status
-
-The complete historical `tests/run_tests.sh` suite ran for ten minutes and reached the journal-recovery tests without reporting a failure, but it did not finish before the execution limit. The focused revision-32 tests and all directly affected backend tests completed successfully.
+Physical EXT4 and Btrfs mutation still requires a real writable block-device partition and `CAP_SYS_ADMIN`, which this container does not provide. Shannon's test partitions remain the physical validation environment. The specific revision-32 EXT4 failure was nevertheless reproduced from its command sequence and corrected by enforcing the e2fsprogs check required after the private online packing mount.

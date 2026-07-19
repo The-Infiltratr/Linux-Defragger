@@ -357,6 +357,7 @@ def test_ext4_compact_iterates_shrink_and_regular_file_packing():
         ('/usr/sbin/e2fsck', '-f', '-D', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-p', '/dev/test', '1000'),
+        ('/usr/sbin/e2fsck', '-f', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
         ('/usr/sbin/e2fsck', '-f', '-n', '/dev/test'),
     ]

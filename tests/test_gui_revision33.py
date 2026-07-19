@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static regression checks for revision 32 GUI behaviour."""
+"""Static regression checks for revision 33 GUI behaviour."""
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 gui=(ROOT/'gui/linux_defragger_gui.py').read_text()
@@ -7,7 +7,7 @@ version=(ROOT/'gui/version.py').read_text()
 helper=(ROOT/'gui/privileged_helper.py').read_text()
 ext4=(ROOT/'gui/backends/ext4.py').read_text()
 
-assert 'VERSION = "1.8.0-32"' in version
+assert 'VERSION = "1.8.0-33"' in version
 assert 'gi.require_version("Gdk", "3.0")' in gui
 assert 'Packed tail outside filesystem' in gui
 assert 'outside_filesystem_blocks' in ext4
@@ -23,4 +23,6 @@ assert 'clean.startswith(("@@LIVE_MAP ", "@@LIVE_RANGE ", "@@LIVE_RANGES "))' in
 assert 'ranges_prefix = "@@LIVE_RANGES "' in gui
 assert '"outside": int(changed.get("outside", 0))' in gui
 assert '"growth-defrag"' in helper
-print('revision 32 GUI regression checks passed')
+assert 'never creates fragmentation' in gui
+assert 'lowest suitable free run' in gui
+print('revision 33 GUI regression checks passed')

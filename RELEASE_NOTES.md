@@ -1,6 +1,14 @@
-# Linux Defragger 1.8.0-32
+# Linux Defragger 1.8.0-33
 
-- EXT4 Compact now leaves the final minimum-size filesystem in place instead of expanding it back across the partition. This removes the remaining inode-table and bitmap islands: the unchanged partition tail is physically outside ext4 and cannot contain any file, directory or filesystem metadata allocation. Analyse renders that packed tail separately from usable filesystem free space.
+- Fixes the EXT4 final-consolidation failure `Please run e2fsck -f /dev/... first`. Every private online extent-packing round is now followed by a forced offline `e2fsck -f -p` before `resize2fs -M` is allowed to run again. The final minimum-size shrink therefore starts from a filesystem state that e2fsprogs has explicitly validated.
+- Replaces NTFS slice packing with complete-stream packing. Compact now moves an entire supported file or directory stream into one lower contiguous gap and never splits an extent merely to consume a small hole. A fragmented source may become contiguous, but no Compact transaction can increase its physical fragment count.
+- Changes NTFS Compact selection to largest-complete-stream fit within the lowest current gap, with the highest source used as the tie-breaker. Gaps too small for any complete higher stream are left free and reported honestly rather than being filled by creating hundreds of fragments.
+- Reworks NTFS Defragment placement. Each fragmented stream is rebuilt in the lowest suitable contiguous free run, not the highest run. If only higher space is large enough, it is used as safe temporary staging; bounded settling passes then reuse released source space and move the still-contiguous stream downward wherever possible.
+- NTFS Compact and Defragment continue to use one recovery journal per complete stream transaction, preserve live allocation-map updates and remain safely stoppable between transactions.
+
+## Revision 32
+
+- EXT4 Compact leaves the final minimum-size filesystem in place instead of expanding it back across the partition. This removes the remaining inode-table and bitmap islands: the unchanged partition tail is physically outside ext4 and cannot contain any file, directory or filesystem metadata allocation. Analyse renders that packed tail separately from usable filesystem free space.
 - Fixed the NTFS live-map path that could freeze the GTK main thread. Physical range updates are emitted in bounded transaction batches, locate only overlapping map cells with binary search instead of rescanning every map cell, and redraws are coalesced to ten per second.
 - Fixed safe-stop dispatch to use the active privileged request identifier. NTFS Compact and Defragment can now receive the stop command while live allocation updates are arriving.
 
