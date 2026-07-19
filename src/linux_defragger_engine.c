@@ -3,7 +3,7 @@
  * Author: Shannon Smith
  *
  * Implements FAT12, FAT16 and FAT32 analysis, compaction, defragmentation,
- * transaction journalling and recovery. The engine is intentionally separate
+ * growth-space defragmentation, transaction journalling and recovery. The engine is intentionally separate
  * from the GTK interface so raw-device operations remain testable and safe.
  */
 
@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.8.0-14"
+#define PROGRAM_VERSION "1.8.0-15"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -1817,10 +1817,10 @@ static void complete_compact_journal(Fat32 *fs, const char *journal_path,
 
 static void recover_compact_journal(Fat32 *fs, const char *journal_path) {
     CompactJournal j = compact_journal_read(journal_path);
-    fprintf(stderr, "Recovering interrupted compact batch of %zu cluster%s...\n",
+    fprintf(stderr, "Recovering interrupted mapped FAT relocation of %zu cluster%s...\n",
             j.move_count, j.move_count == 1 ? "" : "s");
     complete_compact_journal(fs, journal_path, &j);
-    fprintf(stderr, "Compact recovery completed by finishing the recorded batch.\n");
+    fprintf(stderr, "Mapped FAT recovery completed by finishing the recorded transaction.\n");
     compact_journal_free(&j);
 }
 
@@ -2226,6 +2226,448 @@ static CompactStats compact_volume(Fat32 *fs, const char *journal_path,
 
     update_fsinfo_next_free(fs, first_free_cluster_hint(fs));
     fat32_sync(fs);
+    return stats;
+}
+
+
+typedef struct {
+    bool is_root;
+    bool is_dir;
+    char *path;
+    size_t clusters;
+    uint32_t physical_first;
+    uint32_t target;
+    size_t reserve_after;
+} GrowthObject;
+
+typedef struct {
+    GrowthObject *v;
+    size_t len;
+    size_t cap;
+} GrowthObjectList;
+
+typedef struct {
+    size_t objects_moved;
+    size_t files_moved;
+    size_t directories_moved;
+    size_t clusters_copied;
+    size_t transactions;
+    size_t compact_clusters;
+    size_t compact_transactions;
+    size_t reserve_clusters;
+    unsigned applied_percent;
+} GrowthStats;
+
+static void growth_object_list_push(GrowthObjectList *list, GrowthObject object) {
+    if (list->len == list->cap) {
+        size_t new_cap = list->cap == 0 ? 128 : list->cap * 2;
+        list->v = xrealloc(list->v, new_cap * sizeof(*list->v));
+        list->cap = new_cap;
+    }
+    list->v[list->len++] = object;
+}
+
+static void growth_object_list_free(GrowthObjectList *list) {
+    for (size_t i = 0; i < list->len; i++) free(list->v[i].path);
+    free(list->v);
+    memset(list, 0, sizeof(*list));
+}
+
+static int compare_growth_objects_asc(const void *a, const void *b) {
+    const GrowthObject *oa = a;
+    const GrowthObject *ob = b;
+    if (oa->physical_first != ob->physical_first) {
+        return oa->physical_first < ob->physical_first ? -1 : 1;
+    }
+    if (oa->is_root != ob->is_root) return oa->is_root ? -1 : 1;
+    if (oa->is_dir != ob->is_dir) return oa->is_dir ? -1 : 1;
+    return strcmp(oa->path, ob->path);
+}
+
+static GrowthObjectList build_growth_objects(Fat32 *fs, const FileList *files,
+                                               size_t *largest_out,
+                                               uint64_t *regular_clusters_out,
+                                               size_t *regular_files_out,
+                                               size_t *directories_out) {
+    GrowthObjectList objects = {0};
+    size_t largest = 0;
+    uint64_t regular_clusters = 0;
+    size_t regular_files = 0;
+    size_t directories = 0;
+
+    U32Vec root = filesystem_root_chain(fs);
+    if (root.len != 0) {
+        growth_object_list_push(&objects, (GrowthObject){
+            .is_root = true,
+            .is_dir = true,
+            .path = xstrdup("<root directory>"),
+            .clusters = root.len,
+            .physical_first = chain_min_cluster(&root),
+        });
+        if (root.len > largest) largest = root.len;
+        directories++;
+    }
+    u32vec_free(&root);
+
+    for (size_t i = 0; i < files->len; i++) {
+        const FileRecord *file = &files->v[i];
+        if (file->chain.len == 0) continue;
+        growth_object_list_push(&objects, (GrowthObject){
+            .is_root = false,
+            .is_dir = file->is_dir,
+            .path = xstrdup(file->path),
+            .clusters = file->chain.len,
+            .physical_first = chain_min_cluster(&file->chain),
+        });
+        if (file->chain.len > largest) largest = file->chain.len;
+        if (file->is_dir) directories++;
+        else {
+            regular_files++;
+            regular_clusters += file->chain.len;
+        }
+    }
+    qsort(objects.v, objects.len, sizeof(objects.v[0]), compare_growth_objects_asc);
+    *largest_out = largest;
+    *regular_clusters_out = regular_clusters;
+    *regular_files_out = regular_files;
+    *directories_out = directories;
+    return objects;
+}
+
+static bool growth_cluster_is_barrier(const Fat32 *fs, uint32_t cluster) {
+    return fat_value(fs, cluster) == fat_bad_value(fs);
+}
+
+static bool growth_find_usable_run(const Fat32 *fs, uint32_t cursor, size_t length,
+                                   uint32_t limit_exclusive, uint32_t *start_out) {
+    if (length == 0 || cursor < 2) return false;
+    uint32_t start = cursor;
+    while (start < limit_exclusive) {
+        uint64_t end64 = (uint64_t)start + length;
+        if (end64 > limit_exclusive) return false;
+        bool clear = true;
+        for (size_t i = 0; i < length; i++) {
+            uint32_t cluster = start + (uint32_t)i;
+            if (growth_cluster_is_barrier(fs, cluster)) {
+                if (cluster == UINT32_MAX) return false;
+                start = cluster + 1;
+                clear = false;
+                break;
+            }
+        }
+        if (clear) {
+            *start_out = start;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool growth_advance_reserve(const Fat32 *fs, uint32_t cursor, size_t reserve,
+                                   uint32_t limit_exclusive, uint32_t *cursor_out) {
+    size_t remaining = reserve;
+    uint32_t c = cursor;
+    while (remaining != 0) {
+        if (c >= limit_exclusive) return false;
+        if (!growth_cluster_is_barrier(fs, c)) remaining--;
+        if (c == UINT32_MAX) return false;
+        c++;
+    }
+    *cursor_out = c;
+    return c <= limit_exclusive;
+}
+
+static bool plan_growth_layout(Fat32 *fs, GrowthObjectList *objects,
+                               unsigned percent, uint32_t workspace_start,
+                               size_t *reserve_total_out, uint32_t *layout_end_out) {
+    uint32_t cursor = 2;
+    size_t reserve_total = 0;
+    for (size_t i = 0; i < objects->len; i++) {
+        GrowthObject *object = &objects->v[i];
+        uint32_t target = 0;
+        if (!growth_find_usable_run(fs, cursor, object->clusters,
+                                    workspace_start, &target)) {
+            return false;
+        }
+        object->target = target;
+        uint64_t after64 = (uint64_t)target + object->clusters;
+        if (after64 > workspace_start) return false;
+        cursor = (uint32_t)after64;
+        object->reserve_after = 0;
+        if (!object->is_dir) {
+            uint64_t scaled = (uint64_t)object->clusters * percent;
+            size_t reserve = (size_t)((scaled + 99) / 100);
+            object->reserve_after = reserve;
+            if (reserve > SIZE_MAX - reserve_total) return false;
+            reserve_total += reserve;
+            if (!growth_advance_reserve(fs, cursor, reserve,
+                                        workspace_start, &cursor)) {
+                return false;
+            }
+        }
+    }
+    *reserve_total_out = reserve_total;
+    *layout_end_out = cursor == 0 ? 0 : cursor - 1;
+    return true;
+}
+
+static bool chain_is_exact_run(const U32Vec *chain, uint32_t start) {
+    if (chain->len == 0) return false;
+    for (size_t i = 0; i < chain->len; i++) {
+        if (chain->v[i] != start + (uint32_t)i) return false;
+    }
+    return true;
+}
+
+static bool cluster_range_is_free(const Fat32 *fs, uint32_t start, size_t length) {
+    if (length == 0) return false;
+    uint64_t end64 = (uint64_t)start + length - 1;
+    if (start < 2 || end64 > fs->max_cluster) return false;
+    for (size_t i = 0; i < length; i++) {
+        if (!fat_is_free(fs, start + (uint32_t)i)) return false;
+    }
+    return true;
+}
+
+static const U32Vec *find_growth_object_chain(Fat32 *fs, const GrowthObject *object,
+                                              FileList *files, U32Vec *root_chain,
+                                              const FileRecord **file_out) {
+    *file_out = NULL;
+    if (object->is_root) {
+        *root_chain = filesystem_root_chain(fs);
+        return root_chain;
+    }
+    for (size_t i = 0; i < files->len; i++) {
+        if (strcmp(files->v[i].path, object->path) == 0 &&
+            files->v[i].is_dir == object->is_dir) {
+            *file_out = &files->v[i];
+            return &files->v[i].chain;
+        }
+    }
+    die_msg("growth-defrag object disappeared during rescan");
+    return NULL;
+}
+
+static void growth_move_chain(Fat32 *fs, const DirRefList *dir_refs,
+                              const U32Vec *chain, uint32_t destination,
+                              const char *journal_path, bool emit_map) {
+    CompactMove *moves = xmalloc(chain->len * sizeof(*moves));
+    for (size_t i = 0; i < chain->len; i++) {
+        moves[i] = (CompactMove){
+            .source = chain->v[i],
+            .destination = destination + (uint32_t)i,
+        };
+    }
+    uint32_t *pred = build_predecessor_table(fs);
+    CompactJournal journal = make_compact_journal(fs, dir_refs, pred, moves, chain->len);
+    free(pred);
+    free(moves);
+    compact_journal_write(journal_path, &journal);
+    complete_compact_journal(fs, journal_path, &journal);
+    compact_journal_free(&journal);
+    if (emit_map) emit_live_map_update(fs);
+}
+
+static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
+                                        unsigned requested_percent,
+                                        size_t batch_clusters) {
+    GrowthStats stats = {0};
+    if (requested_percent == 0 || requested_percent > 25) {
+        die_msg("growth reserve percentage must be between 1 and 25");
+    }
+
+    DirRefList initial_refs = {0};
+    FileList initial_files = scan_files(fs, &initial_refs);
+    size_t initial_largest = 0, regular_files = 0, directories = 0;
+    uint64_t regular_clusters = 0;
+    GrowthObjectList initial_objects = build_growth_objects(
+        fs, &initial_files, &initial_largest, &regular_clusters,
+        &regular_files, &directories);
+    uint64_t free_before = count_free_clusters(fs);
+    if (initial_objects.len == 0 || regular_files == 0) {
+        growth_object_list_free(&initial_objects);
+        filelist_free(&initial_files);
+        dirreflist_free(&initial_refs);
+        fprintf(stderr, "growth-defrag: no allocated regular files require a growth layout\n");
+        return stats;
+    }
+    if (free_before <= initial_largest || regular_clusters == 0) {
+        growth_object_list_free(&initial_objects);
+        filelist_free(&initial_files);
+        dirreflist_free(&initial_refs);
+        die_msg("growth-defrag needs free space larger than the largest allocated object for safe staging");
+    }
+    uint64_t requested_reserve = 0;
+    for (size_t i = 0; i < initial_objects.len; i++) {
+        const GrowthObject *object = &initial_objects.v[i];
+        if (object->is_dir) continue;
+        uint64_t reserve = ((uint64_t)object->clusters * requested_percent + 99) / 100;
+        requested_reserve += reserve;
+    }
+    if (requested_reserve > free_before - initial_largest) {
+        growth_object_list_free(&initial_objects);
+        filelist_free(&initial_files);
+        dirreflist_free(&initial_refs);
+        die_msg("growth-defrag does not have enough free clusters for the requested reserve plus a safe staging workspace");
+    }
+    growth_object_list_free(&initial_objects);
+    filelist_free(&initial_files);
+    dirreflist_free(&initial_refs);
+
+    fprintf(stderr,
+            "Growth Defrag phase 1: compacting FAT allocation so free space can be used as a safe workspace.\n");
+    CompactStats compact_stats = compact_volume(fs, journal_path, 0, batch_clusters, 0);
+    stats.compact_clusters = compact_stats.clusters_moved;
+    stats.compact_transactions = compact_stats.transactions;
+    fprintf(stderr,
+            "Growth Defrag phase 1 complete: %zu cluster%s moved in %zu transaction%s.\n",
+            compact_stats.clusters_moved, compact_stats.clusters_moved == 1 ? "" : "s",
+            compact_stats.transactions, compact_stats.transactions == 1 ? "" : "s");
+    if (g_stop_requested) {
+        fprintf(stderr, "interrupt requested; growth layout was not started after compaction\n");
+        return stats;
+    }
+
+    DirRefList refs = {0};
+    FileList files = scan_files(fs, &refs);
+    size_t largest = 0;
+    regular_clusters = 0;
+    regular_files = 0;
+    directories = 0;
+    GrowthObjectList objects = build_growth_objects(
+        fs, &files, &largest, &regular_clusters, &regular_files, &directories);
+    uint64_t terminal = terminal_free_clusters(fs);
+    if (terminal < largest) {
+        growth_object_list_free(&objects);
+        filelist_free(&files);
+        dirreflist_free(&refs);
+        die_msg("growth-defrag could not create a terminal workspace large enough for the largest object");
+    }
+    uint32_t workspace_start = fs->max_cluster - (uint32_t)largest + 1;
+    unsigned applied_percent = requested_percent;
+    size_t reserve_total = 0;
+    uint32_t layout_end = 1;
+    if (!plan_growth_layout(fs, &objects, applied_percent, workspace_start,
+                            &reserve_total, &layout_end)) {
+        growth_object_list_free(&objects);
+        filelist_free(&files);
+        dirreflist_free(&refs);
+        die_msg("growth-defrag could not fit the requested growth layout below the staging workspace");
+    }
+    stats.applied_percent = applied_percent;
+    stats.reserve_clusters = reserve_total;
+    fprintf(stderr,
+            "Growth Defrag phase 2: %zu regular file%s, %zu director%s, %u%% growth reserve (%zu clusters).\n",
+            regular_files, regular_files == 1 ? "" : "s",
+            directories, directories == 1 ? "y" : "ies",
+            applied_percent, reserve_total);
+    fprintf(stderr,
+            "Final planned layout ends at cluster %" PRIu32 "; reusable staging workspace begins at cluster %" PRIu32 ".\n",
+            layout_end, workspace_start);
+    filelist_free(&files);
+    dirreflist_free(&refs);
+
+    for (size_t reverse = objects.len; reverse != 0; reverse--) {
+        if (g_stop_requested) {
+            fprintf(stderr, "interrupt requested; stopping Growth Defrag between complete objects\n");
+            break;
+        }
+        GrowthObject *object = &objects.v[reverse - 1];
+        DirRefList current_refs = {0};
+        FileList current_files = scan_files(fs, &current_refs);
+        U32Vec root_chain = {0};
+        const FileRecord *current_file = NULL;
+        const U32Vec *chain = find_growth_object_chain(
+            fs, object, &current_files, &root_chain, &current_file);
+        (void)current_file;
+        if (chain->len != object->clusters) {
+            u32vec_free(&root_chain);
+            filelist_free(&current_files);
+            dirreflist_free(&current_refs);
+            growth_object_list_free(&objects);
+            die_msg("growth-defrag object changed size during offline operation");
+        }
+        if (chain_is_exact_run(chain, object->target)) {
+            u32vec_free(&root_chain);
+            filelist_free(&current_files);
+            dirreflist_free(&current_refs);
+            continue;
+        }
+
+        bool direct = cluster_range_is_free(fs, object->target, object->clusters);
+        if (direct) {
+            fprintf(stderr,
+                    "growth-place: %s %s (%zu clusters) -> cluster %" PRIu32
+                    " with %zu reserved cluster%s after it\n",
+                    object->is_dir ? "DIR" : "FILE", object->path,
+                    object->clusters, object->target, object->reserve_after,
+                    object->reserve_after == 1 ? "" : "s");
+            growth_move_chain(fs, &current_refs, chain, object->target,
+                              journal_path, true);
+            stats.transactions++;
+            stats.clusters_copied += object->clusters;
+        } else {
+            if (!cluster_range_is_free(fs, workspace_start, object->clusters)) {
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag staging workspace is unexpectedly occupied");
+            }
+            fprintf(stderr,
+                    "growth-stage: %s %s (%zu clusters) -> workspace cluster %" PRIu32 "\n",
+                    object->is_dir ? "DIR" : "FILE", object->path,
+                    object->clusters, workspace_start);
+            growth_move_chain(fs, &current_refs, chain, workspace_start,
+                              journal_path, false);
+            stats.transactions++;
+            stats.clusters_copied += object->clusters;
+            u32vec_free(&root_chain);
+            filelist_free(&current_files);
+            dirreflist_free(&current_refs);
+
+            current_refs = (DirRefList){0};
+            current_files = scan_files(fs, &current_refs);
+            root_chain = (U32Vec){0};
+            current_file = NULL;
+            chain = find_growth_object_chain(
+                fs, object, &current_files, &root_chain, &current_file);
+            if (!chain_is_exact_run(chain, workspace_start)) {
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag staged object did not reopen at the workspace");
+            }
+            if (!cluster_range_is_free(fs, object->target, object->clusters)) {
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag target range is occupied after staging; layout planning stopped safely");
+            }
+            fprintf(stderr,
+                    "growth-place: %s %s -> cluster %" PRIu32
+                    " with %zu reserved cluster%s after it\n",
+                    object->is_dir ? "DIR" : "FILE", object->path,
+                    object->target, object->reserve_after,
+                    object->reserve_after == 1 ? "" : "s");
+            growth_move_chain(fs, &current_refs, chain, object->target,
+                              journal_path, true);
+            stats.transactions++;
+            stats.clusters_copied += object->clusters;
+        }
+        stats.objects_moved++;
+        if (object->is_dir) stats.directories_moved++;
+        else stats.files_moved++;
+        u32vec_free(&root_chain);
+        filelist_free(&current_files);
+        dirreflist_free(&current_refs);
+    }
+
+    update_fsinfo_next_free(fs, first_free_cluster_hint(fs));
+    fat32_sync(fs);
+    growth_object_list_free(&objects);
     return stats;
 }
 
@@ -2890,20 +3332,25 @@ static void usage(FILE *out) {
         "  %s compact DEVICE --write --confirm DEVICE [--journal PATH]\n"
         "       [--max-clusters N] [--max-transactions N] [--batch-clusters N]\n"
         "       [--ram-buffer auto|SIZE] [--workers auto|N]\n"
+        "  %s growth-defrag DEVICE --write --confirm DEVICE [--journal PATH]\n"
+        "       [--growth-percent 1..25] [--batch-clusters N]\n"
+        "       [--ram-buffer auto|SIZE] [--workers auto|N]\n"
         "  %s recover DEVICE --write --confirm DEVICE [--journal PATH]\n"
         "       [--ram-buffer auto|SIZE] [--workers auto|N]\n\n"
         "DEVICE may be an unmounted block-device partition or a regular FAT12/FAT16/FAT32 image.\n"
         "The defrag command relocates fragmented directory chains and regular files into\n"
-        "genuinely free contiguous cluster runs. Directory moves update parent entries,\n"
-        "`.` and `..` references, and FAT32 root boot-sector fields. The compact command\n"
-        "packs complete file and directory chains toward the start whenever they fit.\n"
-        "For unavoidable small holes it shifts ordered physical extents downward without\n"
-        "reversing or scattering them, leaving the largest possible terminal free run.\n"
+        "genuinely free contiguous cluster runs. Growth Defrag first compacts FAT allocation,\n"
+        "then rebuilds objects in physical order and leaves proportional free growth room\n"
+        "after each regular file. Directory moves update parent entries, `.` and `..`\n"
+        "references, and FAT32 root boot-sector fields. The compact command packs complete\n"
+        "file and directory chains toward the start whenever they fit. For unavoidable small\n"
+        "holes it shifts ordered physical extents downward without reversing or scattering\n"
+        "them, leaving the largest possible terminal free run.\n"
         "SIZE accepts byte suffixes such as 512M, 2G, or 8GiB. Automatic mode uses up\n"
         "to one quarter of currently available RAM, capped at 8 GiB. Regular files are\n"
         "committed in recoverable batches of 32 by default. Ctrl-C requests a clean stop\n"
         "after the current journalled file batch or compaction transaction.\n",
-        PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME);
+        PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME);
 }
 
 static size_t parse_size(const char *s) {
@@ -2991,6 +3438,8 @@ int main(int argc, char **argv) {
     size_t max_transactions = 0;
     size_t batch_clusters = 4096;
     size_t transaction_files = 32;
+    unsigned growth_percent = 10;
+    bool growth_percent_set = false;
     bool files_only = false;
     bool directories_only = false;
     const char *ram_buffer_arg = "auto";
@@ -3032,6 +3481,12 @@ int main(int argc, char **argv) {
             transaction_files = parse_size(argv[++i]);
             if (transaction_files == 0) die_msg("--transaction-files must be at least 1");
         }
+        else if (strcmp(argv[i], "--growth-percent") == 0 && i + 1 < argc) {
+            size_t parsed = parse_size(argv[++i]);
+            if (parsed < 1 || parsed > 25) die_msg("--growth-percent must be between 1 and 25");
+            growth_percent = (unsigned)parsed;
+            growth_percent_set = true;
+        }
         else if (strcmp(argv[i], "--ram-buffer") == 0 && i + 1 < argc) {
             ram_buffer_arg = argv[++i];
         }
@@ -3054,16 +3509,20 @@ int main(int argc, char **argv) {
     if (max_transactions != 0 && strcmp(command, "compact") != 0) {
         die_msg("--max-transactions is valid only with compact");
     }
+    if (growth_percent_set && strcmp(command, "growth-defrag") != 0) {
+        die_msg("--growth-percent is valid only with growth-defrag");
+    }
     if (map_cells != 4096 && strcmp(command, "map") != 0) {
         die_msg("--cells is valid only with map");
     }
-    if (live_map_cells != 0 && strcmp(command, "defrag") != 0 && strcmp(command, "compact") != 0) {
-        die_msg("--live-map-cells is valid only with defrag or compact");
+    if (live_map_cells != 0 && strcmp(command, "defrag") != 0 &&
+        strcmp(command, "compact") != 0 && strcmp(command, "growth-defrag") != 0) {
+        die_msg("--live-map-cells is valid only with defrag, compact or growth-defrag");
     }
     g_live_map_cells = live_map_cells;
 
     bool mutating = strcmp(command, "defrag") == 0 || strcmp(command, "compact") == 0 ||
-                    strcmp(command, "recover") == 0;
+                    strcmp(command, "growth-defrag") == 0 || strcmp(command, "recover") == 0;
     if (mutating && (!write_flag || confirm == NULL || strcmp(confirm, device_path) != 0)) {
         die_msg("writes require both --write and --confirm with the exact DEVICE path");
     }
@@ -3107,11 +3566,12 @@ int main(int argc, char **argv) {
     }
 
     if (path_exists(journal_path)) {
-        die_msg("an unfinished journal exists; run recover before analysis or defragmentation");
+        die_msg("an unfinished journal exists; run recover before analysis or filesystem relocation");
     }
 
     DirRefList dir_refs = {0};
-    bool need_dir_refs = strcmp(command, "compact") == 0 || strcmp(command, "defrag") == 0;
+    bool need_dir_refs = strcmp(command, "compact") == 0 || strcmp(command, "defrag") == 0 ||
+                         strcmp(command, "growth-defrag") == 0;
     FileList files = scan_files(&fs, need_dir_refs ? &dir_refs : NULL);
     initialise_live_map(&fs, &files);
     if (strcmp(command, "map") == 0) {
@@ -3148,6 +3608,23 @@ int main(int argc, char **argv) {
         }
         filelist_free(&files);
         dirreflist_free(&dir_refs);
+        files = scan_files(&fs, NULL);
+        print_analysis(&fs, &files);
+    } else if (strcmp(command, "growth-defrag") == 0) {
+        filelist_free(&files);
+        dirreflist_free(&dir_refs);
+        GrowthStats growth = growth_defrag_volume(&fs, journal_path, growth_percent, batch_clusters);
+        printf("Growth Defrag applied reserve: %u%% (%zu clusters)\n",
+               growth.applied_percent, growth.reserve_clusters);
+        printf("Growth Defrag compact phase:  %zu clusters in %zu transaction%s\n",
+               growth.compact_clusters, growth.compact_transactions,
+               growth.compact_transactions == 1 ? "" : "s");
+        printf("Growth Defrag layout phase:   %zu file%s and %zu director%s repositioned\n",
+               growth.files_moved, growth.files_moved == 1 ? "" : "s",
+               growth.directories_moved, growth.directories_moved == 1 ? "y" : "ies");
+        printf("Growth Defrag layout I/O:     %zu clusters in %zu transaction%s\n",
+               growth.clusters_copied, growth.transactions,
+               growth.transactions == 1 ? "" : "s");
         files = scan_files(&fs, NULL);
         print_analysis(&fs, &files);
     } else if (strcmp(command, "compact") == 0) {

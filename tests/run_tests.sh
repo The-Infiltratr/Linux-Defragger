@@ -175,6 +175,24 @@ wait "$interrupt_pid"
 test ! -e "$TMP/interrupt.journal"
 "$BIN" analyze "$TMP/interrupt.img" >/dev/null
 
+for fat_kind in fat12 fat16; do
+  "$ROOT/tests/make_fat12_16_image.py" "$fat_kind" "$TMP/growth-$fat_kind.img" fragmented >/dev/null
+  "$BIN" growth-defrag "$TMP/growth-$fat_kind.img" --write \
+    --confirm "$TMP/growth-$fat_kind.img" --growth-percent 10 \
+    >"$TMP/growth-$fat_kind.txt"
+  grep -q 'Growth Defrag applied reserve: 10% (1 clusters)' "$TMP/growth-$fat_kind.txt"
+  "$ROOT/tests/verify_growth_fat12_16.py" "$fat_kind" "$TMP/growth-$fat_kind.img" >/dev/null
+done
+
+"$ROOT/tests/make_growth_defrag_image.py" "$TMP/growth-defrag.img" >/dev/null
+"$BIN" growth-defrag "$TMP/growth-defrag.img" --write \
+  --confirm "$TMP/growth-defrag.img" --growth-percent 10 --batch-clusters 128 \
+  >"$TMP/growth-defrag.txt"
+grep -q 'Growth Defrag applied reserve: 10% (3 clusters)' "$TMP/growth-defrag.txt"
+"$ROOT/tests/verify_growth_defrag.py" "$TMP/growth-defrag.img" >/dev/null
+"$BIN" analyze "$TMP/growth-defrag.img" >"$TMP/growth-defrag-after.txt"
+grep -q 'Fragmented files:       0' "$TMP/growth-defrag-after.txt"
+
 "$ROOT/tests/make_gapped_contiguous_image.py" "$TMP/gapped-contiguous.img" >/dev/null
 "$BIN" analyze "$TMP/gapped-contiguous.img" >"$TMP/gapped-before.txt"
 grep -q 'Fragmented files:       0' "$TMP/gapped-before.txt"
@@ -194,6 +212,7 @@ PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_compact_real.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_partial_compact_real.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_defrag_real.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_allocation_mapper.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_growth_defrag_ui.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_mounted_analysis_policy.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_swap_backend.py" >/dev/null
 

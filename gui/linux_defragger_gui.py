@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: GTK interface for analysis, compaction, defragmentation and recovery.
+# Purpose: GTK interface for analysis, compaction, defragmentation, FAT growth layouts and recovery.
 #
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
@@ -44,7 +44,7 @@ except (ImportError, ValueError) as exc:
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
 BASE_VERSION = "1.8.0"
-PACKAGE_REVISION = "14"
+PACKAGE_REVISION = "15"
 VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
@@ -55,6 +55,7 @@ CAP_COMPACT = 1 << 2
 CAP_DEFRAG = 1 << 3
 CAP_RECOVER = 1 << 4
 CAP_LIVE_MAP = 1 << 5
+CAP_GROWTH_DEFRAG = 1 << 6
 BACKEND_CAPABILITIES: dict[str, int] = {}
 # Linux filesystem names are normalised to backend identifiers here.
 SUPPORTED_FILESYSTEMS = {
@@ -485,7 +486,7 @@ class MainWindow(Gtk.ApplicationWindow):
         title.set_markup("<span size='x-large' weight='bold'>Linux Defragger</span>")
         title.set_xalign(0)
         subtitle = Gtk.Label(
-            label="Analyse allocation and fragmentation, compact free space, and defragment supported filesystems"
+            label="Analyse fragmentation, compact free space, defragment files, or create FAT growth-space layouts"
         )
         subtitle.set_xalign(0)
         subtitle.set_line_wrap(True)
@@ -569,6 +570,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.defrag_button = Gtk.Button.new_with_label("Defragment")
         self.defrag_button.connect("clicked", lambda _b: self.start_mutation("defrag"))
         action_row.pack_start(self.defrag_button, False, False, 0)
+        self.growth_button = Gtk.Button.new_with_label("Growth Defrag")
+        self.growth_button.set_tooltip_text(
+            "FAT only: defragment files and leave 10% free expansion space after each file"
+        )
+        self.growth_button.connect("clicked", lambda _b: self.start_mutation("growth-defrag"))
+        action_row.pack_start(self.growth_button, False, False, 0)
         self.recover_button = Gtk.Button.new_with_label("Recover")
         self.recover_button.connect("clicked", lambda _b: self.start_mutation("recover"))
         action_row.pack_start(self.recover_button, False, False, 0)
@@ -640,8 +647,8 @@ class MainWindow(Gtk.ApplicationWindow):
         dialog.set_program_name(APP_NAME)
         dialog.set_version(VERSION)
         dialog.set_comments(
-            "Filesystem allocation analysis, free-space compaction, "
-            "defragmentation and journalled recovery."
+            "Filesystem allocation analysis, free-space compaction, defragmentation, "
+            "FAT growth-space layouts and journalled recovery."
         )
         dialog.set_authors(["Shannon Smith"])
         dialog.set_website(PROJECT_URL)
@@ -908,6 +915,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     operations.append("Compact")
                 if capabilities & CAP_DEFRAG:
                     operations.append("Defragment")
+                if capabilities & CAP_GROWTH_DEFRAG:
+                    operations.append("Growth Defrag")
                 if capabilities & CAP_RECOVER:
                     operations.append("Recover")
                 if operations:
@@ -955,6 +964,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     operations.append("Compact")
                 if capabilities & CAP_DEFRAG:
                     operations.append("Defragment")
+                if capabilities & CAP_GROWTH_DEFRAG:
+                    operations.append("Growth Defrag")
                 if capabilities & CAP_RECOVER:
                     operations.append("Recover")
                 if operations:
@@ -1059,6 +1070,7 @@ class MainWindow(Gtk.ApplicationWindow):
                         write_ops = []
                         if volume.capabilities & CAP_COMPACT: write_ops.append("Compact")
                         if volume.capabilities & CAP_DEFRAG: write_ops.append("Defragment")
+                        if volume.capabilities & CAP_GROWTH_DEFRAG: write_ops.append("Growth Defrag")
                         if volume.capabilities & CAP_RECOVER: write_ops.append("Recover")
                         suffix = (" Available: " + ", ".join(write_ops) + ".") if write_ops else " Read-only analysis backend."
                         self.append_log(
@@ -1072,7 +1084,12 @@ class MainWindow(Gtk.ApplicationWindow):
         volume = self.current_volume
         if not volume or self.busy:
             return
-        required = {"compact": CAP_COMPACT, "defrag": CAP_DEFRAG, "recover": CAP_RECOVER}[operation]
+        required = {
+            "compact": CAP_COMPACT,
+            "defrag": CAP_DEFRAG,
+            "growth-defrag": CAP_GROWTH_DEFRAG,
+            "recover": CAP_RECOVER,
+        }[operation]
         if not (volume.capabilities & required):
             self.show_error(
                 "Operation unavailable",
@@ -1103,6 +1120,10 @@ class MainWindow(Gtk.ApplicationWindow):
         descriptions = {
             "defrag": "Rebuild fragmented files as contiguous runs without compacting free space.",
             "compact": "Fill internal free-space gaps without attempting to defragment files.",
+            "growth-defrag": (
+                "FAT only: compact allocation, rebuild files contiguously in physical order, "
+                "and leave a 10% free expansion gap after each regular file."
+            ),
             "recover": "Complete or roll back the interrupted journalled transaction.",
         }
         extra_warning = ""
@@ -1124,8 +1145,14 @@ class MainWindow(Gtk.ApplicationWindow):
                     "\n\nNTFS Recover completes or rolls back the one journalled native NTFS "
                     "file transaction that was interrupted."
                 )
+        operation_names = {
+            "compact": "Compact",
+            "defrag": "Defragment",
+            "growth-defrag": "Growth Defrag",
+            "recover": "Recover",
+        }
         if not self.confirm(
-            f"{operation.capitalize()} {volume.path}?",
+            f"{operation_names[operation]} {volume.path}?",
             f"{descriptions[operation]}{extra_warning}\n\nThe volume must remain connected and unmounted. "
             "A clean Stop request finishes the active transaction before exiting.",
         ):
@@ -1146,6 +1173,10 @@ class MainWindow(Gtk.ApplicationWindow):
             else:
                 args += ["--transaction-files", "32", "--ram-buffer", "auto", "--workers", "auto",
                          "--live-map-cells", str(live_cells)]
+        elif operation == "growth-defrag":
+            args += ["--growth-percent", "10", "--batch-clusters", "4096",
+                     "--ram-buffer", "auto", "--workers", "auto",
+                     "--live-map-cells", str(live_cells)]
         elif operation == "compact":
             args += ["--ram-buffer", "auto", "--workers", "auto",
                      "--live-map-cells", str(live_cells)]
@@ -1153,7 +1184,7 @@ class MainWindow(Gtk.ApplicationWindow):
             args += ["--ram-buffer", "auto", "--workers", "auto"]
 
         self.clear_log()
-        self.append_log(f"Starting {operation} on {volume.path}…")
+        self.append_log(f"Starting {operation_names[operation]} on {volume.path}…")
         self._run_command(
             args,
             privileged=not volume.image or not os.access(volume.path, os.R_OK | os.W_OK),
@@ -1207,7 +1238,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self.stop_requested = False
         self._update_controls()
         self.progress.set_fraction(0.0)
-        self.progress.set_text(f"{purpose.capitalize()} in progress…")
+        display_name = {
+            "analysis": "Analysis",
+            "compact": "Compact",
+            "defrag": "Defragment",
+            "growth-defrag": "Growth Defrag",
+            "recover": "Recovery",
+        }.get(purpose, purpose.capitalize())
+        self.progress.set_text(f"{display_name} in progress…")
         self.determinate_progress = False
         self.pulse_id = GLib.timeout_add(120, self._pulse_progress)
 
@@ -1350,6 +1388,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 "analysis": "Analysis",
                 "compact": "Compact",
                 "defrag": "Defragment",
+                "growth-defrag": "Growth Defrag",
                 "recover": "Recovery",
             }.get(purpose, purpose.capitalize())
             self.determinate_progress = True
@@ -1545,11 +1584,25 @@ class MainWindow(Gtk.ApplicationWindow):
         if raw_completion is not None:
             raw_completion(returncode, output)
         elif returncode == 0:
-            self.status_label.set_text(f"{purpose.capitalize()} completed successfully.")
+            display_name = {
+                "analysis": "Analysis",
+                "compact": "Compact",
+                "defrag": "Defragment",
+                "growth-defrag": "Growth Defrag",
+                "recover": "Recovery",
+            }.get(purpose, purpose.capitalize())
+            self.status_label.set_text(f"{display_name} completed successfully.")
             if on_success:
                 on_success(output)
         else:
-            self.show_error(f"{purpose.capitalize()} failed", output.strip() or f"Exit status {returncode}")
+            display_name = {
+                "analysis": "Analysis",
+                "compact": "Compact",
+                "defrag": "Defragment",
+                "growth-defrag": "Growth Defrag",
+                "recover": "Recovery",
+            }.get(purpose, purpose.capitalize())
+            self.show_error(f"{display_name} failed", output.strip() or f"Exit status {returncode}")
         return False
 
     def _request_stop(self, _button: Gtk.Button) -> None:
@@ -1596,7 +1649,7 @@ class MainWindow(Gtk.ApplicationWindow):
         enabled = volume is not None and not self.busy
         mounted = bool(volume and volume.mounted)
         caps = volume.capabilities if volume else 0
-        mutation_backend = bool(caps & (CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER))
+        mutation_backend = bool(caps & (CAP_COMPACT | CAP_DEFRAG | CAP_GROWTH_DEFRAG | CAP_RECOVER))
         journal_exists = bool(mutation_backend and volume and Path(self.journal_path()).exists())
         self.refresh_button.set_sensitive(not self.busy)
         self.image_button.set_sensitive(not self.busy)
@@ -1606,6 +1659,9 @@ class MainWindow(Gtk.ApplicationWindow):
         can_write = enabled and mutation_backend and not mounted and not bool(volume and volume.readonly)
         self.compact_button.set_sensitive(can_write and bool(caps & CAP_COMPACT) and not journal_exists)
         self.defrag_button.set_sensitive(can_write and bool(caps & CAP_DEFRAG) and not journal_exists)
+        self.growth_button.set_sensitive(
+            can_write and bool(caps & CAP_GROWTH_DEFRAG) and not journal_exists
+        )
         self.recover_button.set_sensitive(can_write and bool(caps & CAP_RECOVER) and journal_exists)
         self.stop_button.set_sensitive(self.busy and not self.stop_requested)
 

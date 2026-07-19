@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=Linux Defragger
-Comment=Analyse, compact and defragment supported filesystems
+Comment=Analyse, compact, defragment and optimise supported filesystems
 Exec=linux-defragger
 Icon=io.github.linuxdefragger
 Terminal=false
 Categories=System;Utility;Filesystem;
-Keywords=defrag;defragment;compact;filesystem;disk;fat;exfat;ntfs;allocation;
+Keywords=defrag;defragment;compact;growth;optimise;filesystem;disk;fat;exfat;ntfs;allocation;
 StartupNotify=true

@@ -1,14 +1,10 @@
-# Test status for 1.8.0-14
+# Test status for 1.8.0-15
 
-- Python syntax compilation passed for the GUI, privileged helper, backends and native NTFS engine.
-- Synthetic native NTFS Defragment tests rebuild a two-extent file as one contiguous extent and preserve the exact SHA-256 payload.
-- A new destructive test fills the physical tail, leaves a suitable internal free run, and confirms Defragment still rebuilds the file into one extent.
-- The regression test confirms the old trailing-only planner would have had no destination while the corrected whole-volume planner succeeds.
-- Synthetic native NTFS Compact tests confirm complete extents may move downward while the file's physical fragment count remains unchanged.
-- Native NTFS forward recovery, rollback recovery, bitmap range updates and preserved `0x0080` volume-flag tests passed.
-- Existing NTFS allocation/MFT fragmentation analysis tests passed.
-- Real formatted NTFS compact and defragment tests remain in the test suite and automatically run when `mkntfs`, `ntfscp`, `ntfscat` and `ntfsresize` are available. Those independent utilities were unavailable in the current build container, so those optional tests were skipped rather than claimed as executed.
-- Focused EXT, swap, Apple-backend, allocation-mapper and mounted-analysis policy tests passed after the change.
-- The C engines compiled cleanly with the normal warning set, and the packaged FAT engine reports `1.8.0-14`.
-- Static GUI checks confirmed the title, File menu, About menu, Defragment control and operation-specific progress wording.
-- Existing FAT, exFAT and Amiga destructive regression suites remain unchanged and present.
+- Both C engines compile cleanly with the normal warning set.
+- Python syntax compilation passes for the GTK GUI, privileged helper, backend modules, native filesystem engines and test scripts.
+- FAT32 Growth Defrag destructive testing uses two fragmented files of 10 and 20 clusters. The final chains are contiguous at clusters 3-12 and 14-33, with one and two free clusters respectively after the files. Every payload byte is preserved.
+- FAT12 and FAT16 Growth Defrag tests rebuild a fragmented three-cluster file at clusters 2-4, preserve the A/B/C payload order and leave cluster 5 free as the rounded 10 percent growth gap.
+- The backend manifest test confirms only FAT backends advertise `CAP_GROWTH_DEFRAG` and that the GUI/helper route `growth-defrag` to the native FAT engine.
+- The complete existing regression suite passed after the change, including FAT analysis, defragmentation, compaction, directory relocation, mapped recovery, interruption, FAT mirror and live-map tests.
+- Existing NTFS, EXT, swap, Apple, allocation-mapper and mounted-analysis tests passed. Optional independently formatted NTFS tests run when their external validation utilities are available.
+- Real physical FAT media have not been used for the new Growth Defrag test; validation was performed on controlled destructive filesystem images.

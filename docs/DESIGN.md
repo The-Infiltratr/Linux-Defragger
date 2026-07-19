@@ -2,11 +2,12 @@
 
 ## User-visible operation separation
 
-`Analyse`, `Compact` and `Defragment` are independent controls. Analyse is
-read-only. Compact reorganises allocation to reduce internal free-space gaps.
-Defragment reorganises file allocation to reduce the number of physical extents
-per file. A backend advertises each operation separately through the capability
-manifest.
+`Analyse`, `Compact`, `Defragment` and `Growth Defrag` are independent controls.
+Analyse is read-only. Compact reorganises allocation to reduce internal free-space
+gaps. Defragment reorganises file allocation to reduce the number of physical
+extents per file. Growth Defrag is a FAT-specific policy layout that deliberately
+creates proportional free gaps after regular files. A backend advertises each
+operation separately through the capability manifest.
 
 The native NTFS backend enforces this separation strictly: Compact preserves
 the fragment count of every moved file, while Defragment rebuilds supported
@@ -101,6 +102,37 @@ Stable downward shifting preserves adjacency inside every selected physical exte
 ### Transaction limits
 
 `--batch-clusters` limits ordered-extent fallback transactions. A whole object may exceed that soft limit because splitting an otherwise movable complete chain would create avoidable fragmentation. `--max-clusters` remains a hard limit on the total number of physical cluster copies, including temporary staging copies.
+
+## FAT Growth Defrag planner
+
+Growth Defrag is intentionally neither ordinary Compact nor ordinary Defragment.
+It creates a future-growth layout of:
+
+```
+contiguous file A | proportional free gap | contiguous file B | proportional free gap
+```
+
+The requested percentage is converted to whole clusters with ceiling rounding
+for each non-empty regular file. Directories receive no deliberate gap. Before
+any mutation, the planner verifies that free space can hold the complete reserve
+plus a terminal workspace at least as large as the largest allocated file or
+directory chain.
+
+Phase one runs the normal FAT compactor. Phase two rescans the filesystem, orders
+the FAT32 root (where applicable), directories and regular files by their current
+lowest physical cluster, and calculates stable target positions. Bad clusters
+are treated as fixed barriers and are never counted as growth reserve.
+
+Placement proceeds in reverse physical order. A chain whose final destination is
+already free moves directly. If the destination overlaps the current chain, the
+complete object first moves into the reusable terminal workspace and then into
+its final target. The current object is always fully placed before a Stop request
+is honoured, so no object is intentionally left staged between clean stops.
+
+Both the staging move and final move use the generic mapped-cluster transaction.
+A crash can therefore leave at most one normal external journal; Recover finishes
+that transaction idempotently. A subsequent Growth Defrag run rescans and
+recalculates the complete plan rather than trusting stale byte offsets.
 
 ## FAT directory-chain defragmentation
 

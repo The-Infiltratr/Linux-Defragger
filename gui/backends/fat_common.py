@@ -13,7 +13,7 @@ class FatBackend:
         self.info = BackendInfo(
             id=f"fat{fat_bits}", display_name=f"FAT{fat_bits}",
             aliases=(f"fat{fat_bits}", "vfat" if fat_bits == 32 else f"msdos{fat_bits}"),
-            capabilities=CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_DEFRAG|CAP_RECOVER|CAP_LIVE_MAP,
+            capabilities=CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_DEFRAG|CAP_RECOVER|CAP_LIVE_MAP|CAP_GROWTH_DEFRAG,
             map_accuracy="exact")
 
     def probe(self, path: str) -> bool:

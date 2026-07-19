@@ -22,6 +22,7 @@ CAP_COMPACT = 1 << 2
 CAP_DEFRAG = 1 << 3
 CAP_RECOVER = 1 << 4
 CAP_LIVE_MAP = 1 << 5
+CAP_GROWTH_DEFRAG = 1 << 6
 
 
 class BackendError(RuntimeError):

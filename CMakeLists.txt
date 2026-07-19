@@ -60,6 +60,8 @@ if(BUILD_TESTING)
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh $<TARGET_FILE:linux-defragger-engine>)
 endif()
 
-install(DIRECTORY vendor/amitools DESTINATION lib/linux-defragger/vendor)
+install(DIRECTORY vendor/amitools DESTINATION lib/linux-defragger/vendor
+        PATTERN "__pycache__" EXCLUDE
+        PATTERN "*.pyc" EXCLUDE)
 install(FILES README.md RELEASE_NOTES.md TEST_STATUS.md DESTINATION share/doc/linux-defragger)
 install(FILES vendor/hfsutils-3.2.6/COPYING DESTINATION share/doc/linux-defragger RENAME COPYING.hfsutils)

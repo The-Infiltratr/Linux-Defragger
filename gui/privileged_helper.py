@@ -61,7 +61,7 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
     if program == "engine":
         if not ENGINE.is_file() or not os.access(ENGINE, os.X_OK):
             raise RuntimeError(f"engine is unavailable: {ENGINE}")
-        if not argv or argv[0] not in {"analyze", "map", "defrag", "compact", "recover"}:
+        if not argv or argv[0] not in {"analyze", "map", "defrag", "compact", "growth-defrag", "recover"}:
             raise RuntimeError("engine command is not allowed")
         return [str(ENGINE), *argv]
     if program == "exfat-engine":
