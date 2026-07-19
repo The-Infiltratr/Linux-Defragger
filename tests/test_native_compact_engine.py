@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+from __future__ import annotations
+import heapq
+import os
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'gui'))
+
+import native_compact_engine as n
+from backends.base import CAP_COMPACT
+from backends.ext4 import BACKEND as EXT
+from backends.btrfs import BACKEND as BTRFS
+from backends.xfs import BACKEND as XFS
+
+
+def test_ioctl_layouts():
+    assert n.FS_IOC_FIEMAP == 3223348747
+    assert n.FS_IOC_FSGETXATTR == 2149341215
+    assert n.XFS_IOC_EXCHANGE_RANGE == 1076385921
+    assert n.EXT4_IOC_MOVE_EXT == 3223873039
+    assert n.BTRFS_IOC_BALANCE_V2 == 3288372256
+    assert n.BTRFS_IOC_BALANCE_CTL == 1074041889
+    assert len(n._balance_request(7, 4096, 8192)) == 1024
+    request = n._balance_request(7, 4096, 8192)
+    assert struct.unpack_from('=Q', request, 0)[0] == 7
+    for offset in (16, 152, 288):
+        assert struct.unpack_from('=Q', request, offset + 16)[0] == 7
+        assert struct.unpack_from('=Q', request, offset + 24)[0] == 4096
+        assert struct.unpack_from('=Q', request, offset + 32)[0] == 8192
+        assert struct.unpack_from('=Q', request, offset + 72)[0] == 1
+
+
+def test_tail_source_selection_and_partial_suffix():
+    heap = []
+    low = n.SourceExtent('/low', 0, 100, 50, 0, 0)
+    high = n.SourceExtent('/high', 4096, 1000, 200, 0, 1)
+    heapq.heappush(heap, (-low.physical_end, low.token, low.generation, low))
+    heapq.heappush(heap, (-high.physical_end, high.token, high.generation, high))
+    selected = n._pop_high_source(heap, 300)
+    assert selected is high
+    selected.length -= 64
+    n._requeue_source(heap, selected)
+    selected2 = n._pop_high_source(heap, 300)
+    assert selected2 is high
+    assert selected2.physical_end == 1136
+
+
+def test_range_merging():
+    result = n._merge_ranges([(20, 30), (0, 10), (8, 15), (40, 40)])
+    assert [(x.start, x.end) for x in result] == [(0, 15), (20, 30)]
+
+
+def test_copy_range_zero_pads_last_allocated_block():
+    with tempfile.TemporaryDirectory() as directory:
+        source_path = Path(directory) / 'source'
+        donor_path = Path(directory) / 'donor'
+        source_path.write_bytes(b'abc')
+        donor_path.write_bytes(b'\0' * 8)
+        source_fd = os.open(source_path, os.O_RDONLY)
+        donor_fd = os.open(donor_path, os.O_RDWR)
+        try:
+            n._copy_range(source_fd, 0, donor_fd, 8)
+        finally:
+            os.close(source_fd)
+            os.close(donor_fd)
+        assert donor_path.read_bytes() == b'abc' + b'\0' * 5
+
+
+def test_ext2_and_ext3_do_not_advertise_compact_in_gui():
+    gui = (ROOT / 'gui' / 'linux_defragger_gui.py').read_text()
+    assert 'self.fstype.lower() != "ext4"' in gui
+    assert 'capabilities &= ~CAP_COMPACT' in gui
+
+
+def test_backend_capabilities():
+    assert EXT.info.capabilities & CAP_COMPACT
+    assert BTRFS.info.capabilities & CAP_COMPACT
+    assert XFS.info.capabilities & CAP_COMPACT
+
+
+def test_gui_and_helper_dispatch_are_wired():
+    gui = (ROOT / 'gui' / 'linux_defragger_gui.py').read_text()
+    helper = (ROOT / 'gui' / 'privileged_helper.py').read_text()
+    assert 'find_native_compact_engine' in gui
+    assert 'native-compact-engine' in gui
+    assert 'volume.normalized_fstype in {"ext4", "btrfs", "xfs"}' in gui
+    assert 'NATIVE_COMPACT_ENGINE' in helper
+    assert 'native-compact-engine' in helper
+
+
+if __name__ == '__main__':
+    for name, value in sorted(globals().items()):
+        if name.startswith('test_') and callable(value):
+            value()
+            print(name, 'ok')

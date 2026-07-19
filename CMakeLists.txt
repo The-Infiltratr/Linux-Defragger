@@ -39,7 +39,7 @@ set_target_properties(linux-defragger-hfs-engine PROPERTIES OUTPUT_NAME hfs_engi
 install(TARGETS linux-defragger-engine RUNTIME DESTINATION bin)
 install(TARGETS linux-defragger-hfs-engine RUNTIME DESTINATION lib/linux-defragger)
 install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py
-                 gui/exfat_engine.py gui/affs_engine.py gui/apple_engine.py gui/ntfs_engine.py
+                 gui/exfat_engine.py gui/affs_engine.py gui/apple_engine.py gui/ntfs_engine.py gui/native_compact_engine.py
         DESTINATION lib/linux-defragger)
 install(FILES gui/version.py DESTINATION lib/linux-defragger)
 install(FILES

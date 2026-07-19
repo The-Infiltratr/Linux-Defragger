@@ -13,7 +13,7 @@ import struct
 
 from .base import *
 
-INFO = BackendInfo("ext4", "ext2/3/4", ("ext2", "ext3", "ext4"), CAP_ANALYSE | CAP_MAP, "exact")
+INFO = BackendInfo("ext4", "ext2/3/4", ("ext2", "ext3", "ext4"), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact")
 
 _EXT4_EXTENTS_FL = 0x00080000
 _EXT4_INLINE_DATA_FL = 0x10000000

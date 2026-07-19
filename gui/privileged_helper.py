@@ -34,6 +34,7 @@ EXFAT_ENGINE = Path("/usr/lib/linux-defragger/exfat_engine.py")
 AFFS_ENGINE = Path("/usr/lib/linux-defragger/affs_engine.py")
 APPLE_ENGINE = Path("/usr/lib/linux-defragger/apple_engine.py")
 NTFS_ENGINE = Path("/usr/lib/linux-defragger/ntfs_engine.py")
+NATIVE_COMPACT_ENGINE = Path("/usr/lib/linux-defragger/native_compact_engine.py")
 UDISKSCTL = Path("/usr/bin/udisksctl")
 
 _emit_lock = threading.Lock()
@@ -88,6 +89,12 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
         if not argv or argv[0] not in {"compact", "defrag", "recover"}:
             raise RuntimeError("NTFS engine command is not allowed")
         return [str(NTFS_ENGINE), *argv]
+    if program == "native-compact-engine":
+        if not NATIVE_COMPACT_ENGINE.is_file() or not os.access(NATIVE_COMPACT_ENGINE, os.X_OK):
+            raise RuntimeError(f"native Linux compact engine is unavailable: {NATIVE_COMPACT_ENGINE}")
+        if not argv or argv[0] != "compact":
+            raise RuntimeError("native Linux compact command is not allowed")
+        return [str(NATIVE_COMPACT_ENGINE), *argv]
     if program == "mapper":
         if not MAPPER.is_file() or not os.access(MAPPER, os.X_OK):
             raise RuntimeError(f"allocation mapper is unavailable: {MAPPER}")

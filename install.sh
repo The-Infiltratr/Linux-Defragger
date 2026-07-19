@@ -13,6 +13,7 @@ install -Dm755 "$ROOT/gui/exfat_engine.py" /usr/lib/linux-defragger/exfat_engine
 install -Dm755 "$ROOT/gui/affs_engine.py" /usr/lib/linux-defragger/affs_engine.py
 install -Dm755 "$ROOT/gui/apple_engine.py" /usr/lib/linux-defragger/apple_engine.py
 install -Dm755 "$ROOT/gui/ntfs_engine.py" /usr/lib/linux-defragger/ntfs_engine.py
+install -Dm755 "$ROOT/gui/native_compact_engine.py" /usr/lib/linux-defragger/native_compact_engine.py
 install -Dm644 "$ROOT/gui/version.py" /usr/lib/linux-defragger/version.py
 install -Dm755 "$ROOT/tools/linux-defragger-testdata.py" /usr/bin/linux-defragger-testdata
 install -Dm755 "$ROOT/build/hfs_engine" /usr/lib/linux-defragger/hfs_engine

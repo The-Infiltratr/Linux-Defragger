@@ -150,6 +150,14 @@ def find_ntfs_engine() -> str:
     )
 
 
+def find_native_compact_engine() -> str:
+    return _configured_executable(
+        "LINUX_DEFRAGGER_NATIVE_COMPACT_ENGINE",
+        "/usr/lib/linux-defragger/native_compact_engine.py",
+        "the native ext4, XFS and Btrfs compact engine",
+    )
+
+
 def find_privileged_helper() -> str:
     return _configured_executable(
         "LINUX_DEFRAGGER_HELPER",
@@ -191,7 +199,12 @@ class Volume:
 
     @property
     def capabilities(self) -> int:
-        return BACKEND_CAPABILITIES.get(self.normalized_fstype, 0)
+        capabilities = BACKEND_CAPABILITIES.get(self.normalized_fstype, 0)
+        # The ext backend analyses ext2, ext3 and ext4, but the native extent
+        # exchange compactor is deliberately limited to actual ext4 volumes.
+        if self.normalized_fstype == "ext4" and self.fstype.lower() != "ext4":
+            capabilities &= ~CAP_COMPACT
+        return capabilities
 
     @property
     def display_name(self) -> str:
@@ -416,6 +429,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.exfat_engine = find_exfat_engine()
         self.apple_engine = find_apple_engine()
         self.ntfs_engine = find_ntfs_engine()
+        self.native_compact_engine = find_native_compact_engine()
         self.affs_engine = str(Path(__file__).resolve().parent / "affs_engine.py")
         if not Path(self.affs_engine).is_file():
             self.affs_engine = "/usr/lib/linux-defragger/affs_engine.py"
@@ -1206,7 +1220,20 @@ class MainWindow(Gtk.ApplicationWindow):
             "recover": "Complete or roll back the interrupted journalled transaction.",
         }
         extra_warning = ""
-        if volume.normalized_fstype == "ntfs":
+        if operation == "compact" and volume.normalized_fstype in {"ext4", "xfs"}:
+            extra_warning = (
+                "\n\nThis Compact pass mounts the otherwise-unmounted volume privately and uses "
+                "the filesystem kernel driver to exchange high regular-file extents into low "
+                "free ranges. It may increase fragmentation and does not move filesystem metadata."
+                + (" XFS range exchange requires Linux 6.10 or newer."
+                   if volume.normalized_fstype == "xfs" else "")
+            )
+        elif operation == "compact" and volume.normalized_fstype == "btrfs":
+            extra_warning = (
+                "\n\nBtrfs Compact uses native one-chunk balance transactions to consolidate "
+                "physical chunk allocation. It does not run file defragmentation."
+            )
+        elif volume.normalized_fstype == "ntfs":
             if operation == "compact":
                 extra_warning = (
                     "\n\nNTFS Compact moves complete physical extents into lower gaps while "
@@ -1241,8 +1268,12 @@ class MainWindow(Gtk.ApplicationWindow):
                             self.affs_engine if volume.normalized_fstype == "affs" else
                             self.apple_engine if volume.normalized_fstype in {"hfs", "hfsplus"} else
                             self.ntfs_engine if volume.normalized_fstype == "ntfs" else
-                            self.engine)
+                            self.native_compact_engine if (
+                                operation == "compact" and volume.normalized_fstype in {"ext4", "btrfs", "xfs"}
+                            ) else self.engine)
         args = [operation_engine, operation, volume.path, "--write", "--confirm", volume.path, "--journal", journal]
+        if operation_engine == self.native_compact_engine:
+            args += ["--filesystem", volume.normalized_fstype]
         live_cells = len(self.map_data.get("cells", [])) if self.map_data else self._desired_map_cells()
         live_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(live_cells)))
         if operation == "defrag":
@@ -1308,6 +1339,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return "apple-engine", args[1:]
         if executable == os.path.realpath(self.ntfs_engine):
             return "ntfs-engine", args[1:]
+        if executable == os.path.realpath(self.native_compact_engine):
+            return "native-compact-engine", args[1:]
         if os.path.basename(args[0]) == "udisksctl":
             return "udisksctl", args[1:]
         raise RuntimeError(f"The privileged helper does not permit: {args[0]}")

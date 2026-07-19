@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from .base import *
 
-INFO = BackendInfo("xfs", "XFS", ("xfs",), CAP_ANALYSE | CAP_MAP, "exact")
+INFO = BackendInfo("xfs", "XFS", ("xfs",), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact")
 
 _XFS_SB_MAGIC = b"XFSB"
 _XFS_AGF_MAGIC = b"XAGF"

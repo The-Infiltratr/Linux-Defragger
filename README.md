@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-22
+# Linux Defragger 1.8.0-23
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -38,10 +38,18 @@ The operation refuses to start unless the volume has enough free clusters for bo
 - Classic Apple HFS: analyse, map, compact, defragment and recover.
 - Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
 - NTFS: analyse, map, native offline compact, native offline defragment and recover.
-- EXT2/3/4: read-only allocation maps and file/directory fragmentation analysis.
-- Btrfs: genuine native read-only physical allocation maps and file-fragmentation analysis for single-device filesystems using non-striped local profiles. The analyser walks the chunk, root, extent and filesystem trees directly. Multi-device and striped RAID profiles remain conservatively unsupported.
-- XFS: genuine native read-only physical allocation maps and file/directory fragmentation analysis. The analyser walks allocation-group free-space B+trees, inode B+trees and inode data-fork extent trees directly. Realtime-file data on a separate realtime device is reported but cannot be positioned on the data-device map.
+- EXT2/3/4: read-only allocation maps and file/directory fragmentation analysis. Actual ext4 extent-format volumes also support native Compact; ext2, ext3 and ext4 bigalloc remain analysis-only.
+- Btrfs: genuine native physical allocation maps, file-fragmentation analysis and chunk-level Compact for single-device filesystems using non-striped local profiles. Multi-device and striped RAID profiles remain conservatively unsupported.
+- XFS: genuine native physical allocation maps, file/directory fragmentation analysis and range-level Compact on kernels that provide `XFS_IOC_EXCHANGE_RANGE` (Linux 6.10 or newer). Realtime-file data on a separate realtime device is reported but is not moved by Compact.
 - UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
+
+### Native ext4, XFS and Btrfs Compact semantics
+
+The ext4 and XFS compactors use the mounted kernel filesystem driver rather than editing live metadata structures themselves. The GUI still requires the volume to be unmounted; the privileged engine mounts it privately, reserves accessible free extents in unlinked collector files, opens the lowest physical hole, allocates a donor into that exact hole, and exchanges a high regular-file extent into it. The operation is deliberately allowed to split files and increase fragmentation. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsupported extents are left in place. Filesystem metadata is not moved.
+
+Each ext4 move uses `EXT4_IOC_MOVE_EXT`; each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. Temporary collector and donor files are unlinked and held only by open descriptors, so they disappear automatically if the process exits. A safe Stop finishes or abandons the current kernel transaction and exits between exchanges.
+
+Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses filtered native balance transactions to relocate high physical chunks into lower unallocated device gaps. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each balance transaction and stops if the allocator no longer moves the boundary.
 
 ### FAT and exFAT Compact semantics
 

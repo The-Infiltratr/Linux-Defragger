@@ -1,25 +1,27 @@
-# Test status for 1.8.0-22
+# Test status for 1.8.0-23
 
-Validated in controlled filesystem images:
+Validated in this build environment:
 
-- Btrfs single-device analysis using a synthetic filesystem with a system chunk array, mirrored metadata chunks, a multi-level filesystem tree, extent-tree allocations, two regular files and one directory.
-- Btrfs exact physical map accounting, free-space complement, metadata/data allocation, superblock reservation and detection of a two-extent fragmented file.
-- Btrfs conservative rejection paths for unsupported or contradictory physical mappings remain active.
-- XFS v5 analysis using a synthetic filesystem with multi-level allocation-group free-space and inode B+trees, sparse inode records, direct inode extents and an external bmap B+tree.
-- XFS exact free/used data-device mapping, regular-file and directory counts, fragmented-file detection and physical fragmentation overlays.
-- Existing FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper and GUI focused tests remain present.
-- Unified version reporting and package metadata now identify revision `1.8.0-22`.
+- Native Compact ioctl numbers and binary request layouts against the installed Linux UAPI headers for FIEMAP, ext4 move-extent and Btrfs balance/control.
+- Btrfs balance request packing for data, metadata and system filters, device ranges and one-chunk-per-class limits.
+- Lowest-gap/highest-source planning, partial suffix selection, physical-range merging, capability advertising, GUI dispatch and privileged-helper allowlisting.
+- Python syntax checks for the native compact engine, GUI and privileged helper.
+- Existing synthetic Btrfs and XFS analyser tests, including corrected Btrfs leaf offsets and multi-level XFS trees.
+- Existing focused FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper, Growth Defrag and GUI tests remain present.
+- Unified version reporting and package metadata identify revision `1.8.0-23`.
 
-The Btrfs and XFS analysers are read-only and do not depend on `btrfs-progs` or `xfsprogs` at runtime. The synthetic tests exercise the on-disk parsers and map builders without mutating the images.
+The new ext4, XFS and Btrfs mutation paths require a real block device and a private kernel mount. This container does not have `CAP_SYS_ADMIN`, so it cannot mount loop images and could not execute a destructive physical relocation test. Shannon's removable-media ext4, Btrfs and XFS partitions are therefore the first physical validation targets for these three new compactors. The program must be treated as experimental on them until those tests complete.
 
-Physical Btrfs and XFS removable-media partitions have not yet been validated in this build environment. Shannon's multi-filesystem SD-card test is the first intended real-device validation, and any mismatch should be treated as a parser bug until investigated.
+Safety boundaries retained in the untested physical paths:
 
-## Revision 22 Btrfs leaf-offset correction
-
-- The Btrfs multi-level tree image now encodes leaf item offsets relative to the end of the 101-byte tree header, matching the native on-disk format.
-- The corrected analyser passes allocation, file count, fragmentation and map-overlay assertions on that image.
-- A physical Btrfs volume remains the required final validation for this correction.
+- The GUI and engine require the target to be unmounted before starting.
+- ext4/XFS use kernel-journalled mapping exchange calls and retain old high allocations in unlinked donor files until the pass ends.
+- If the allocator does not place the donor in the exact requested low hole, no exchange occurs and the pass stops.
+- Unsupported inode flags and FIEMAP extent states are skipped. Filesystem metadata is never rewritten directly.
+- XFS kernels without `XFS_IOC_EXCHANGE_RANGE` fail before a mapping exchange.
+- Btrfs is limited to single-device non-striped layouts and re-reads the physical chunk layout after each balance transaction.
+- SIGINT requests a Btrfs balance cancellation or stops ext4/XFS between completed exchange transactions.
 
 ## Long-suite status
 
-- The unchanged full regression script was run for 15 minutes. It reached the existing FAT recovery and compaction coverage without reporting a failure before the execution limit stopped the run.
+Focused revision-23 tests pass. The complete historical regression suite is substantially longer and was not used as a substitute for the missing real-device mutation tests.

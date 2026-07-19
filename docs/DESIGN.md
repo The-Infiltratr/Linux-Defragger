@@ -206,7 +206,7 @@ directory-fragmentation count.
 SINGLE, DUP and local same-device mirrors are supported. Multi-device chunks and
 RAID0/10/5/6 layouts are rejected until a stripe-aware multi-device mapper can
 represent every physical target. The backend opens the volume read-only and
-advertises no mutation capabilities.
+advertises no mutation capabilities in the analyser itself; revision 23 adds a separate kernel-driven Compact engine.
 
 ## Native XFS read-only analyser
 
@@ -226,9 +226,22 @@ map and is reported conservatively.
 
 The XFS analyser supports version 4 and version 5 short B+tree headers, version 5
 CRC bmap blocks, sparse inodes and NREXT64 inode extent counters. It opens the
-filesystem read-only, invokes no external XFS utility and advertises no mutation
-capabilities.
+filesystem read-only and invokes no external XFS utility. Revision 23 adds a separate kernel-driven Compact engine when the running kernel supports range exchange.
 
 ## GUI analysis cache and concurrent volumes
 
 Each window owns an independent privileged helper and operation state. Opening another window permits a second volume to be analysed or modified while the first window continues its journalled operation. A volume is analysed automatically when selected. The returned allocation cells are cached by device path and resampled over the current drawing area; window resizing is therefore a memory-only redraw. A manual volume refresh invalidates the cache.
+
+## Native ext4 and XFS free-space compactor
+
+The native Linux compactor does not call the file-defragmentation utilities. It privately mounts an otherwise-unmounted filesystem and creates unlinked collector files that temporarily own nearly all accessible free blocks. FIEMAP on the collector is therefore the kernel-confirmed physical free map. For each low collector extent, the engine punches one aligned range, allocates an unlinked donor into the exposed hole and verifies the donor's physical address before touching a user file.
+
+The highest supported regular-file extent is copied into the donor. ext4 commits the mapping with `EXT4_IOC_MOVE_EXT`; XFS commits it with `XFS_IOC_EXCHANGE_RANGE`. The donor then owns the old high mapping and remains open until the end of the pass. Closing the collector set releases all retained high mappings together. This is a compaction planner, not a defragmentation planner: a partial suffix may be moved and the source file may gain another extent.
+
+Collector and donor names are unlinked immediately. If the process terminates before an exchange, closing the descriptors restores the low hole without changing the source file. If it terminates after a successful kernel transaction, the source file already owns the low mapping and descriptor teardown releases the high mapping. The engine never writes ext4 or XFS allocation metadata directly.
+
+## Native Btrfs chunk compactor
+
+Btrfs file extents cannot be exchanged safely without updating copy-on-write backreferences. Compact therefore operates at the chunk layer. The engine reads the native chunk tree, finds unallocated physical device gaps below the chunk high-water mark, privately mounts the single-device filesystem and submits filtered `BTRFS_IOC_BALANCE_V2` requests for high physical data, metadata and system chunks. The layout is synchronised and read again after each request. No-progress detection prevents an endless balance loop, and Stop sends `BTRFS_IOC_BALANCE_CTL` cancellation.
+
+This operation can consolidate device-level chunk allocation but does not promise to remove free space inside allocated Btrfs block groups. That inner free space belongs to Btrfs's own extent allocator and is distinct from unallocated device gaps between chunks.

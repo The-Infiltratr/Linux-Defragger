@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from .base import *
 
-INFO = BackendInfo("btrfs", "Btrfs", ("btrfs",), CAP_ANALYSE | CAP_MAP, "exact-single-device")
+INFO = BackendInfo("btrfs", "Btrfs", ("btrfs",), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact-single-device")
 
 _BTRFS_MAGIC = b"_BHRfS_M"
 _SUPER_OFFSET = 64 * 1024
