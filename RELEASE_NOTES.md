@@ -1,7 +1,7 @@
-# Linux Defragger 1.8.0 package revision 7
+# Linux Defragger 1.8.0 package revision 8
 
-- Replaced the rejected NTFS-3G/`ntfsresize` shortcut with Linux Defragger's own native NTFS compaction engine.
-- Removed the `ntfs-3g` runtime package dependency.
-- Added direct NTFS mapping-pairs encoding, MFT update-sequence handling, `$Bitmap` allocation updates, `$Volume`/`$MFTMirr` dirty-state handling and external interrupted-move recovery.
-- NTFS Compact now relocates conservative ordinary file-data streams toward lower free clusters without resizing the filesystem or changing the partition table.
-- NTFS system metadata, directories, compressed, sparse, encrypted and attribute-list streams remain intentionally immovable in this first native stage.
+- Corrected native NTFS `$VOLUME_INFORMATION` validation. Revision 7 incorrectly treated every non-zero volume flag as the dirty state.
+- NTFS dirty detection now checks only the defined `0x0001` dirty bit.
+- The observed undocumented `0x0080` flag is accepted and preserved exactly while Linux Defragger temporarily adds and removes its transaction dirty bit.
+- Active NTFS maintenance states and genuinely dirty volumes remain blocked. Other unrecognised flag bits remain conservatively rejected.
+- Added destructive relocation and recovery regression coverage for a volume carrying `0x0080`, including exact post-operation flag restoration and SHA-256 payload retention.

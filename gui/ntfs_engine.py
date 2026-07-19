@@ -51,6 +51,28 @@ ATTR_ENCRYPTED = 0x4000
 ATTR_SPARSE = 0x8000
 FILE_REFERENCE_MASK = (1 << 48) - 1
 
+# $VOLUME_INFORMATION flags.  Only VOLUME_IS_DIRTY means the filesystem is
+# dirty.  Bit 0x0080 is present on some valid modern volumes but remains
+# undocumented; preserve it exactly rather than treating every non-zero flag
+# as corruption.  Unknown flags other than this observed preserved bit are
+# rejected conservatively.
+VOLUME_IS_DIRTY = 0x0001
+VOLUME_RESIZE_LOG_FILE = 0x0002
+VOLUME_UPGRADE_ON_MOUNT = 0x0004
+VOLUME_MOUNTED_ON_NT4 = 0x0008
+VOLUME_DELETE_USN_UNDERWAY = 0x0010
+VOLUME_REPAIR_OBJECT_ID = 0x0020
+VOLUME_OBSERVED_UNKNOWN_0080 = 0x0080
+VOLUME_CHKDSK_UNDERWAY = 0x4000
+VOLUME_MODIFIED_BY_CHKDSK = 0x8000
+VOLUME_UNSAFE_WRITE_MASK = (
+    VOLUME_IS_DIRTY | VOLUME_RESIZE_LOG_FILE | VOLUME_UPGRADE_ON_MOUNT |
+    VOLUME_DELETE_USN_UNDERWAY | VOLUME_REPAIR_OBJECT_ID |
+    VOLUME_CHKDSK_UNDERWAY | VOLUME_MODIFIED_BY_CHKDSK
+)
+VOLUME_PRESERVED_SAFE_MASK = VOLUME_MOUNTED_ON_NT4 | VOLUME_OBSERVED_UNKNOWN_0080
+VOLUME_ACCEPTED_MASK = VOLUME_UNSAFE_WRITE_MASK | VOLUME_PRESERVED_SAFE_MASK
+
 _stop_requested = False
 
 
@@ -460,6 +482,33 @@ def _write_mft_record(volume: Volume, mft_runs: Iterable[Run], record_number: in
     _write_stream(volume, mft_runs, record_number * volume.mft_record_size, raw)
 
 
+def _validate_volume_flags(flags: int, *, allow_dirty: bool = False) -> None:
+    """Reject unsafe NTFS states while preserving benign non-zero flags.
+
+    The old implementation treated any non-zero value as "dirty".  NTFS uses
+    only bit 0x0001 for that state.  We retain benign flags verbatim when
+    temporarily adding our transaction dirty bit.
+    """
+    unsupported = flags & ~VOLUME_ACCEPTED_MASK
+    if unsupported:
+        raise NtfsCompactError(
+            f"unsupported NTFS volume flags are set (0x{flags:04x}; "
+            f"unknown mask 0x{unsupported:04x})"
+        )
+    if (flags & VOLUME_IS_DIRTY) and not allow_dirty:
+        raise NtfsCompactError(
+            f"NTFS dirty flag is set (0x{flags:04x}); run Windows chkdsk first"
+        )
+    unsafe = flags & VOLUME_UNSAFE_WRITE_MASK
+    if allow_dirty:
+        unsafe &= ~VOLUME_IS_DIRTY
+    if unsafe:
+        raise NtfsCompactError(
+            f"NTFS volume has an active maintenance state (0x{flags:04x}); "
+            "complete it in Windows before compacting"
+        )
+
+
 def _read_layout(volume: Volume, *, allow_dirty: bool = False, check_volume: bool = True) -> NtfsLayout:
     _raw0, _fixed0, mft_attr = _record_zero(volume)
     mft_runs = mft_attr.runs
@@ -477,10 +526,7 @@ def _read_layout(volume: Volume, *, allow_dirty: bool = False, check_volume: boo
                 break
         if flags_seen is None:
             raise NtfsCompactError("NTFS volume-information attribute was not found")
-        if flags_seen and not allow_dirty:
-            raise NtfsCompactError(f"NTFS volume flags are not clean (0x{flags_seen:04x}); run Windows chkdsk first")
-        if flags_seen & ~0x0001:
-            raise NtfsCompactError(f"unsupported NTFS volume flags are set (0x{flags_seen:04x})")
+        _validate_volume_flags(flags_seen, allow_dirty=allow_dirty)
 
     _, _raw6, fixed6 = _read_mft_record(volume, mft_runs, 6)
     bitmap_attrs = [attr for attr in _attributes(fixed6)
@@ -512,10 +558,9 @@ def _volume_record_state(layout: NtfsLayout) -> tuple[bytes, bytes, bytes, bytes
         raise NtfsCompactError("invalid NTFS volume-information attribute")
     flags_offset = info.offset + value_off + 10
     flags = _u16(fixed, flags_offset)
-    if flags:
-        raise NtfsCompactError(f"NTFS volume flags changed during compaction (0x{flags:04x})")
+    _validate_volume_flags(flags)
     dirty_fixed = bytearray(fixed)
-    struct.pack_into("<H", dirty_fixed, flags_offset, flags | 0x0001)
+    struct.pack_into("<H", dirty_fixed, flags_offset, flags | VOLUME_IS_DIRTY)
     dirty_raw = _prepare_fixups(dirty_fixed, volume.bytes_per_sector)
 
     mirror_offset = volume.mftmirr_lcn * volume.cluster_size + 3 * volume.mft_record_size
@@ -533,7 +578,7 @@ def _volume_record_state(layout: NtfsLayout) -> tuple[bytes, bytes, bytes, bytes
     if _u16(mirror_fixed, mirror_flags_offset) != flags:
         raise NtfsCompactError("NTFS $Volume and $MFTMirr flags disagree")
     mirror_dirty_fixed = bytearray(mirror_fixed)
-    struct.pack_into("<H", mirror_dirty_fixed, mirror_flags_offset, flags | 0x0001)
+    struct.pack_into("<H", mirror_dirty_fixed, mirror_flags_offset, flags | VOLUME_IS_DIRTY)
     mirror_dirty_raw = _prepare_fixups(mirror_dirty_fixed, volume.bytes_per_sector)
     return raw, dirty_raw, mirror_raw, mirror_dirty_raw
 

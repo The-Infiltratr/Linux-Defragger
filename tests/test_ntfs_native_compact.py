@@ -102,7 +102,7 @@ def record(number: int, attrs: list[bytes]) -> bytes:
     return ntfs_engine._prepare_fixups(fixed, BPS)
 
 
-def make_image(path: Path) -> bytes:
+def make_image(path: Path, volume_flags: int = 0) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -122,7 +122,7 @@ def make_image(path: Path) -> bytes:
     volume_info = bytearray(12)
     volume_info[8] = 3
     volume_info[9] = 1
-    struct.pack_into("<H", volume_info, 10, 0)
+    struct.pack_into("<H", volume_info, 10, volume_flags)
     records[3] = record(3, [resident(0x70, bytes(volume_info))])
     records[6] = record(6, [nonresident(0x80, [(BITMAP_LCN, 1)], (TOTAL_CLUSTERS + 7) // 8)])
     records[24] = record(24, [nonresident(0x80, [(DATA_LCN, DATA_CLUSTERS)], DATA_CLUSTERS * CLUSTER_SIZE)])
@@ -145,6 +145,20 @@ def make_image(path: Path) -> bytes:
     image[DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE] = payload
     path.write_bytes(image)
     return payload
+
+
+def current_volume_flags(path: Path) -> int:
+    volume = ntfs_engine._open_volume(str(path), False)
+    try:
+        _raw0, _fixed0, mft_attr = ntfs_engine._record_zero(volume)
+        _offset, _raw, fixed = ntfs_engine._read_mft_record(volume, mft_attr.runs, 3)
+        for attr in ntfs_engine._attributes(fixed):
+            if attr.atype == ntfs_engine.ATTR_VOLUME_INFORMATION and not attr.nonresident:
+                value_off = ntfs_engine._u16(fixed, attr.offset + 20)
+                return ntfs_engine._u16(fixed, attr.offset + value_off + 10)
+        raise AssertionError("volume information missing")
+    finally:
+        ntfs_engine._close_volume(volume)
 
 
 def current_data_run(path: Path) -> tuple[int, int]:
@@ -213,7 +227,36 @@ def main() -> None:
         actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
         assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
 
-    print("Native NTFS compact and recovery test passed")
+        # A real-world NTFS volume may carry the undocumented 0x0080 bit.  It
+        # is not the dirty bit and must survive our temporary dirty-state
+        # transaction unchanged.
+        payload = make_image(image, ntfs_engine.VOLUME_OBSERVED_UNKNOWN_0080)
+        assert current_volume_flags(image) == 0x0080
+        ntfs_engine._stop_requested = False
+        assert ntfs_engine.compact(str(image), journal) == 0
+        assert current_volume_flags(image) == 0x0080
+        destination, count = current_data_run(image)
+        actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
+        assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+        # The actual dirty bit is still a hard stop, and an unrecognised flag
+        # remains rejected rather than guessed at.
+        make_image(image, ntfs_engine.VOLUME_IS_DIRTY)
+        try:
+            ntfs_engine.compact(str(image), journal)
+        except ntfs_engine.NtfsCompactError as exc:
+            assert "dirty flag" in str(exc)
+        else:
+            raise AssertionError("dirty NTFS volume was accepted")
+        make_image(image, 0x0040)
+        try:
+            ntfs_engine.compact(str(image), journal)
+        except ntfs_engine.NtfsCompactError as exc:
+            assert "unsupported NTFS volume flags" in str(exc)
+        else:
+            raise AssertionError("unknown NTFS volume flag was accepted")
+
+    print("Native NTFS compact, recovery and volume-flag tests passed")
 
 
 if __name__ == "__main__":
