@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import heapq
 import json
 import os
 import signal
@@ -30,9 +31,10 @@ import stat
 import struct
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TextIO
 
 SCHEMA = 2
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
@@ -40,10 +42,17 @@ BLKGETSIZE64 = 0x80081272
 COPY_CHUNK = 8 * 1024 * 1024
 MFT_RECORD_CHUNK = 16 * 1024 * 1024
 FIRST_USER_RECORD = 24
+REPORT_EVERY_FILES = 128
+REPORT_EVERY_CLUSTERS = 262144
+REPORT_EVERY_SECONDS = 2.0
 
 ATTR_ATTRIBUTE_LIST = 0x20
-ATTR_DATA = 0x80
+ATTR_FILE_NAME = 0x30
 ATTR_VOLUME_INFORMATION = 0x70
+ATTR_DATA = 0x80
+ATTR_INDEX_ROOT = 0x90
+ATTR_INDEX_ALLOCATION = 0xA0
+ATTR_BITMAP = 0xB0
 RECORD_IN_USE = 0x0001
 RECORD_DIRECTORY = 0x0002
 ATTR_COMPRESSED = 0x0001
@@ -147,6 +156,63 @@ class NtfsLayout:
     bitmap_runs: tuple[Run, ...]
     bitmap_data_size: int
     bitmap: bytearray
+
+
+@dataclass(frozen=True)
+class StreamInfo:
+    record_number: int
+    base_record_number: int
+    attribute_offset: int
+    attribute_type: int
+    attribute_name: str
+    file_name: str
+    flags: int
+    runs: tuple[Run, ...]
+    movable: bool
+    blocker_reason: str
+    generation: int = 0
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.record_number, self.attribute_offset
+
+    @property
+    def clusters(self) -> int:
+        return sum(run.length for run in self.runs if run.lcn is not None)
+
+    @property
+    def highest_lcn(self) -> int:
+        return max((run.lcn + run.length for run in self.runs if run.lcn is not None), default=0)
+
+    @property
+    def lowest_lcn(self) -> int:
+        return min((run.lcn for run in self.runs if run.lcn is not None), default=0)
+
+
+@dataclass
+class AllocationPlan:
+    streams: dict[tuple[int, int], StreamInfo]
+    heap: list[tuple[int, int, int, int]]
+    movable_count: int
+    malformed_records: int
+    hibernation_active: bool
+
+
+SYSTEM_RECORD_NAMES = {
+    0: "$MFT", 1: "$MFTMirr", 2: "$LogFile", 3: "$Volume",
+    4: "$AttrDef", 5: "$Root", 6: "$Bitmap", 7: "$Boot",
+    8: "$BadClus", 9: "$Secure", 10: "$UpCase", 11: "$Extend",
+}
+
+ATTRIBUTE_NAMES = {
+    0x10: "$STANDARD_INFORMATION", ATTR_ATTRIBUTE_LIST: "$ATTRIBUTE_LIST",
+    ATTR_FILE_NAME: "$FILE_NAME", 0x40: "$OBJECT_ID", 0x50: "$SECURITY_DESCRIPTOR",
+    ATTR_VOLUME_INFORMATION: "$VOLUME_INFORMATION", 0x60: "$VOLUME_NAME",
+    ATTR_DATA: "$DATA", ATTR_INDEX_ROOT: "$INDEX_ROOT",
+    ATTR_INDEX_ALLOCATION: "$INDEX_ALLOCATION", ATTR_BITMAP: "$BITMAP",
+    0xC0: "$REPARSE_POINT", 0xD0: "$EA_INFORMATION", 0xE0: "$EA",
+    0xF0: "$PROPERTY_SET", 0x100: "$LOGGED_UTILITY_STREAM",
+}
 
 
 def _stop(_signum: int, _frame: object) -> None:
@@ -715,39 +781,324 @@ def _find_free_run(bitmap: bytes | bytearray, length: int, before: int) -> int |
     return None
 
 
-def _candidate_records(layout: NtfsLayout) -> list[Candidate]:
-    volume = layout.volume
-    record_count = min(layout.mft_data_size // volume.mft_record_size, 0xFFFFFFFF)
-    candidates: list[Candidate] = []
-    for number in range(FIRST_USER_RECORD, record_count):
+def _decode_attribute_name(name: bytes) -> str:
+    if not name:
+        return ""
+    return name.decode("utf-16le", errors="replace")
+
+
+def _best_file_name(record: bytes | bytearray, attrs: Iterable[Attribute], record_number: int) -> str:
+    if record_number in SYSTEM_RECORD_NAMES:
+        return SYSTEM_RECORD_NAMES[record_number]
+    choices: list[tuple[int, str]] = []
+    for attr in attrs:
+        if attr.atype != ATTR_FILE_NAME or attr.nonresident:
+            continue
         try:
-            record_offset, raw, fixed = _read_mft_record(volume, layout.mft_runs, number)
+            value = _resident_value(record, attr)
         except NtfsCompactError:
             continue
-        if fixed[:4] != b"FILE":
+        if len(value) < 66:
             continue
-        flags = _u16(fixed, 22)
-        if not (flags & RECORD_IN_USE) or (flags & RECORD_DIRECTORY):
+        name_length = value[64]
+        namespace = value[65]
+        end = 66 + name_length * 2
+        if end > len(value):
             continue
-        if _u64(fixed, 32) & FILE_REFERENCE_MASK:
+        name = value[66:end].decode("utf-16le", errors="replace")
+        if not name:
+            continue
+        # Prefer Win32 and Win32+DOS names over POSIX, and DOS aliases last.
+        score = 3 if namespace in (1, 3) else 2 if namespace == 0 else 1
+        choices.append((score, name))
+    return max(choices, default=(0, ""))[1]
+
+
+def _select_movable_attribute(record_number: int, fixed: bytes | bytearray,
+                              attrs: list[Attribute]) -> Attribute | None:
+    flags = _u16(fixed, 22)
+    if record_number < FIRST_USER_RECORD:
+        return None
+    if not (flags & RECORD_IN_USE) or (flags & RECORD_DIRECTORY):
+        return None
+    if _u64(fixed, 32) & FILE_REFERENCE_MASK:
+        return None
+    if any(attr.atype == ATTR_ATTRIBUTE_LIST for attr in attrs):
+        return None
+    data_attrs = [attr for attr in attrs
+                  if attr.atype == ATTR_DATA and not attr.name and attr.nonresident]
+    if len(data_attrs) != 1:
+        return None
+    attr = data_attrs[0]
+    if attr.lowest_vcn != 0 or attr.flags & (ATTR_COMPRESSED | ATTR_ENCRYPTED | ATTR_SPARSE):
+        return None
+    if any(run.lcn is None for run in attr.runs):
+        return None
+    if not attr.runs or attr.data_size == 0:
+        return None
+    return attr
+
+
+def _stream_blocker_reason(record_number: int, fixed: bytes | bytearray,
+                           attrs: list[Attribute], attr: Attribute,
+                           movable_attr: Attribute | None) -> str:
+    if movable_attr is not None and attr.offset == movable_attr.offset:
+        return ""
+    flags = _u16(fixed, 22)
+    base_record = _u64(fixed, 32) & FILE_REFERENCE_MASK
+    if record_number < FIRST_USER_RECORD:
+        return "NTFS system metadata is not yet movable"
+    if flags & RECORD_DIRECTORY:
+        return "directory data and index streams are not yet movable"
+    if base_record:
+        return "attribute-list extension records are not yet movable"
+    if any(item.atype == ATTR_ATTRIBUTE_LIST for item in attrs):
+        return "streams described through $ATTRIBUTE_LIST are not yet movable"
+    if attr.atype == ATTR_DATA:
+        if attr.name:
+            return "named NTFS data streams are not yet movable"
+        if attr.flags & ATTR_COMPRESSED:
+            return "compressed NTFS data is not yet movable"
+        if attr.flags & ATTR_SPARSE or any(run.lcn is None for run in attr.runs):
+            return "sparse NTFS data is not yet movable"
+        if attr.flags & ATTR_ENCRYPTED:
+            return "encrypted NTFS data is not yet movable"
+        if attr.lowest_vcn != 0:
+            return "split NTFS data-stream segments are not yet movable"
+        unnamed = [item for item in attrs
+                   if item.atype == ATTR_DATA and not item.name and item.nonresident]
+        if len(unnamed) != 1:
+            return "multiple unnamed NTFS data segments are not yet movable"
+        return "this NTFS data-stream layout is not yet movable"
+    if attr.atype == ATTR_INDEX_ALLOCATION:
+        return "directory index allocation is not yet movable"
+    return f"the {ATTRIBUTE_NAMES.get(attr.atype, f'attribute 0x{attr.atype:x}')} stream is not yet movable"
+
+
+def _iter_mft_records(layout: NtfsLayout) -> Iterator[tuple[int, bytes]]:
+    volume = layout.volume
+    record_size = volume.mft_record_size
+    record_count = min(layout.mft_data_size // record_size, 0xFFFFFFFF)
+    records_per_chunk = max(1, MFT_RECORD_CHUNK // record_size)
+    first = 0
+    while first < record_count:
+        count = min(records_per_chunk, record_count - first)
+        raw = _read_stream(volume, layout.mft_runs, first * record_size, count * record_size)
+        for offset in range(count):
+            start = offset * record_size
+            yield first + offset, raw[start:start + record_size]
+        first += count
+
+
+def _record_hibernation_active(layout: NtfsLayout, fixed: bytes | bytearray,
+                               attrs: list[Attribute], file_name: str) -> bool:
+    if file_name.casefold() != "hiberfil.sys":
+        return False
+    data_attrs = [attr for attr in attrs if attr.atype == ATTR_DATA and not attr.name]
+    if not data_attrs:
+        return False
+    attr = data_attrs[0]
+    if attr.nonresident:
+        if not attr.runs or attr.data_size == 0:
+            return False
+        header = _read_stream(layout.volume, attr.runs, 0, min(4096, attr.data_size))
+    else:
+        header = _resident_value(fixed, attr)
+    return bool(header[:4].strip(b"\0"))
+
+
+def _scan_allocation_plan(layout: NtfsLayout) -> AllocationPlan:
+    streams: dict[tuple[int, int], StreamInfo] = {}
+    names: dict[int, str] = {}
+    malformed = 0
+    hibernation = False
+    movable_count = 0
+    for number, raw in _iter_mft_records(layout):
+        if raw[:4] != b"FILE":
             continue
         try:
+            fixed = _apply_fixups(raw, layout.volume.bytes_per_sector)
+            if not (_u16(fixed, 22) & RECORD_IN_USE):
+                continue
             attrs = list(_attributes(fixed))
         except NtfsCompactError:
+            malformed += 1
             continue
-        if any(attr.atype == ATTR_ATTRIBUTE_LIST for attr in attrs):
+        file_name = _best_file_name(fixed, attrs, number)
+        if file_name:
+            names[number] = file_name
+        if not hibernation and _record_hibernation_active(layout, fixed, attrs, file_name):
+            hibernation = True
+        base_record = _u64(fixed, 32) & FILE_REFERENCE_MASK
+        movable_attr = _select_movable_attribute(number, fixed, attrs)
+        if movable_attr is not None:
+            movable_count += 1
+        for attr in attrs:
+            if not attr.nonresident:
+                continue
+            physical_runs = tuple(run for run in attr.runs if run.lcn is not None)
+            if not physical_runs:
+                continue
+            for run in physical_runs:
+                if run.lcn < 0 or run.lcn + run.length > layout.volume.total_clusters:
+                    raise NtfsCompactError(
+                        f"MFT record {number} describes clusters outside the NTFS volume"
+                    )
+            info = StreamInfo(
+                record_number=number,
+                base_record_number=int(base_record),
+                attribute_offset=attr.offset,
+                attribute_type=attr.atype,
+                attribute_name=_decode_attribute_name(attr.name),
+                file_name=file_name,
+                flags=attr.flags,
+                runs=tuple(attr.runs),
+                movable=movable_attr is not None and attr.offset == movable_attr.offset,
+                blocker_reason=_stream_blocker_reason(number, fixed, attrs, attr, movable_attr),
+            )
+            streams[info.key] = info
+
+    # Extension records often have no $FILE_NAME of their own.  Resolve their
+    # base-record name after the complete MFT pass so scan order does not matter.
+    for key, info in list(streams.items()):
+        if not info.file_name and info.base_record_number in names:
+            streams[key] = StreamInfo(
+                record_number=info.record_number,
+                base_record_number=info.base_record_number,
+                attribute_offset=info.attribute_offset,
+                attribute_type=info.attribute_type,
+                attribute_name=info.attribute_name,
+                file_name=names[info.base_record_number],
+                flags=info.flags,
+                runs=info.runs,
+                movable=info.movable,
+                blocker_reason=info.blocker_reason,
+                generation=info.generation,
+            )
+
+    heap = [(-info.highest_lcn, info.record_number, info.attribute_offset, info.generation)
+            for info in streams.values() if info.highest_lcn]
+    heapq.heapify(heap)
+    return AllocationPlan(streams, heap, movable_count, malformed, hibernation)
+
+
+def _heap_entry_current(plan: AllocationPlan, entry: tuple[int, int, int, int]) -> bool:
+    neg_high, record_number, attribute_offset, generation = entry
+    info = plan.streams.get((record_number, attribute_offset))
+    return bool(info is not None and info.generation == generation and info.highest_lcn == -neg_high)
+
+
+def _clean_plan_heap(plan: AllocationPlan) -> None:
+    while plan.heap and not _heap_entry_current(plan, plan.heap[0]):
+        heapq.heappop(plan.heap)
+
+
+def _owners_at_high_water(plan: AllocationPlan, high_water: int) -> tuple[int, list[StreamInfo]]:
+    _clean_plan_heap(plan)
+    if not plan.heap:
+        return 0, []
+    metadata_high = -plan.heap[0][0]
+    if metadata_high != high_water:
+        return metadata_high, []
+    held: list[tuple[int, int, int, int]] = []
+    owners: list[StreamInfo] = []
+    while plan.heap and -plan.heap[0][0] == high_water:
+        entry = heapq.heappop(plan.heap)
+        if not _heap_entry_current(plan, entry):
             continue
-        data_attrs = [attr for attr in attrs if attr.atype == ATTR_DATA and not attr.name and attr.nonresident]
-        if len(data_attrs) != 1:
-            continue
-        attr = data_attrs[0]
-        if attr.lowest_vcn != 0 or attr.flags & (ATTR_COMPRESSED | ATTR_ENCRYPTED | ATTR_SPARSE):
-            continue
-        if any(run.lcn is None for run in attr.runs):
-            continue
-        if not attr.runs or attr.data_size == 0:
-            continue
-        candidates.append(Candidate(number, record_offset, raw, bytes(fixed), attr))
+        held.append(entry)
+        info = plan.streams[(entry[1], entry[2])]
+        if any(run.lcn is not None and run.lcn <= high_water - 1 < run.lcn + run.length
+               for run in info.runs):
+            owners.append(info)
+    for entry in held:
+        heapq.heappush(plan.heap, entry)
+    return metadata_high, owners
+
+
+def _load_candidate(layout: NtfsLayout, info: StreamInfo) -> Candidate:
+    record_offset, raw, fixed = _read_mft_record(layout.volume, layout.mft_runs, info.record_number)
+    if fixed[:4] != b"FILE" or not (_u16(fixed, 22) & RECORD_IN_USE):
+        raise NtfsCompactError(f"MFT record {info.record_number} changed during offline compaction")
+    attrs = list(_attributes(fixed))
+    attr = _select_movable_attribute(info.record_number, fixed, attrs)
+    if attr is None or attr.offset != info.attribute_offset:
+        raise NtfsCompactError(
+            f"MFT record {info.record_number} is no longer a supported movable stream"
+        )
+    return Candidate(info.record_number, record_offset, raw, bytes(fixed), attr)
+
+
+def _update_moved_stream(plan: AllocationPlan, info: StreamInfo, destination: int,
+                         clusters: int) -> StreamInfo:
+    updated = StreamInfo(
+        record_number=info.record_number,
+        base_record_number=info.base_record_number,
+        attribute_offset=info.attribute_offset,
+        attribute_type=info.attribute_type,
+        attribute_name=info.attribute_name,
+        file_name=info.file_name,
+        flags=info.flags,
+        runs=(Run(destination, clusters),),
+        movable=True,
+        blocker_reason="",
+        generation=info.generation + 1,
+    )
+    plan.streams[updated.key] = updated
+    heapq.heappush(plan.heap, (-updated.highest_lcn, updated.record_number,
+                               updated.attribute_offset, updated.generation))
+    return updated
+
+
+def _attribute_display(info: StreamInfo) -> str:
+    label = ATTRIBUTE_NAMES.get(info.attribute_type, f"attribute 0x{info.attribute_type:x}")
+    if info.attribute_name:
+        label += f' named "{info.attribute_name}"'
+    return label
+
+
+def _stream_display(info: StreamInfo) -> str:
+    if info.record_number in SYSTEM_RECORD_NAMES:
+        owner = SYSTEM_RECORD_NAMES[info.record_number]
+    else:
+        owner = f"MFT record {info.record_number}"
+        if info.file_name:
+            owner += f' ("{info.file_name}")'
+    if info.base_record_number:
+        owner += f" via extension record for MFT {info.base_record_number}"
+    return f"{owner} {_attribute_display(info)}"
+
+
+def _allocated_cluster_count(bitmap: bytes | bytearray, total_clusters: int) -> int:
+    full_bytes, remaining = divmod(total_clusters, 8)
+    total = sum(int(value).bit_count() for value in bitmap[:full_bytes])
+    if remaining and full_bytes < len(bitmap):
+        total += (bitmap[full_bytes] & ((1 << remaining) - 1)).bit_count()
+    return total
+
+
+def _boundary_progress(initial_high: int, current_high: int, theoretical_floor: int) -> float:
+    if initial_high <= theoretical_floor:
+        return 100.0
+    reduced = max(0, initial_high - current_high)
+    possible = max(1, initial_high - theoretical_floor)
+    return max(0.0, min(100.0, 100.0 * reduced / possible))
+
+
+def _human_bytes(value: int) -> str:
+    amount = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024.0 or suffix == "TiB":
+            return f"{amount:.1f} {suffix}" if suffix != "B" else f"{int(amount)} B"
+        amount /= 1024.0
+    return f"{value} B"
+
+
+def _candidate_records(layout: NtfsLayout) -> list[Candidate]:
+    """Compatibility helper used by focused tests and diagnostics."""
+    plan = _scan_allocation_plan(layout)
+    candidates = [_load_candidate(layout, info)
+                  for info in plan.streams.values() if info.movable]
     candidates.sort(key=lambda item: item.highest_lcn, reverse=True)
     return candidates
 
@@ -937,7 +1288,14 @@ def recover(device: str, journal_path: Path) -> int:
         _close_volume(volume)
 
 
-def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int, journal_path: Path) -> None:
+def _detail(diagnostic: TextIO | None, message: str) -> None:
+    if diagnostic is not None:
+        diagnostic.write(message + "\n")
+        diagnostic.flush()
+
+
+def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
+              journal_path: Path, diagnostic: TextIO | None = None) -> None:
     volume = layout.volume
     new_record = _updated_record(candidate, destination, volume.bytes_per_sector)
     old_clusters = [cluster for run in candidate.attribute.runs
@@ -946,8 +1304,11 @@ def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int, journa
     bitmap_before = _bitmap_patches(layout, old_clusters + new_clusters)
     volume_records = _volume_record_state(layout)
 
-    print(f"Copying MFT record {candidate.record_number}: {candidate.clusters:,} clusters ", end="", flush=True)
-    print(f"from high LCN {candidate.highest_lcn - 1:,} to LCN {destination:,}.", flush=True)
+    _detail(
+        diagnostic,
+        f"MFT record {candidate.record_number}: {candidate.clusters} clusters "
+        f"from high LCN {candidate.highest_lcn - 1} to LCN {destination}",
+    )
     _copy_runs(volume, candidate.attribute.runs, destination, candidate.clusters)
     state = _journal_state(layout, candidate, destination, new_record,
                            bitmap_before, volume_records, "copied")
@@ -983,52 +1344,190 @@ def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int, journa
     _write_journal(journal_path, state)
     _remove_journal(journal_path)
 
-def compact(device: str, journal_path: Path) -> int:
+
+def _blocker_message(high_water: int, metadata_high: int,
+                     owners: list[StreamInfo]) -> str:
+    cluster = high_water - 1
+    if metadata_high > high_water:
+        return (
+            f"NTFS metadata describes allocation through cluster {metadata_high - 1:,}, "
+            f"but $Bitmap ends at cluster {cluster:,}; compaction stopped because the "
+            "metadata and allocation bitmap disagree"
+        )
+    if not owners:
+        return (
+            f"allocated high-water cluster {cluster:,} is not claimed by any readable "
+            "non-resident MFT stream; it may be reserved metadata, an orphan allocation, "
+            "or damaged metadata"
+        )
+    if len(owners) > 1:
+        labels = "; ".join(_stream_display(owner) for owner in owners[:4])
+        suffix = "" if len(owners) <= 4 else f"; and {len(owners) - 4} more"
+        return (
+            f"multiple NTFS streams claim high-water cluster {cluster:,}: "
+            f"{labels}{suffix}; compaction stopped to avoid modifying a cross-linked volume"
+        )
+    owner = owners[0]
+    reason = owner.blocker_reason or "the stream cannot be relocated by the current native writer"
+    return f"{_stream_display(owner)} at cluster {cluster:,}; {reason}"
+
+
+def compact(device: str, journal_path: Path,
+            diagnostic_path: Path | None = None) -> int:
     if _is_mounted(device):
         raise NtfsCompactError("NTFS compaction requires an unmounted volume")
     if journal_path.exists():
         raise NtfsCompactError("an unfinished NTFS transaction exists; run Recover first")
+    diagnostic: TextIO | None = None
     volume = _open_volume(device, True)
     try:
+        if diagnostic_path is not None:
+            diagnostic_path = diagnostic_path.expanduser().resolve()
+            if diagnostic_path == journal_path.expanduser().resolve():
+                raise NtfsCompactError("the diagnostic log and recovery journal must be different files")
+            diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            diagnostic = diagnostic_path.open("w", encoding="utf-8", buffering=1)
+            os.chmod(diagnostic_path, 0o600)
+            print(f"Detailed NTFS move diagnostics: {diagnostic_path}", flush=True)
+
         layout = _read_layout(volume)
-        if _hibernation_active(layout):
-            raise NtfsCompactError("Windows hibernation is active on this NTFS volume; perform a full Windows shutdown first")
-        candidates = _candidate_records(layout)
+        plan = _scan_allocation_plan(layout)
+        if plan.hibernation_active:
+            raise NtfsCompactError(
+                "Windows hibernation is active on this NTFS volume; perform a full Windows shutdown first"
+            )
         before_high = _highest_used(layout.bitmap, volume.total_clusters)
-        print(f"Native NTFS scan found {len(candidates):,} movable ordinary file streams.", flush=True)
+        allocated = _allocated_cluster_count(layout.bitmap, volume.total_clusters)
+        theoretical_floor = allocated
+        print(
+            f"Native NTFS scan found {plan.movable_count:,} movable ordinary file streams "
+            f"and tracked {len(plan.streams):,} physical NTFS streams.",
+            flush=True,
+        )
+        if plan.malformed_records:
+            print(
+                f"Warning: {plan.malformed_records:,} in-use MFT records could not be decoded; "
+                "their allocations will be treated as immovable.",
+                flush=True,
+            )
         print(f"Initial allocated high-water mark: cluster {before_high - 1:,}.", flush=True)
-        moved_files = moved_clusters = skipped_no_space = skipped_encoding = 0
-        total = max(1, len(candidates))
-        for index, candidate in enumerate(candidates, 1):
+        print(
+            f"Theoretical packed boundary from {allocated:,} allocated clusters: "
+            f"cluster {max(0, theoretical_floor - 1):,}.",
+            flush=True,
+        )
+        print("0.00 percent completed", flush=True)
+
+        moved_files = 0
+        moved_clusters = 0
+        blocker = ""
+        last_report_files = 0
+        last_report_clusters = 0
+        last_report_time = time.monotonic()
+
+        while True:
             if _stop_requested:
+                break
+            current_high = _highest_used(layout.bitmap, volume.total_clusters)
+            if current_high <= theoretical_floor:
+                break
+            metadata_high, owners = _owners_at_high_water(plan, current_high)
+            if metadata_high != current_high or len(owners) != 1:
+                blocker = _blocker_message(current_high, metadata_high, owners)
+                break
+            owner = owners[0]
+            if not owner.movable:
+                blocker = _blocker_message(current_high, metadata_high, owners)
+                break
+
+            candidate = _load_candidate(layout, owner)
+            if candidate.highest_lcn != current_high:
+                blocker = (
+                    f"{_stream_display(owner)} changed while the offline compact plan was active; "
+                    "no further streams were moved"
+                )
                 break
             destination = _find_free_run(layout.bitmap, candidate.clusters, candidate.lowest_lcn)
             if destination is None or destination + candidate.clusters >= candidate.highest_lcn:
-                skipped_no_space += 1
-                print(f"{100.0 * index / total:.2f} percent completed", flush=True)
-                continue
+                blocker = (
+                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; "
+                    f"no lower contiguous free run of {candidate.clusters:,} clusters is available"
+                )
+                break
             try:
                 _updated_record(candidate, destination, volume.bytes_per_sector)
             except NtfsCompactError:
-                skipped_encoding += 1
-                print(f"{100.0 * index / total:.2f} percent completed", flush=True)
-                continue
-            _move_one(layout, candidate, destination, journal_path)
+                blocker = (
+                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; "
+                    "replacement mapping pairs do not fit its existing MFT attribute"
+                )
+                break
+
+            _move_one(layout, candidate, destination, journal_path, diagnostic)
             moved_files += 1
             moved_clusters += candidate.clusters
-            print(f"{100.0 * index / total:.2f} percent completed", flush=True)
+            _update_moved_stream(plan, owner, destination, candidate.clusters)
+            new_high = _highest_used(layout.bitmap, volume.total_clusters)
+            if new_high >= current_high:
+                blocker = (
+                    f"moving {_stream_display(owner)} did not lower the allocated boundary; "
+                    "compaction stopped rather than relocating unrelated lower files"
+                )
+                break
+            progress = _boundary_progress(before_high, new_high, theoretical_floor)
+            print(f"{progress:.2f} percent completed", flush=True)
+
+            now = time.monotonic()
+            if (moved_files - last_report_files >= REPORT_EVERY_FILES or
+                    moved_clusters - last_report_clusters >= REPORT_EVERY_CLUSTERS or
+                    now - last_report_time >= REPORT_EVERY_SECONDS):
+                print(
+                    f"Moved {moved_files:,} high-water files ({_human_bytes(moved_clusters * volume.cluster_size)}); "
+                    f"current high-water cluster {new_high - 1:,}.",
+                    flush=True,
+                )
+                last_report_files = moved_files
+                last_report_clusters = moved_clusters
+                last_report_time = now
+
         after_high = _highest_used(layout.bitmap, volume.total_clusters)
-        print(f"Native NTFS compact moved {moved_files:,} files and {moved_clusters:,} clusters.", flush=True)
-        print(f"Allocated high-water mark: cluster {before_high - 1:,} -> {after_high - 1:,}.", flush=True)
-        if skipped_no_space:
-            print(f"Skipped {skipped_no_space:,} streams without a lower contiguous free run.", flush=True)
-        if skipped_encoding:
-            print(f"Skipped {skipped_encoding:,} streams whose replacement mapping pairs did not fit.", flush=True)
-        print("System metadata, directories, compressed, sparse, encrypted and attribute-list streams were not moved.", flush=True)
+        reduced = max(0, before_high - after_high)
+        print(
+            f"Native NTFS compact moved {moved_files:,} files and {moved_clusters:,} clusters "
+            f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
+            flush=True,
+        )
+        print(
+            f"Allocated high-water mark: cluster {before_high - 1:,} -> {after_high - 1:,}.",
+            flush=True,
+        )
+        if reduced:
+            print(
+                f"Effective NTFS boundary reduction: {reduced:,} clusters "
+                f"({_human_bytes(reduced * volume.cluster_size)}).",
+                flush=True,
+            )
+        else:
+            print(
+                "No effective NTFS volume compaction was achieved; the allocated high-water "
+                "boundary did not move.",
+                flush=True,
+            )
+        if blocker:
+            print(f"Compaction limited by {blocker}.", flush=True)
+        elif after_high <= theoretical_floor:
+            print("The allocation boundary reached the theoretical packed limit.", flush=True)
+        print(
+            "Only the stream that currently owns the physical high-water cluster is considered; "
+            "unrelated lower files are not moved.",
+            flush=True,
+        )
         if _stop_requested:
             print("Stopped safely after the current NTFS stream transaction.", flush=True)
         return 0
     finally:
+        if diagnostic is not None:
+            diagnostic.close()
         _close_volume(volume)
 
 
@@ -1049,12 +1548,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ram-buffer", default="auto")
     parser.add_argument("--workers", default="auto")
     parser.add_argument("--live-map-cells")
+    parser.add_argument("--diagnostic-log", help="optional detailed per-stream move log")
     args = parser.parse_args(argv)
     try:
         _validate_confirmation(args.device, args.confirm, args.write)
         journal = Path(args.journal)
         if args.operation == "compact":
-            return compact(args.device, journal)
+            diagnostic = Path(args.diagnostic_log) if args.diagnostic_log else None
+            return compact(args.device, journal, diagnostic)
         return recover(args.device, journal)
     except (NtfsCompactError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr, flush=True)

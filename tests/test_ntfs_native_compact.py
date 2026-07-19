@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import os
 import struct
 import sys
@@ -27,6 +29,8 @@ MFT_CLUSTERS = MFT_RECORDS * RECORD_SIZE // CLUSTER_SIZE
 BITMAP_LCN = 100
 DATA_LCN = 3500
 DATA_CLUSTERS = 16
+BLOCKER_LCN = 3800
+MIRROR_CLUSTERS = 4 * RECORD_SIZE // CLUSTER_SIZE
 
 
 def runlist(runs: list[tuple[int, int]]) -> bytes:
@@ -102,7 +106,7 @@ def record(number: int, attrs: list[bytes]) -> bytes:
     return ntfs_engine._prepare_fixups(fixed, BPS)
 
 
-def make_image(path: Path, volume_flags: int = 0) -> bytes:
+def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -111,7 +115,8 @@ def make_image(path: Path, volume_flags: int = 0) -> bytes:
     boot[13] = SPC
     struct.pack_into("<Q", boot, 40, TOTAL_CLUSTERS)
     struct.pack_into("<Q", boot, 48, MFT_LCN)
-    struct.pack_into("<Q", boot, 56, 3000)
+    mirror_lcn = BLOCKER_LCN if high_mftmirr_blocker else 3000
+    struct.pack_into("<Q", boot, 56, mirror_lcn)
     boot[64] = 0xF6
     boot[68] = 1
     boot[72:80] = bytes.fromhex("0123456789abcdef")
@@ -123,13 +128,15 @@ def make_image(path: Path, volume_flags: int = 0) -> bytes:
     volume_info[8] = 3
     volume_info[9] = 1
     struct.pack_into("<H", volume_info, 10, volume_flags)
+    if high_mftmirr_blocker:
+        records[1] = record(1, [nonresident(0x80, [(mirror_lcn, MIRROR_CLUSTERS)], 4 * RECORD_SIZE)])
     records[3] = record(3, [resident(0x70, bytes(volume_info))])
     records[6] = record(6, [nonresident(0x80, [(BITMAP_LCN, 1)], (TOTAL_CLUSTERS + 7) // 8)])
     records[24] = record(24, [nonresident(0x80, [(DATA_LCN, DATA_CLUSTERS)], DATA_CLUSTERS * CLUSTER_SIZE)])
     mft_offset = MFT_LCN * CLUSTER_SIZE
     for number, raw in enumerate(records):
         image[mft_offset + number * RECORD_SIZE:mft_offset + (number + 1) * RECORD_SIZE] = raw
-    mirror_offset = 3000 * CLUSTER_SIZE
+    mirror_offset = mirror_lcn * CLUSTER_SIZE
     for number in range(4):
         image[mirror_offset + number * RECORD_SIZE:mirror_offset + (number + 1) * RECORD_SIZE] = records[number]
 
@@ -137,6 +144,8 @@ def make_image(path: Path, volume_flags: int = 0) -> bytes:
     used = set(range(MFT_LCN, MFT_LCN + MFT_CLUSTERS))
     used.add(BITMAP_LCN)
     used.update(range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
+    if high_mftmirr_blocker:
+        used.update(range(mirror_lcn, mirror_lcn + MIRROR_CLUSTERS))
     for cluster in used:
         bitmap[cluster >> 3] |= 1 << (cluster & 7)
     image[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE] = bitmap
@@ -195,6 +204,24 @@ def main() -> None:
         bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
         assert all(bitmap[c >> 3] & (1 << (c & 7)) for c in range(destination, destination + count))
         assert all(not (bitmap[c >> 3] & (1 << (c & 7))) for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
+
+        # An immovable object above an ordinary file must be diagnosed before
+        # any unrelated lower file is moved.  This models the real-world case
+        # where $MFTMirr fixes the high-water boundary near mid-volume.
+        payload = make_image(image, high_mftmirr_blocker=True)
+        before_run = current_data_run(image)
+        captured = io.StringIO()
+        ntfs_engine._stop_requested = False
+        with contextlib.redirect_stdout(captured):
+            assert ntfs_engine.compact(str(image), journal) == 0
+        assert current_data_run(image) == before_run
+        assert hashlib.sha256(payload).hexdigest() == hashlib.sha256(
+            image.read_bytes()[DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE]
+        ).hexdigest()
+        report = captured.getvalue()
+        assert "moved 0 files" in report
+        assert "No effective NTFS volume compaction was achieved" in report
+        assert "Compaction limited by $MFTMirr $DATA" in report
 
         # Simulate a crash after metadata switched but before old clusters were
         # released. Recovery must complete forward and retain the payload.

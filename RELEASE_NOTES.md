@@ -1,7 +1,10 @@
-# Linux Defragger 1.8.0 package revision 8
+# Linux Defragger 1.8.0 package revision 9
 
-- Corrected native NTFS `$VOLUME_INFORMATION` validation. Revision 7 incorrectly treated every non-zero volume flag as the dirty state.
-- NTFS dirty detection now checks only the defined `0x0001` dirty bit.
-- The observed undocumented `0x0080` flag is accepted and preserved exactly while Linux Defragger temporarily adds and removes its transaction dirty bit.
-- Active NTFS maintenance states and genuinely dirty volumes remain blocked. Other unrecognised flag bits remain conservatively rejected.
-- Added destructive relocation and recovery regression coverage for a volume carrying `0x0080`, including exact post-operation flag restoration and SHA-256 payload retention.
+- Reworked native NTFS Compact around the true allocated high-water owner.
+- The engine now indexes physical ownership for all readable non-resident NTFS streams before writing.
+- It moves only the stream that currently owns the final allocated cluster, then recalculates the boundary.
+- An immovable `$MFTMirr`, `$LogFile`, directory index, named/compressed/sparse/encrypted stream, `$ATTRIBUTE_LIST` segment, cross-link, orphan allocation or metadata/bitmap mismatch is reported precisely and stops the operation before unrelated lower files are moved.
+- Compact now distinguishes clusters copied from effective boundary reduction and explicitly reports when no useful compaction was achieved.
+- GUI progress is based on real high-water reduction toward the theoretical packed boundary rather than the number of candidate MFT records scanned.
+- Per-record GUI logging was replaced with periodic summaries; optional detailed move logging is available through `ntfs_engine.py --diagnostic-log PATH`.
+- The journalled native NTFS writer, safe Stop path, recovery logic and zero-`ntfs-3g` runtime dependency are unchanged.

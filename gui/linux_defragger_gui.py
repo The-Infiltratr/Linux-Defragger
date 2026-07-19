@@ -1054,8 +1054,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if volume.normalized_fstype == "ntfs":
             extra_warning = (
                 "\n\nNTFS Compact uses Linux Defragger's native offline NTFS writer. "
-                "It moves only ordinary file data streams that can be relocated safely; "
-                "system metadata and unsupported stream layouts remain in place."
+                "It first identifies the stream owning the physical high-water cluster and "
+                "moves only that stream when it is supported. If metadata or an unsupported "
+                "layout fixes the boundary, it stops and names the blocker rather than moving "
+                "unrelated lower files."
             )
         if not self.confirm(
             f"{operation.capitalize()} {volume.path}?",
