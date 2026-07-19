@@ -186,6 +186,49 @@ flags and remove the journal. Recovery compares the current MFT record with the
 saved before/after images to choose idempotent forward completion or rollback.
 
 
+## Native Btrfs read-only analyser
+
+The Btrfs backend does not use aggregate `bytes_used` accounting as a substitute
+for a physical map. It reads the primary superblock, parses the system chunk
+array, then walks the chunk tree to build the filesystem's logical-to-physical
+translation table. The root tree identifies the extent tree and every live
+filesystem root.
+
+Allocated logical extents are obtained from extent and skinny-metadata items and
+translated to every local physical mirror. The physical complement, plus fixed
+superblock mirror reservations, forms the exact single-device free/used map.
+Regular-file fragmentation is calculated from each inode's non-inline file-extent
+items after logical and physically adjacent extents are coalesced. Directory
+inodes are counted, but Btrfs directory records occupy shared filesystem-tree
+blocks rather than private directory chains, so the backend does not invent a
+directory-fragmentation count.
+
+SINGLE, DUP and local same-device mirrors are supported. Multi-device chunks and
+RAID0/10/5/6 layouts are rejected until a stripe-aware multi-device mapper can
+represent every physical target. The backend opens the volume read-only and
+advertises no mutation capabilities.
+
+## Native XFS read-only analyser
+
+The XFS backend reads the primary superblock and validates data-device, allocation
+group, sector and inode geometry. For each allocation group it reads the AGF and
+walks the block-number free-space B+tree (`bnobt`). The merged free records are
+exact physical free ranges; their data-device complement is the used allocation
+map. This replaces the former aggregate summary and avoids relying on AGF counters
+as positional information.
+
+Allocated inode numbers are obtained by walking each AGI inode B+tree, including
+sparse-inode records. Every allocated inode's data fork is decoded in local,
+direct-extent or bmap B+tree format. Physical extent counts provide regular-file
+and directory fragmentation counts and the red/purple map overlays. Realtime data
+that resides on a separate realtime device cannot be positioned on the data-device
+map and is reported conservatively.
+
+The XFS analyser supports version 4 and version 5 short B+tree headers, version 5
+CRC bmap blocks, sparse inodes and NREXT64 inode extent counters. It opens the
+filesystem read-only, invokes no external XFS utility and advertises no mutation
+capabilities.
+
 ## GUI analysis cache and concurrent volumes
 
 Each window owns an independent privileged helper and operation state. Opening another window permits a second volume to be analysed or modified while the first window continues its journalled operation. A volume is analysed automatically when selected. The returned allocation cells are cached by device path and resampled over the current drawing area; window resizing is therefore a memory-only redraw. A manual volume refresh invalidates the cache.

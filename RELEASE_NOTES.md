@@ -1,12 +1,13 @@
-# Linux Defragger 1.8.0 package revision 20
+# Linux Defragger 1.8.0 package revision 21
 
-- Uses one Python version source and queries the installed native engine for the visible engine revision. The title bar, upper-right build label and About dialog now agree on `1.8.0-20`.
-- Automatically analyses a volume when it is selected.
-- Keeps analysed allocation samples in memory and resamples them during window resizing. Resizing no longer rereads the device.
-- Changes native FAT and exFAT Compact to pure physical tail filling. Compact removes internal free gaps without attempting to preserve or improve file fragmentation.
-- Retains a separate whole-object preparation planner for FAT Growth Defrag, followed by the normal contiguous growth-layout phase.
-- Adds exact cached `growth_10_satisfied` analysis data. Re-running Growth Defrag on an already-correct FAT or exFAT volume returns immediately from the existing analysis without a second scan or write.
-- Adds native exFAT Growth Defrag and advertises the capability in the backend registry.
-- Adds independent application windows. Each window owns its own authenticated helper and may operate on a different volume concurrently.
-- Adds **File → Create fragmented test data…** and the `linux-defragger-testdata` command for portable cross-filesystem test generation.
-- Updates comments, CLI help, README, design documentation and tests to match the separated operation semantics.
+- Replaces the Btrfs aggregate-summary placeholder with a genuine native read-only analyser for supported single-device filesystems.
+- Walks the Btrfs system chunk array, chunk tree, root tree, extent tree and live filesystem trees directly, without invoking `btrfs-progs`.
+- Produces an exact physical allocation map for local SINGLE, DUP and same-device mirrored profiles, including metadata, data extents and superblock mirrors.
+- Counts Btrfs regular files and directories and identifies fragmented regular files from their physical file-extent records. Directory fragmentation remains not applicable because Btrfs directories share filesystem-tree blocks rather than owning private allocation chains.
+- Rejects multi-device or striped Btrfs profiles rather than presenting an invented physical layout.
+- Replaces the XFS summary placeholder with a genuine native read-only allocation-group and inode analyser.
+- Walks each XFS allocation group's block-number free-space B+tree, inode B+tree and allocated inode data fork, including direct extents and external bmap B+trees.
+- Fixes the old XFS free-space accounting bug that could incorrectly report an almost-full filesystem.
+- Produces exact XFS free/used maps and file/directory fragmentation overlays on the data device.
+- Keeps all Btrfs and XFS mutation capabilities disabled. Analyse and Map remain the only advertised operations.
+- Adds focused synthetic multi-level-tree regression images for both filesystems and updates the backend documentation and package revision to `1.8.0-21`.

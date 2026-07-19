@@ -224,7 +224,7 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
   >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
   "$TMP/growth-defrag-idempotent.txt"
-grep -q 'Growth Defrag preflight (1.8.0-20): checking' \
+grep -q 'Growth Defrag preflight (1.8.0-21): checking' \
   "$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag preflight result: the existing FAT layout already satisfies' \
   "$TMP/growth-defrag-idempotent.err"
@@ -249,6 +249,8 @@ grep -q 'Ordered extent moves:' "$TMP/gapped-compact.txt"
 grep -q 'Free gaps below it:       0 clusters' "$TMP/gapped-compact.txt"
 grep -Eq 'Fragmented files:       [1-9][0-9]*' "$TMP/gapped-after.txt"
 
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_btrfs_backend.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_xfs_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ext_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_native_compact.py" >/dev/null
@@ -259,7 +261,7 @@ PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_allocation_mapper.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_growth_defrag_ui.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_mounted_analysis_policy.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_swap_backend.py" >/dev/null
-PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_gui_revision20.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_gui_revision21.py" >/dev/null
 "$ROOT/tests/exfat/run_exfat_tests.sh" >/dev/null
 
 echo 'all tests passed'

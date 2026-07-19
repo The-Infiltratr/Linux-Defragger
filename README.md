@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-20
+# Linux Defragger 1.8.0-21
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -38,7 +38,10 @@ The operation refuses to start unless the volume has enough free clusters for bo
 - Classic Apple HFS: analyse, map, compact, defragment and recover.
 - Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
 - NTFS: analyse, map, native offline compact, native offline defragment and recover.
-- EXT2/3/4, Btrfs, XFS, UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
+- EXT2/3/4: read-only allocation maps and file/directory fragmentation analysis.
+- Btrfs: genuine native read-only physical allocation maps and file-fragmentation analysis for single-device filesystems using non-striped local profiles. The analyser walks the chunk, root, extent and filesystem trees directly. Multi-device and striped RAID profiles remain conservatively unsupported.
+- XFS: genuine native read-only physical allocation maps and file/directory fragmentation analysis. The analyser walks allocation-group free-space B+trees, inode B+trees and inode data-fork extent trees directly. Realtime-file data on a separate realtime device is reported but cannot be positioned on the data-device map.
+- UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
 
 ### FAT and exFAT Compact semantics
 
