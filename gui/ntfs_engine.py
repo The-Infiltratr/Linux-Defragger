@@ -3,15 +3,14 @@
 # Author: Shannon Smith
 # Purpose: Native offline NTFS compaction, defragmentation and recovery.
 
-"""Conservative native NTFS maintenance.
+"""Native offline NTFS maintenance.
 
-Compact and Defragment are intentionally separate operations. Compact fills
-low free gaps with complete physical extents while preserving the number of
-fragments in every moved file. Defragment rebuilds supported fragmented files
-as one contiguous extent, allocating those rebuilt files from the physical end
-of the volume downward. Both operations edit only the stream's mapping pairs,
-the volume $Bitmap and the affected MFT record. System files, directories and
-attribute-list streams are deliberately left untouched.
+Compact eliminates low free gaps by copying data from higher supported streams
+into them. It may split or join physical extents because physical packing, not
+fragment-count preservation, is the purpose of Compact. Defragment separately
+rebuilds supported fragmented files as one contiguous extent. Both operations
+edit only the stream's mapping pairs, the volume $Bitmap and the affected MFT
+record. Core NTFS system metadata and attribute-list streams remain protected.
 
 Each stream move is a separate externally journalled transaction. Destination
 clusters are copied first, then reserved in $Bitmap, then the MFT mapping pairs
@@ -38,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-29"
+ENGINE_VERSION = "1.8.0-30"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -1040,20 +1039,30 @@ def _best_file_name(record: bytes | bytearray, attrs: Iterable[Attribute], recor
 
 def _select_movable_attribute(record_number: int, fixed: bytes | bytearray,
                               attrs: list[Attribute]) -> Attribute | None:
+    """Return the one nonresident stream this MFT record can safely rewrite.
+
+    A single movable attribute per record avoids invalidating another planned
+    attribute offset if mapping pairs have to grow. Ordinary files use their
+    sole unnamed $DATA stream. Directories use their sole $INDEX_ALLOCATION
+    stream, which is the physical directory data that revision 29 skipped.
+    """
     flags = _u16(fixed, 22)
-    if record_number < FIRST_USER_RECORD:
-        return None
-    if not (flags & RECORD_IN_USE) or (flags & RECORD_DIRECTORY):
+    if record_number < FIRST_USER_RECORD or not (flags & RECORD_IN_USE):
         return None
     if _u64(fixed, 32) & FILE_REFERENCE_MASK:
         return None
     if any(attr.atype == ATTR_ATTRIBUTE_LIST for attr in attrs):
         return None
-    data_attrs = [attr for attr in attrs
-                  if attr.atype == ATTR_DATA and not attr.name and attr.nonresident]
-    if len(data_attrs) != 1:
+
+    if flags & RECORD_DIRECTORY:
+        candidates = [attr for attr in attrs
+                      if attr.atype == ATTR_INDEX_ALLOCATION and attr.nonresident]
+    else:
+        candidates = [attr for attr in attrs
+                      if attr.atype == ATTR_DATA and not attr.name and attr.nonresident]
+    if len(candidates) != 1:
         return None
-    attr = data_attrs[0]
+    attr = candidates[0]
     if attr.lowest_vcn != 0 or attr.flags & (ATTR_COMPRESSED | ATTR_ENCRYPTED | ATTR_SPARSE):
         return None
     if any(run.lcn is None for run in attr.runs):
@@ -1083,7 +1092,9 @@ def _stream_blocker_reason(record_number: int, fixed: bytes | bytearray,
     if record_number < FIRST_USER_RECORD:
         return "NTFS system metadata is not yet movable"
     if flags & RECORD_DIRECTORY:
-        return "directory data and index streams are not yet movable"
+        if attr.atype == ATTR_INDEX_ALLOCATION:
+            return "this directory index layout is not safely rewritable"
+        return "this directory metadata stream is not yet movable"
     if base_record:
         return "attribute-list extension records are not yet movable"
     if any(item.atype == ATTR_ATTRIBUTE_LIST for item in attrs):
@@ -1405,47 +1416,53 @@ def _highest_physical_run_index(runs: tuple[Run, ...]) -> int | None:
 
 
 def _plan_compact_extent_info(info: StreamInfo, gap: Run) -> tuple[ExtentMove | None, str]:
-    """Move one complete physical extent into one lower gap without defragging.
+    """Fill a low gap from the highest suitable part of a movable stream.
 
-    Compact is not allowed to split an extent, join two logical neighbours or
-    otherwise alter the stream's physical fragment count. A file that had N
-    extents before Compact therefore still has N extents afterwards.
+    Compact is deliberately allowed to split an extent. The copied physical
+    slice keeps the same logical VCN position in the stream, while its new LCN
+    is the start of the low gap. This is what lets a one-cluster hole be filled
+    instead of stopping the entire operation as revision 29 did.
     """
     if gap.lcn is None or gap.length <= 0:
         return None, "the selected destination gap is invalid"
     gap_start = int(gap.lcn)
     gap_end = gap_start + gap.length
     runs = tuple(info.runs)
-    old_fragments = _physical_fragment_count(runs)
     capacity = info.mapping_capacity
     if capacity <= 0:
         return None, "the replacement mapping-pair capacity is unavailable"
 
     best: ExtentMove | None = None
-    best_source_lcn = -1
+    best_source_end = -1
     for index, source in enumerate(runs):
         if source.lcn is None or source.length <= 0:
             continue
         source_start = int(source.lcn)
-        if source_start < gap_end or source.length > gap.length:
+        source_end = source_start + source.length
+        if source_start < gap_end:
             continue
-        destination = Run(gap_start, source.length)
-        replacement = list(runs)
-        replacement[index] = destination
+
+        take = min(source.length, gap.length)
+        # Move the physical tail of the source extent. If it reaches the current
+        # high-water mark, this immediately lowers that boundary.
+        moved_start = source_end - take
+        destination = Run(gap_start, take)
+        replacement = list(runs[:index])
+        if source.length > take:
+            replacement.append(Run(source_start, source.length - take))
+        replacement.append(destination)
+        replacement.extend(runs[index + 1:])
         new_runs = _coalesce_runs(replacement)
-        if _physical_fragment_count(new_runs) != old_fragments:
-            continue
         if len(_encode_runlist(new_runs)) > capacity:
             continue
-        move = ExtentMove((source,), (destination,), new_runs)
-        if (best is None or move.clusters > best.clusters or
-                (move.clusters == best.clusters and source_start > best_source_lcn)):
+        move = ExtentMove((Run(moved_start, take),), (destination,), new_runs)
+        if (best is None or source_end > best_source_end or
+                (source_end == best_source_end and move.clusters > best.clusters)):
             best = move
-            best_source_lcn = source_start
+            best_source_end = source_end
     if best is None:
         return None, (
-            "no complete movable extent fits this gap without changing the file's "
-            "fragment count"
+            "no higher movable stream can map data into this gap within its existing MFT record"
         )
     return best, ""
 
@@ -1454,7 +1471,7 @@ def _select_compact_source(layout: NtfsLayout, plan: AllocationPlan, gap: Run, *
                            max_attempts: int = SOURCE_SEARCH_LIMIT
                            ) -> tuple[StreamInfo | None, Candidate | None,
                                       ExtentMove | None, str]:
-    """Choose a whole extent for Compact, loading only the selected MFT record."""
+    """Choose a high stream slice for the selected low Compact gap."""
     if gap.lcn is None:
         return None, None, None, "no destination gap was supplied"
     held: list[tuple[int, int, int, int]] = []
@@ -1479,8 +1496,13 @@ def _select_compact_source(layout: NtfsLayout, plan: AllocationPlan, gap: Run, *
             info = plan.streams[(entry[1], entry[2])]
             move, reason = _plan_compact_extent_info(info, gap)
             if move is not None:
-                if best is None or move.clusters > best[1].clusters:
+                source_end = max(int(run.lcn) + run.length for run in move.source_runs)
+                if best is None:
                     best = (info, move)
+                else:
+                    best_end = max(int(run.lcn) + run.length for run in best[1].source_runs)
+                    if source_end > best_end or (source_end == best_end and move.clusters > best[1].clusters):
+                        best = (info, move)
             else:
                 reasons[reason] = reasons.get(reason, 0) + 1
 
@@ -1491,8 +1513,6 @@ def _select_compact_source(layout: NtfsLayout, plan: AllocationPlan, gap: Run, *
                 raise NtfsCompactError(
                     f"MFT record {info.record_number} runlist changed during offline compaction"
                 )
-            if _physical_fragment_count(move.new_runs) != _physical_fragment_count(info.runs):
-                raise NtfsCompactError("Compact planner attempted to change file fragmentation")
             if len(_encode_runlist(move.new_runs)) > _maximum_mapping_capacity(candidate):
                 return None, None, None, (
                     "the selected replacement mapping pairs no longer fit the MFT record"
@@ -1506,8 +1526,8 @@ def _select_compact_source(layout: NtfsLayout, plan: AllocationPlan, gap: Run, *
         return None, None, None, "no supported movable file extent remains above the gap"
     if len(held) >= max_attempts:
         return None, None, None, (
-            f"the first {max_attempts:,} higher movable streams contain no whole extent "
-            "that fits without changing fragmentation"
+            f"the first {max_attempts:,} higher movable streams cannot encode a safe "
+            "mapping into this gap"
         )
     if reasons:
         return None, None, None, max(reasons.items(), key=lambda item: item[1])[0]
@@ -1937,12 +1957,11 @@ def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
 
 def compact(device: str, journal_path: Path,
             diagnostic_path: Path | None = None) -> int:
-    """Fill low NTFS free gaps without changing any file's fragment count.
+    """Pack supported NTFS file and directory streams toward the beginning.
 
-    Compact treats each physical extent as an opaque unit. It moves a complete
-    extent into one lower gap and rejects any move that would split or join the
-    file's logical extents. Defragment is the separate operation responsible for
-    rebuilding fragmented files as one contiguous extent.
+    Compact fills low free gaps even when that requires splitting a physical
+    extent. Defragment remains the operation that later rebuilds fragmented
+    ordinary files as one contiguous extent.
     """
     if _is_mounted(device):
         raise NtfsCompactError("NTFS compaction requires an unmounted volume")
@@ -1977,9 +1996,15 @@ def compact(device: str, journal_path: Path,
         initial_gap_count, initial_gap_clusters, initial_first_gap = _free_gap_stats(
             layout.bitmap, before_high, packing_start
         )
+        movable_directories = sum(
+            1 for info in plan.streams.values()
+            if info.movable and info.attribute_type == ATTR_INDEX_ALLOCATION
+        )
+        movable_files = plan.movable_count - movable_directories
         print(
-            f"Native NTFS scan found {plan.movable_count:,} movable ordinary file streams "
-            f"and tracked {len(plan.streams):,} physical NTFS streams.",
+            f"Native NTFS scan found {movable_files:,} movable ordinary file streams and "
+            f"{movable_directories:,} movable directory index streams; tracked "
+            f"{len(plan.streams):,} physical NTFS streams.",
             flush=True,
         )
         if plan.malformed_records:
@@ -2009,7 +2034,7 @@ def compact(device: str, journal_path: Path,
         moved_streams: set[tuple[int, int]] = set()
         moved_transactions = 0
         moved_clusters = 0
-        blocker = ""
+        blocked_gaps: list[tuple[int, int, str]] = []
         packed_cursor = initial_first_gap if initial_first_gap is not None else before_high
         last_report_transactions = 0
         last_report_clusters = 0
@@ -2031,11 +2056,11 @@ def compact(device: str, journal_path: Path,
                 layout, plan, first_hole
             )
             if owner is None or candidate is None or move is None:
-                blocker = (
-                    f"internal free gap at cluster {int(first_hole.lcn):,}+{first_hole.length:,} "
-                    f"({_human_bytes(first_hole.length * volume.cluster_size)}) cannot be filled; {reason}"
-                )
-                break
+                # One tiny or awkward gap must not stop packing every later gap.
+                # Record it, skip past it, and continue searching the volume.
+                blocked_gaps.append((int(first_hole.lcn), first_hole.length, reason))
+                packed_cursor = int(first_hole.lcn) + first_hole.length
+                continue
 
             old_high = current_high
             _move_extent(layout, candidate, move, journal_path, diagnostic)
@@ -2048,8 +2073,8 @@ def compact(device: str, journal_path: Path,
             # boundary.  Otherwise the high-water mark cannot have changed.
             if any(int(run.lcn) + run.length >= old_high for run in move.source_runs):
                 current_high = _highest_used_before(layout.bitmap, old_high)
-            # Restart at the destination gap. A whole extent may fill it or
-            # leave a smaller remainder, but Compact never splits that extent.
+            # Restart at the destination gap. The selected source slice may fill
+            # it or leave a smaller remainder for another high stream slice.
             packed_cursor = int(first_hole.lcn)
             next_gap = _next_free_run(layout.bitmap, packed_cursor, current_high)
             current_first_gap = int(next_gap.lcn) if next_gap is not None else None
@@ -2065,8 +2090,8 @@ def compact(device: str, journal_path: Path,
                 gap_text = (f"cluster {current_first_gap:,}" if current_first_gap is not None
                             else "none")
                 print(
-                    f"Moved {moved_transactions:,} complete extents using "
-                    f"{len(moved_streams):,} file streams "
+                    f"Moved {moved_transactions:,} stream slices using "
+                    f"{len(moved_streams):,} file or directory streams "
                     f"({_human_bytes(moved_clusters * volume.cluster_size)} moved); "
                     f"lowest remaining gap: {gap_text}.",
                     flush=True,
@@ -2082,8 +2107,8 @@ def compact(device: str, journal_path: Path,
         reduced = max(0, before_high - after_high)
         filled = max(0, initial_gap_clusters - final_gap_clusters)
         print(
-            f"Native NTFS compact used {len(moved_streams):,} file streams in "
-            f"{moved_transactions:,} whole-extent transactions and moved {moved_clusters:,} clusters "
+            f"Native NTFS compact used {len(moved_streams):,} file or directory streams in "
+            f"{moved_transactions:,} journalled slice transactions and moved {moved_clusters:,} clusters "
             f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
             flush=True,
         )
@@ -2117,8 +2142,15 @@ def compact(device: str, journal_path: Path,
                 f"({_human_bytes(filled * volume.cluster_size)}).",
                 flush=True,
             )
-        if blocker:
-            print(f"Compaction limited by {blocker}.", flush=True)
+        if blocked_gaps:
+            blocked_clusters = sum(length for _start, length, _reason in blocked_gaps)
+            first_start, first_length, first_reason = blocked_gaps[0]
+            print(
+                f"{len(blocked_gaps):,} low gaps containing {blocked_clusters:,} clusters "
+                "could not be filled by the currently supported NTFS stream writer; "
+                f"the first is cluster {first_start:,}+{first_length:,}: {first_reason}.",
+                flush=True,
+            )
         elif final_gap_count == 0:
             print(
                 "All free clusters below the allocation boundary were eliminated; "
@@ -2129,7 +2161,7 @@ def compact(device: str, journal_path: Path,
             print("The allocation boundary reached the theoretical packed limit.", flush=True)
         if moved_transactions == 0 and initial_gap_count:
             print(
-                "No internal NTFS gaps could be removed without changing file fragmentation.",
+                "No internal NTFS gaps could be filled by any supported file or directory stream.",
                 flush=True,
             )
         if _stop_requested:

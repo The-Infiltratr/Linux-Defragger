@@ -1,9 +1,12 @@
-# Linux Defragger 1.8.0-29
+# Linux Defragger 1.8.0-30
 
-- Fixes the urgent FAT12/16/32 Growth Defrag failure `growth-defrag target range is occupied after staging`. A fragmented chain can place clusters belonging to an earlier object inside a later object's planned target, so moving only the later object to the terminal workspace does not necessarily clear that target.
-- After staging an object, Growth Defrag now identifies every remaining occupied cluster in its final target and evacuates those blockers into the staged object's released source clusters outside the target. It then places the staged object normally.
-- The blocker evacuation is journalled with the same durable mapped-cluster transaction engine as every other FAT move. It requires no larger workspace than the existing largest-object terminal workspace and preserves the live chains and directory references of the displaced objects.
-- Adds a deterministic interleaved FAT32 regression image that reproduced the exact failure after phase 1 reported zero preparation moves. The test verifies both blocker evacuations, final file payloads, contiguous chains and all 10 percent growth gaps.
+- Replaces EXT4's regular-file-only online exchange pass with a complete offline shrink-and-restore repack. Compact now runs `e2fsck`, shrinks the ext4 filesystem to its minimum valid size with `resize2fs -M`, and restores the exact original block count without changing the partition. This forces ordinary files, directory blocks, the journal and relocatable metadata out of the physical tail.
+- Adds failure cleanup that restores the original ext4 filesystem size if an interruption or tool failure occurs after the shrink stage. The package now declares `e2fsprogs` as a runtime dependency.
+- Fixes NTFS Compact stopping at a one-cluster or otherwise undersized low gap. Compact can now copy a tail slice of a higher file extent into the gap and rewrite the mapping pairs even when that increases fragmentation.
+- Makes NTFS Compact continue beyond a gap that no currently supported stream can fill instead of abandoning the entire volume.
+- Adds native relocation of supported directory `$INDEX_ALLOCATION` streams, so directory data is packed with ordinary file data.
+- Classifies NTFS core system and non-file streams as **Filesystem metadata/reserved** on the allocation map, distinguishing protected metadata from user files left behind.
+- Adds synthetic regression coverage for partial NTFS extent moves, directory-index moves, mapping-pair capacity checks, payload preservation, recovery and the ext4 shrink/check/restore command sequence.
 
 ## Revision 28
 

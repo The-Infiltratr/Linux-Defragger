@@ -274,6 +274,50 @@ def test_btrfs_compact_uses_resize_not_balance():
     assert targets == sorted(targets, reverse=True)
 
 
+
+
+def test_ext4_compact_shrinks_to_minimum_then_restores_original_size():
+    state = {'blocks': 1000}
+    commands = []
+    original_assert = n._assert_unmounted
+    original_which = n.shutil.which
+    original_geometry = n.ext4_compact_geometry
+    original_run = n._run_ext4_tool
+    original_stop = n._stop_requested
+    try:
+        n._assert_unmounted = lambda _device: None
+        n.shutil.which = lambda name: f'/usr/sbin/{name}'
+        n.ext4_compact_geometry = lambda _device: (4096, state['blocks'] * 4096)
+        def fake_run(command, accepted=None):
+            commands.append((tuple(command), accepted))
+            if command[0].endswith('resize2fs') and '-M' in command:
+                state['blocks'] = 420
+            elif command[0].endswith('resize2fs') and command[-1] == '1000':
+                state['blocks'] = 1000
+            return 0
+        n._run_ext4_tool = fake_run
+        n._stop_requested = False
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert n.compact_ext4_offline('/dev/test') == 0
+    finally:
+        n._assert_unmounted = original_assert
+        n.shutil.which = original_which
+        n.ext4_compact_geometry = original_geometry
+        n._run_ext4_tool = original_run
+        n._stop_requested = original_stop
+    assert state['blocks'] == 1000
+    assert [item[0] for item in commands] == [
+        ('/usr/sbin/e2fsck', '-f', '-p', '/dev/test'),
+        ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
+        ('/usr/sbin/resize2fs', '-p', '/dev/test', '1000'),
+        ('/usr/sbin/e2fsck', '-f', '-p', '/dev/test'),
+    ]
+    report = output.getvalue()
+    assert 'offline filesystem-wide repack' in report
+    assert 'All file and directory allocations fit below block 419' in report
+
+
 if __name__ == '__main__':
     for name, value in sorted(globals().items()):
         if name.startswith('test_') and callable(value):

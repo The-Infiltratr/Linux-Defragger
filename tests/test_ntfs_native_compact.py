@@ -83,7 +83,7 @@ def resident(atype: int, value: bytes) -> bytes:
     return bytes(attr)
 
 
-def record(number: int, attrs: list[bytes]) -> bytes:
+def record(number: int, attrs: list[bytes], flags: int = 1) -> bytes:
     fixed = bytearray(RECORD_SIZE)
     fixed[:4] = b"FILE"
     struct.pack_into("<H", fixed, 4, 0x30)
@@ -91,7 +91,7 @@ def record(number: int, attrs: list[bytes]) -> bytes:
     struct.pack_into("<H", fixed, 16, 1)
     struct.pack_into("<H", fixed, 18, 1)
     struct.pack_into("<H", fixed, 20, 0x38)
-    struct.pack_into("<H", fixed, 22, 1)
+    struct.pack_into("<H", fixed, 22, flags)
     struct.pack_into("<I", fixed, 28, RECORD_SIZE)
     struct.pack_into("<I", fixed, 44, number)
     pos = 0x38
@@ -110,7 +110,8 @@ def record(number: int, attrs: list[bytes]) -> bytes:
 def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False,
                split_destinations: bool = False,
                fragmented_data: bool = False,
-               occupied_tail: bool = False) -> bytes:
+               occupied_tail: bool = False,
+               directory_data: bool = False) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -143,6 +144,15 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         0x80, data_runs, DATA_CLUSTERS * CLUSTER_SIZE,
         mapping_slack=0,
     )])
+    directory_lcn = 3720
+    directory_clusters = 4
+    if directory_data:
+        records[25] = record(25, [nonresident(
+            ntfs_engine.ATTR_INDEX_ALLOCATION,
+            [(directory_lcn, directory_clusters)],
+            directory_clusters * CLUSTER_SIZE,
+            mapping_slack=32,
+        )], flags=ntfs_engine.RECORD_IN_USE | ntfs_engine.RECORD_DIRECTORY)
     mft_offset = MFT_LCN * CLUSTER_SIZE
     for number, raw in enumerate(records):
         image[mft_offset + number * RECORD_SIZE:mft_offset + (number + 1) * RECORD_SIZE] = raw
@@ -157,6 +167,8 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
     used.add(BITMAP_LCN)
     for lcn, length in data_runs:
         used.update(range(lcn, lcn + length))
+    if directory_data:
+        used.update(range(directory_lcn, directory_lcn + directory_clusters))
     if split_destinations:
         holes = set(range(200, 204)) | set(range(500, 505)) | set(range(1000, 1007))
         used.update(cluster for cluster in range(DATA_LCN) if cluster not in holes)
@@ -177,6 +189,11 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         count = length * CLUSTER_SIZE
         image[lcn * CLUSTER_SIZE:(lcn + length) * CLUSTER_SIZE] = payload[offset:offset + count]
         offset += count
+    if directory_data:
+        directory_payload = bytes((index * 19 + 7) & 0xFF
+                                  for index in range(directory_clusters * CLUSTER_SIZE))
+        image[directory_lcn * CLUSTER_SIZE:
+              (directory_lcn + directory_clusters) * CLUSTER_SIZE] = directory_payload
     path.write_bytes(image)
     return payload
 
@@ -223,6 +240,28 @@ def current_data_payload(path: Path, length: int) -> bytes:
         ntfs_engine._close_volume(volume)
 
 
+def current_directory_runs(path: Path) -> tuple[ntfs_engine.Run, ...]:
+    volume = ntfs_engine._open_volume(str(path), False)
+    try:
+        layout = ntfs_engine._read_layout(volume)
+        _offset, _raw, fixed = ntfs_engine._read_mft_record(volume, layout.mft_runs, 25)
+        attrs = [attr for attr in ntfs_engine._attributes(fixed)
+                 if attr.atype == ntfs_engine.ATTR_INDEX_ALLOCATION and attr.nonresident]
+        assert len(attrs) == 1
+        return attrs[0].runs
+    finally:
+        ntfs_engine._close_volume(volume)
+
+
+def current_directory_payload(path: Path, length: int) -> bytes:
+    runs = current_directory_runs(path)
+    volume = ntfs_engine._open_volume(str(path), False)
+    try:
+        return ntfs_engine._read_stream(volume, runs, 0, length)
+    finally:
+        ntfs_engine._close_volume(volume)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="linux-defragger-native-ntfs-") as directory:
         tmp = Path(directory)
@@ -247,8 +286,25 @@ def main() -> None:
         )
         assert all(not (bitmap[c >> 3] & (1 << (c & 7))) for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
 
-        # Compact must not split a file extent across several holes. That would
-        # alter fragmentation and belongs to Defragment, not Compact.
+        # Directory $INDEX_ALLOCATION is physical directory data and must be
+        # compacted with ordinary files rather than being left in the tail.
+        payload = make_image(image, directory_data=True)
+        directory_before = current_directory_runs(image)
+        directory_expected = hashlib.sha256(
+            current_directory_payload(image, 4 * CLUSTER_SIZE)
+        ).hexdigest()
+        captured = io.StringIO()
+        ntfs_engine._stop_requested = False
+        with contextlib.redirect_stdout(captured):
+            assert ntfs_engine.compact(str(image), journal) == 0
+        directory_after = current_directory_runs(image)
+        assert directory_after != directory_before
+        assert max(int(run.lcn) + run.length for run in directory_after if run.lcn is not None) < 3720
+        assert hashlib.sha256(current_directory_payload(image, 4 * CLUSTER_SIZE)).hexdigest() == directory_expected
+        assert "1 movable directory index streams" in captured.getvalue()
+
+        # Compact must fill every lower hole even when doing so splits a file
+        # extent. Physical packing takes priority over preserving fragment count.
         payload = make_image(image, split_destinations=True)
         expected = hashlib.sha256(payload).hexdigest()
         ntfs_engine._stop_requested = False
@@ -256,17 +312,19 @@ def main() -> None:
         with contextlib.redirect_stdout(captured):
             assert ntfs_engine.compact(str(image), journal) == 0
         runs = current_data_runs(image)
-        assert runs == (ntfs_engine.Run(DATA_LCN, DATA_CLUSTERS),)
+        assert runs != (ntfs_engine.Run(DATA_LCN, DATA_CLUSTERS),)
+        assert sum(run.length for run in runs) == DATA_CLUSTERS
+        assert all(run.lcn is not None and int(run.lcn) < DATA_LCN for run in runs)
         volume = ntfs_engine._open_volume(str(image), False)
         try:
             actual = ntfs_engine._read_stream(volume, runs, 0, len(payload))
         finally:
             ntfs_engine._close_volume(volume)
         assert hashlib.sha256(actual).hexdigest() == expected
-        assert "without changing file fragmentation" in captured.getvalue()
+        assert "All free clusters below the allocation boundary were eliminated" in captured.getvalue()
 
-        # Compact may move a complete fragment into a lower hole, but the file
-        # must retain the same number of physical fragments.
+        # A previously fragmented file may gain or lose physical fragments while
+        # Compact fills the low map, but its logical payload must remain exact.
         payload = make_image(image, fragmented_data=True)
         expected = hashlib.sha256(payload).hexdigest()
         before_runs = current_data_runs(image)
@@ -275,7 +333,7 @@ def main() -> None:
         assert ntfs_engine.compact(str(image), journal) == 0
         after_runs = current_data_runs(image)
         assert after_runs != before_runs
-        assert ntfs_engine._physical_fragment_count(after_runs) == 2
+        assert max(int(run.lcn) + run.length for run in after_runs if run.lcn is not None) < DATA_LCN
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
 
         # Defragment rebuilds that same two-fragment file as one contiguous run
@@ -324,7 +382,7 @@ def main() -> None:
         assert after_runs != before_runs
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == hashlib.sha256(payload).hexdigest()
         report = captured.getvalue()
-        assert "used 1 file streams" in report
+        assert "used 1 file or directory streams" in report
         assert "Allocated high-water mark: cluster 3,807 -> 3,807" in report
         assert "Lowest internal free gap advanced" in report
 

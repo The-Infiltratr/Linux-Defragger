@@ -22,6 +22,7 @@ _RECORD_IN_USE = 0x0001
 _RECORD_DIRECTORY = 0x0002
 _FILE_REFERENCE_MASK = (1 << 48) - 1
 _MFT_READ_CHUNK = 16 * 1024 * 1024
+_FIRST_USER_RECORD = 24
 
 
 def _signed_le(data: bytes) -> int:
@@ -252,6 +253,7 @@ def _scan_fragmentation(reader: Reader, mft_lcn: int, cluster_size: int,
     segments, data_size = _mft_stream(bytes(record_zero))
 
     objects: dict[int, dict] = {}
+    metadata_ranges: list[tuple[int, int]] = []
     records_scanned = 0
     malformed_records = 0
     for record_number, raw in _mft_records(reader, segments, data_size, cluster_size, record_size):
@@ -279,12 +281,27 @@ def _scan_fragmentation(reader: Reader, mft_lcn: int, cluster_size: int,
                 if not attr["nonresident"]:
                     continue
                 atype = int(attr["type"])
+                runs = list(attr["runs"])
+                physical = [(int(lcn), int(lcn) + int(length))
+                            for lcn, length in runs if lcn is not None]
                 is_directory = bool(state["directory"])
-                if (not is_directory and atype != _ATTR_DATA) or (is_directory and atype != _ATTR_INDEX_ALLOCATION):
+                is_object_stream = (
+                    (not is_directory and atype == _ATTR_DATA) or
+                    (is_directory and atype == _ATTR_INDEX_ALLOCATION)
+                )
+                # Preserve the analyser's historical object/fragment counts for
+                # every in-use MFT record, including the synthetic core records
+                # used by regression images. Independently classify the first
+                # NTFS system records and all non-file streams as filesystem
+                # metadata so the allocation map does not present them as
+                # ordinary files left behind by Compact.
+                if record_number < _FIRST_USER_RECORD or not is_object_stream:
+                    metadata_ranges.extend(physical)
+                if not is_object_stream:
                     continue
                 key = (atype, bytes(attr["name"]))
                 stream = state["streams"].setdefault(key, [])
-                stream.append((int(attr["lowest_vcn"]), list(attr["runs"])))
+                stream.append((int(attr["lowest_vcn"]), runs))
         except BackendError:
             malformed_records += 1
 
@@ -318,6 +335,7 @@ def _scan_fragmentation(reader: Reader, mft_lcn: int, cluster_size: int,
         "mft_malformed_records": malformed_records,
         "fragmented_ranges": _merge_ranges(fragmented_ranges),
         "directory_ranges": _merge_ranges(directory_ranges),
+        "metadata_ranges": _merge_ranges(metadata_ranges),
     }
 
 
@@ -417,6 +435,7 @@ class NtfsBackend:
             return
         fragmented_units = _overlay_ranges(result["cells"], summary["fragmented_ranges"], "fragmented")
         directory_units = _overlay_ranges(result["cells"], summary["directory_ranges"], "directory")
+        metadata_units = _overlay_ranges(result["cells"], summary["metadata_ranges"], "bad")
         result.update({
             "regular_files": summary["regular_files"],
             "directories": summary["directories"],
@@ -431,6 +450,8 @@ class NtfsBackend:
             "mft_malformed_records": summary["mft_malformed_records"],
             "fragmented_clusters_mapped": fragmented_units,
             "directory_clusters_mapped": directory_units,
+            "metadata_clusters_mapped": metadata_units,
+            "metadata_basis": "NTFS system and non-file nonresident streams",
         })
 
 

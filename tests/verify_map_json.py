@@ -15,7 +15,7 @@ with open(path, "r", encoding="utf-8") as handle:
     data = json.load(handle)
 
 assert data["program"] == "linux-defragger-engine"
-assert data["version"] == "1.8.0-29"
+assert data["version"] == "1.8.0-30"
 assert data["filesystem"] == "FAT32"
 assert data["cell_count"] == expected_cells
 assert len(data["cells"]) == expected_cells

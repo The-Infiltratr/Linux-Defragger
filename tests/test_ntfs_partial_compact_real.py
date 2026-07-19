@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Validate that real NTFS Compact preserves file fragmentation.
+# Purpose: Validate real NTFS partial-extent packing and data integrity.
 
 from __future__ import annotations
 
@@ -114,13 +114,14 @@ def main() -> None:
 
         after, _largest, _total = largest_candidate(image)
         assert after.record_number == before.record_number
-        assert ntfs_engine._physical_fragment_count(after.attribute.runs) == before_fragments
-        assert after.highest_lcn <= before_high
+        after_fragments = ntfs_engine._physical_fragment_count(after.attribute.runs)
+        assert after_fragments >= before_fragments
+        assert after.highest_lcn < before_high
 
         run([tools["ntfscat"], "-f", str(image), "/payload.bin"], extracted)
         assert digest(extracted) == expected
         run([tools["ntfsresize"], "--check", "--force", "--force", str(image)])
-    print("Real NTFS whole-extent compaction preserved fragmentation and filesystem consistency")
+    print("Real NTFS partial-extent compaction reduced the boundary and preserved filesystem consistency")
 
 
 if __name__ == "__main__":

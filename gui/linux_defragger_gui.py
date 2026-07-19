@@ -1230,13 +1230,19 @@ class MainWindow(Gtk.ApplicationWindow):
             "recover": "Complete or roll back the interrupted journalled transaction.",
         }
         extra_warning = ""
-        if operation == "compact" and volume.normalized_fstype in {"ext4", "xfs"}:
+        if operation == "compact" and volume.normalized_fstype == "ext4":
             extra_warning = (
-                "\n\nThis Compact pass mounts the otherwise-unmounted volume privately and uses "
+                "\n\nEXT4 Compact remains fully offline. It runs a filesystem check, temporarily "
+                "shrinks the complete filesystem to its minimum valid size so files, directories, "
+                "the journal and relocatable metadata are forced toward the beginning, then expands "
+                "the filesystem back to its exact original size. The partition table is not changed."
+            )
+        elif operation == "compact" and volume.normalized_fstype == "xfs":
+            extra_warning = (
+                "\n\nThis XFS Compact pass mounts the otherwise-unmounted volume privately and uses "
                 "the filesystem kernel driver to exchange high regular-file extents into low "
-                "free ranges. It may increase fragmentation and does not move filesystem metadata."
-                + (" XFS range exchange requires Linux 6.10 or newer."
-                   if volume.normalized_fstype == "xfs" else "")
+                "free ranges. It may increase fragmentation and does not move filesystem metadata. "
+                "XFS range exchange requires Linux 6.10 or newer."
             )
         elif operation == "compact" and volume.normalized_fstype == "btrfs":
             extra_warning = (
@@ -1247,9 +1253,9 @@ class MainWindow(Gtk.ApplicationWindow):
         elif volume.normalized_fstype == "ntfs":
             if operation == "compact":
                 extra_warning = (
-                    "\n\nNTFS Compact moves complete physical extents into lower gaps while "
-                    "preserving each file's existing fragment count. It does not join, split "
-                    "or rebuild fragmented files."
+                    "\n\nNTFS Compact fills lower gaps from higher supported file and directory streams. "
+                    "It may split physical extents and increase fragmentation because consolidating "
+                    "all possible free space at the physical end is the purpose of Compact."
                 )
             elif operation == "defrag":
                 extra_warning = (

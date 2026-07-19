@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-29
+# Linux Defragger 1.8.0-30
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -52,13 +52,15 @@ The operation refuses to start unless the volume has enough free clusters for bo
 
 ### Native ext4, XFS and Btrfs Compact semantics
 
-The ext4 and XFS compactors use the mounted kernel filesystem driver rather than editing live metadata structures themselves. The GUI still requires the volume to be unmounted; the privileged engine mounts it privately and reserves accessible free extents in unlinked collector files. Each lowest collector extent is then used directly as the donor for an exchange with a high regular-file extent. The operation does not punch that range free and does not request a second allocation after the collector has reserved the free-space map. This avoids a self-inflicted `ENOSPC` failure and keeps the exact physical destination under verification before every exchange. The operation is deliberately allowed to split files and increase fragmentation. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsupported extents are left in place. Filesystem metadata is not moved.
+EXT4 Compact is a filesystem-wide offline repack. It runs `e2fsck`, uses `resize2fs -M` to shrink the complete filesystem to its minimum valid size, then restores the exact original block count. Shrinking forces ordinary files, directory blocks, the journal and every relocatable metadata allocation out of the physical tail. The partition table and partition size are never changed. After the grow-back, ext4 may recreate block-group metadata required by the restored full-size geometry, but ordinary file and directory allocations remain below the packed minimum boundary. This path requires the `e2fsprogs` package.
 
-Each ext4 move uses `EXT4_IOC_MOVE_EXT`; each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. The collector files are unlinked and held only by open descriptors. After an exchange they own the old high blocks; closing them at the end releases those blocks together at the physical tail. The engine then creates a fresh collector and repeats automatically until a complete pass moves no more regular-file data, so newly exposed opportunities do not require another click. A safe Stop exits between completed kernel-journalled exchanges or between complete collector passes.
+XFS Compact uses the mounted kernel filesystem driver rather than editing live metadata structures itself. The GUI still requires the volume to be unmounted; the privileged engine mounts it privately and reserves accessible free extents in unlinked collector files. Each lowest collector extent is then used directly as the donor for an exchange with a high regular-file extent. The operation does not punch that range free and does not request a second allocation after the collector has reserved the free-space map. This avoids a self-inflicted `ENOSPC` failure and keeps the exact physical destination under verification before every exchange. The operation is deliberately allowed to split files and increase fragmentation. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsupported extents are left in place. Filesystem metadata is not moved.
 
-During ext4/XFS Compact, each completed exchange sends a physical source/destination range to the GUI. The cached allocation samples are updated and redrawn immediately without rereading the raw device. This live view shows used/free movement; the exact fragmentation overlay is deliberately rebuilt by the final read-only analysis because a compact move may split a file.
+Each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. The collector files are unlinked and held only by open descriptors. After an exchange they own the old high blocks; closing them at the end releases those blocks together at the physical tail. The engine then creates a fresh collector and repeats automatically until a complete pass moves no more regular-file data. A safe Stop exits between completed kernel-journalled exchanges or between complete collector passes.
 
-EXT filesystems contain fixed structures distributed through block groups. The analyser marks known superblock/descriptor areas, block and inode bitmaps, inode tables, and low-numbered system-inode allocations as **Filesystem metadata/reserved**, while directory extents remain purple. The renderer blends these categories by cell density rather than painting a whole cell from a single metadata block. These allocations can remain as islands inside the free tail because the online regular-file extent-exchange interface cannot relocate them. Compact nevertheless includes the privileged free-block reserve and packs all movable regular-file data as low as those fixed structures permit.
+During XFS Compact, each completed exchange sends a physical source/destination range to the GUI. The cached allocation samples are updated and redrawn immediately without rereading the raw device. The exact fragmentation overlay is rebuilt by the final read-only analysis because a compact move may split a file.
+
+EXT allocation maps classify superblock/descriptor areas, block and inode bitmaps, inode tables, journal allocations and reserved system structures as **Filesystem metadata/reserved**, while directory extents remain purple. The renderer blends these categories by cell density rather than painting a whole cell from a single metadata block.
 
 Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses a native online shrink-and-restore transaction to force high physical chunks below a temporary boundary, then restores the original filesystem size. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each resize cycle and stops when the chunk boundary no longer improves.
 
@@ -76,7 +78,7 @@ NTFS support is implemented inside Linux Defragger and has no NTFS-3G runtime de
 
 ### NTFS Compact
 
-NTFS Compact fills the lowest internal free gap using a complete supported physical file extent from a higher location. A compact move is accepted only when it preserves the file's physical fragment count. Compact does not split one extent across several holes and does not join logical neighbouring extents merely to reduce the fragmentation count.
+NTFS Compact fills every low gap it can from higher supported file and directory-index streams. It can move only part of a high extent into a small gap, and it may split or join physical extents because removing internal free space takes priority over preserving the current fragment count. One awkward gap no longer stops the rest of the pass; Compact records it and continues packing later gaps. Core NTFS system records, the boot area and other protected metadata remain fixed and are shown as **Filesystem metadata/reserved**, not as ordinary files.
 
 ### NTFS Defragment
 
@@ -86,7 +88,7 @@ NTFS Defragment finds supported ordinary files that have more than one physical 
 
 Every NTFS move uses an external journal. Data is copied first, destination clusters are reserved, the MFT record is switched, old clusters are released, and the original clean volume flags are restored. Recover inspects the actual on-disk MFT record and completes the transaction forward or restores the original record and bitmap state.
 
-The current native writer deliberately leaves NTFS system files and directories, named data streams, compressed/sparse/encrypted streams, `$ATTRIBUTE_LIST` extension streams and malformed MFT records unchanged.
+The current native writer moves ordinary unnamed file data and supported directory `$INDEX_ALLOCATION` streams. It deliberately leaves core NTFS system records, named data streams, compressed/sparse/encrypted streams, `$ATTRIBUTE_LIST` extension streams and malformed MFT records unchanged. Those protected allocations are classified as filesystem metadata/reserved on the map so any remaining tail islands are not mistaken for user files.
 
 ## Interface
 

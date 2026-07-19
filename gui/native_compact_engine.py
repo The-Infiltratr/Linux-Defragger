@@ -6,17 +6,15 @@
 """Native Linux filesystem compaction engine.
 
 The FAT, exFAT and NTFS engines edit their own on-disk metadata while the
-volume is offline.  ext4, XFS and Btrfs already have kernel transaction code
-for relocating mappings, so this engine mounts an otherwise unmounted volume
-privately and asks the filesystem itself to perform each relocation.
+volume is offline. ext4 Compact now also works offline: it temporarily shrinks
+the complete filesystem to its minimum size, forcing regular files, directory
+blocks, journals and relocatable metadata below that boundary, and then restores
+the original filesystem size. This is a true filesystem-wide packing pass rather
+than the earlier regular-file-only EXT4_IOC_MOVE_EXT loop.
 
-ext4 and XFS use temporary, unlinked space-collector files.  The collector
-occupies existing free runs.  Each low collector extent is then used directly
-as the donor for a mapping exchange with the highest movable file extent.  No
-second allocation is attempted after the free space has been reserved.  After
-an exchange, the collector owns the old high extent and keeps it allocated
-until the pass ends.  Closing the collector descriptors releases those old
-high extents together, leaving free space at the physical tail.
+XFS continues to use temporary, unlinked space-collector files and kernel range
+exchange. The collector occupies existing free runs; low collector extents are
+used as donors for exchanges with the highest movable file extents.
 
 Btrfs cannot exchange arbitrary physical file extents because every extent is
 copy-on-write and back-referenced.  Its compactor therefore uses the native
@@ -37,9 +35,11 @@ import os
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -486,6 +486,138 @@ def ext4_compact_geometry(device: str) -> tuple[int, int]:
         if ro_compat & ext_backend._EXT4_FEATURE_RO_COMPAT_BIGALLOC:
             raise CompactError("ext4 bigalloc Compact is not yet supported")
         return block_size, blocks * block_size
+
+
+def _run_ext4_tool(command: list[str], accepted: set[int] | None = None) -> int:
+    """Run one offline e2fsprogs stage while streaming its output to the GUI."""
+    accepted = {0} if accepted is None else accepted
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+    except OSError as exc:
+        raise CompactError(f"cannot execute {command[0]}: {exc}") from exc
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line.rstrip("\n"), flush=True)
+    result = process.wait()
+    if result not in accepted:
+        raise CompactError(
+            f"{' '.join(command)} failed with exit status {result}"
+        )
+    return result
+
+
+def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
+    """Pack the entire ext4 filesystem by shrinking to minimum and restoring it.
+
+    resize2fs owns all inode, directory, journal and block-group relocation. The
+    partition is never resized; only the filesystem's temporary internal block
+    count changes, and the original count is restored before return.
+    """
+    del live_cells  # resize2fs reports its own phase progress; the GUI refreshes after completion.
+    _assert_unmounted(device)
+    e2fsck = shutil.which("e2fsck")
+    resize2fs = shutil.which("resize2fs")
+    if not e2fsck or not resize2fs:
+        raise CompactError(
+            "ext4 filesystem-wide Compact requires e2fsprogs (e2fsck and resize2fs)"
+        )
+
+    block_size, original_bytes = ext4_compact_geometry(device)
+    original_blocks = original_bytes // block_size
+    restored = False
+    shrunk_blocks = original_blocks
+    print(
+        "EXT4 Compact is performing an offline filesystem-wide repack. It will "
+        "shrink the filesystem to its minimum valid size so directory blocks and "
+        "all relocatable metadata move with file data, then restore the original size.",
+        flush=True,
+    )
+    print(
+        f"Original ext4 size: {original_blocks:,} blocks of {block_size:,} bytes "
+        f"({original_bytes / (1024**3):.2f} GiB). The partition itself will not be changed.",
+        flush=True,
+    )
+    print("2.00 percent completed", flush=True)
+
+    try:
+        print("EXT4 Compact phase 1/4: mandatory offline filesystem check.", flush=True)
+        # e2fsck exit 1 means errors were corrected successfully.
+        _run_ext4_tool([e2fsck, "-f", "-p", device], {0, 1})
+        if _stop_requested:
+            print("Stop requested before filesystem resizing began.", flush=True)
+            return EXIT_STOPPED
+        print("10.00 percent completed", flush=True)
+
+        print(
+            "EXT4 Compact phase 2/4: shrinking to the minimum valid filesystem size. "
+            "This is the relocation phase that moves files, directories, the journal and "
+            "relocatable metadata out of the physical tail.",
+            flush=True,
+        )
+        _run_ext4_tool([resize2fs, "-M", "-p", device])
+        _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
+        shrunk_blocks = shrunk_bytes // block_size
+        if shrunk_blocks > original_blocks:
+            raise CompactError("resize2fs reported a filesystem larger than its original size")
+        print(
+            f"EXT4 minimum packed boundary: {shrunk_blocks:,} blocks "
+            f"({shrunk_bytes / (1024**3):.2f} GiB).",
+            flush=True,
+        )
+        print("72.00 percent completed", flush=True)
+
+        print(
+            "EXT4 Compact phase 3/4: restoring the original filesystem size while leaving "
+            "the relocated file and directory allocations at the beginning.",
+            flush=True,
+        )
+        _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
+        restored = True
+        print("92.00 percent completed", flush=True)
+
+        print("EXT4 Compact phase 4/4: verifying the restored filesystem.", flush=True)
+        _run_ext4_tool([e2fsck, "-f", "-p", device], {0, 1})
+        final_block_size, final_bytes = ext4_compact_geometry(device)
+        if final_block_size != block_size or final_bytes != original_bytes:
+            raise CompactError(
+                "ext4 verification completed, but the original filesystem size was not restored"
+            )
+        moved_tail = max(0, original_blocks - shrunk_blocks) * block_size
+        print(
+            f"EXT4 filesystem-wide Compact completed. All file and directory allocations "
+            f"fit below block {shrunk_blocks - 1:,}; {moved_tail / (1024**3):.2f} GiB of "
+            "physical tail was cleared before the filesystem was expanded back to its original size.",
+            flush=True,
+        )
+        print(
+            "Only ext4 block-group structures created or required across the restored full-size "
+            "filesystem may remain beyond that packed allocation boundary; ordinary file and "
+            "directory data has been forced below it.",
+            flush=True,
+        )
+        print("100.00 percent completed", flush=True)
+        return EXIT_STOPPED if _stop_requested else 0
+    finally:
+        if not restored:
+            try:
+                _current_block_size, current_bytes = ext4_compact_geometry(device)
+                current_blocks = current_bytes // block_size
+                if current_blocks < original_blocks:
+                    print(
+                        "EXT4 Compact cleanup: restoring the original filesystem size after an "
+                        "interrupted or failed shrink stage.",
+                        flush=True,
+                    )
+                    _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
+            except Exception as restore_exc:
+                print(
+                    "CRITICAL: ext4 remains at its smaller but valid filesystem size because "
+                    f"automatic restoration failed: {restore_exc}",
+                    file=sys.stderr, flush=True,
+                )
 
 
 def xfs_compact_geometry(device: str) -> tuple[int, int]:
@@ -1207,6 +1339,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Native Compact engine {VERSION}", flush=True)
     if args.filesystem == "btrfs":
         return compact_btrfs(args.device)
+    if args.filesystem == "ext4":
+        return compact_ext4_offline(args.device, args.live_map_cells)
     return compact_extent_filesystem(args.device, args.filesystem, args.live_map_cells)
 
 
