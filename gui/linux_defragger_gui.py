@@ -139,6 +139,14 @@ def find_apple_engine() -> str:
     )
 
 
+def find_ntfs_engine() -> str:
+    return _configured_executable(
+        "LINUX_DEFRAGGER_NTFS_ENGINE",
+        "/usr/lib/linux-defragger/ntfs_engine.py",
+        "the NTFS compaction engine",
+    )
+
+
 def find_privileged_helper() -> str:
     return _configured_executable(
         "LINUX_DEFRAGGER_HELPER",
@@ -402,6 +410,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.privileged_helper = find_privileged_helper()
         self.exfat_engine = find_exfat_engine()
         self.apple_engine = find_apple_engine()
+        self.ntfs_engine = find_ntfs_engine()
         self.affs_engine = str(Path(__file__).resolve().parent / "affs_engine.py")
         if not Path(self.affs_engine).is_file():
             self.affs_engine = "/usr/lib/linux-defragger/affs_engine.py"
@@ -1022,7 +1031,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if volume.mounted:
             self.show_error(
                 "The volume is mounted",
-                "Unmount it first. The engine intentionally refuses to modify mounted FAT volumes.",
+                "Unmount it first. Filesystem mutation engines intentionally refuse mounted volumes.",
             )
             return
         journal = self.journal_path()
@@ -1041,9 +1050,16 @@ class MainWindow(Gtk.ApplicationWindow):
             "compact": "Pack allocated data toward the beginning of the volume.",
             "recover": "Complete or roll back the interrupted journalled transaction.",
         }
+        extra_warning = ""
+        if volume.normalized_fstype == "ntfs":
+            extra_warning = (
+                "\n\nNTFS Compact uses Linux Defragger's native offline NTFS writer. "
+                "It moves only ordinary file data streams that can be relocated safely; "
+                "system metadata and unsupported stream layouts remain in place."
+            )
         if not self.confirm(
             f"{operation.capitalize()} {volume.path}?",
-            f"{descriptions[operation]}\n\nThe volume must remain connected and unmounted. "
+            f"{descriptions[operation]}{extra_warning}\n\nThe volume must remain connected and unmounted. "
             "A clean Stop request finishes the active transaction before exiting.",
         ):
             return
@@ -1051,6 +1067,7 @@ class MainWindow(Gtk.ApplicationWindow):
         operation_engine = (self.exfat_engine if volume.normalized_fstype == "exfat" else
                             self.affs_engine if volume.normalized_fstype == "affs" else
                             self.apple_engine if volume.normalized_fstype in {"hfs", "hfsplus"} else
+                            self.ntfs_engine if volume.normalized_fstype == "ntfs" else
                             self.engine)
         args = [operation_engine, operation, volume.path, "--write", "--confirm", volume.path, "--journal", journal]
         live_cells = len(self.map_data.get("cells", [])) if self.map_data else self._desired_map_cells()
@@ -1107,6 +1124,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return "affs-engine", args[1:]
         if executable == os.path.realpath(self.apple_engine):
             return "apple-engine", args[1:]
+        if executable == os.path.realpath(self.ntfs_engine):
+            return "ntfs-engine", args[1:]
         if os.path.basename(args[0]) == "udisksctl":
             return "udisksctl", args[1:]
         raise RuntimeError(f"The privileged helper does not permit: {args[0]}")

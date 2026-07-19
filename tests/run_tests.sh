@@ -189,5 +189,7 @@ grep -q 'Free gaps below it:       0 clusters' "$TMP/gapped-compact.txt"
 
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ext_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_backend.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_native_compact.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_compact_real.py" >/dev/null
 
 echo 'all tests passed'

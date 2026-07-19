@@ -5,12 +5,12 @@
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
 
-"""Read-only NTFS allocation-map and fragmentation-analysis backend."""
+"""NTFS allocation/fragmentation analysis with native offline compaction."""
 
 from __future__ import annotations
 from .base import *
 
-INFO = BackendInfo("ntfs", "NTFS", ("ntfs", "ntfs3"), CAP_ANALYSE|CAP_MAP, "exact")
+INFO = BackendInfo("ntfs", "NTFS", ("ntfs", "ntfs3"), CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_RECOVER, "exact")
 
 _ATTR_DATA = 0x80
 _ATTR_INDEX_ALLOCATION = 0xA0

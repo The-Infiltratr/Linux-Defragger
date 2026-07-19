@@ -1,26 +1,7 @@
-# Linux Defragger 1.8.0 test status
+# Test status
 
-The exact source build passed:
-
-- Synthetic Linux swap headers with inactive accounting, active `/proc/swaps` accounting, reserved header pages, bad-page handling and unknown physical-slot maps.
-- GUI unknown-state rendering and swap-specific usage/fragmentation summaries.
-- Synthetic ext4 extent-tree and ext2 indirect-block images, including fragmented files, fragmented directories, file counts, percentage calculation and map overlays.
-- The complete pre-existing FAT regression suite (`all tests passed`).
-- HFS+ three-extent data-fork relocation with byte-for-byte payload verification.
-- HFS+ pre-switch rollback at copied and destination-ready phases.
-- HFS+ post-switch forward recovery.
-- HFSX fragmented-fork relocation.
-- Classic HFS data-fork defragmentation with independent `hfsck` validation.
-- Classic HFS compaction with SHA-256 payload verification.
-- Classic HFS pre-switch rollback and post-switch forward recovery, each followed by `hfsck`.
-- Python compilation for all GUI and backend modules.
-- Capability registry validation: HFS advertises Analyse/Map/Compact/Defragment/Recover; HFS+/HFSX additionally advertise live map updates.
-- The exact unpacked Debian package repeated HFS and HFS+ mutation tests.
-
-No physical Apple-formatted media was available. The first physical run should use backed-up, replaceable media.
-## Mounted-volume analysis policy
-
-- GUI Analyse control is enabled for mounted supported volumes.
-- Native FAT read-only commands no longer request an exclusive block-device open and do not reject the active-volume dirty bit.
-- Compact, Defragment and Recover retain mounted-volume rejection and exclusive writable opens.
-
+- Native NTFS synthetic relocation: high file data moved into a low free run, MFT mapping pairs updated, destination bits allocated, source bits released and SHA-256 payload retained.
+- Native NTFS interrupted transaction: simulated crash after the MFT switch recovered forward with exact payload retention and restored clean `$Volume`/`$MFTMirr` records.
+- Real NTFS image: a file deliberately allocated high after a temporary 400 MiB filler was moved natively to a low run; `ntfscat` returned the identical SHA-256 payload and independent `ntfsresize --check` accepted the final filesystem.
+- The real-image creation and independent validation tests may use NTFS-3G developer utilities when they are available, but the installed Linux Defragger package does not call or depend on them.
+- Existing FAT, exFAT, Amiga and Apple regression suites remain present and unchanged.

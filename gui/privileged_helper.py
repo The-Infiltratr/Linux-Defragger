@@ -33,6 +33,7 @@ MAPPER = Path("/usr/lib/linux-defragger/allocation_mapper.py")
 EXFAT_ENGINE = Path("/usr/lib/linux-defragger/exfat_engine.py")
 AFFS_ENGINE = Path("/usr/lib/linux-defragger/affs_engine.py")
 APPLE_ENGINE = Path("/usr/lib/linux-defragger/apple_engine.py")
+NTFS_ENGINE = Path("/usr/lib/linux-defragger/ntfs_engine.py")
 UDISKSCTL = Path("/usr/bin/udisksctl")
 
 _emit_lock = threading.Lock()
@@ -81,6 +82,12 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
         if not argv or argv[0] not in {"defrag", "compact", "recover"}:
             raise RuntimeError("Apple filesystem engine command is not allowed")
         return [str(APPLE_ENGINE), *argv]
+    if program == "ntfs-engine":
+        if not NTFS_ENGINE.is_file() or not os.access(NTFS_ENGINE, os.X_OK):
+            raise RuntimeError(f"NTFS engine is unavailable: {NTFS_ENGINE}")
+        if not argv or argv[0] not in {"compact", "recover"}:
+            raise RuntimeError("NTFS engine command is not allowed")
+        return [str(NTFS_ENGINE), *argv]
     if program == "mapper":
         if not MAPPER.is_file() or not os.access(MAPPER, os.X_OK):
             raise RuntimeError(f"allocation mapper is unavailable: {MAPPER}")

@@ -1,32 +1,19 @@
 # Linux Defragger 1.8.0
 
-Linux Defragger is a modular GTK allocation-map viewer and offline defragmenter.
-
-## Write-capable backends
+Linux Defragger provides graphical allocation maps and filesystem-specific offline mutation engines.
 
 - FAT12, FAT16 and FAT32: analyse, map, compact, defragment and recover.
 - exFAT: analyse, map, compact, defragment and recover.
 - Amiga OFS/FFS variants: analyse, map, compact, defragment and recover.
 - Classic Apple HFS: analyse, map, compact, defragment and recover.
 - Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
+- NTFS: analyse, map, native offline compact and recover. File-by-file defragmentation is not yet implemented.
+- EXT2/3/4 and other listed modern filesystems: read-only allocation and fragmentation analysis where supported.
 
-NTFS, ext2/3/4, Btrfs, XFS, UFS, ZFS, APFS, swap and Minix remain analysis backends according to their advertised capabilities.
+## Native NTFS compact implementation
 
-## Apple filesystem implementation
+NTFS Compact is implemented inside Linux Defragger and has no NTFS-3G runtime dependency. The engine reads the NTFS boot sector, MFT, mapping pairs and `$Bitmap` directly. It conservatively relocates ordinary, unnamed, non-resident file data streams into lower contiguous free runs and updates the affected MFT record and allocation bitmap itself.
 
-Classic HFS uses the bundled GPLv2 libhfs source from hfsutils 3.2.6, statically linked into a private engine. It relocates complete data and resource forks, updates the volume bitmap, catalogue and extents-overflow B-tree, and uses an external recovery journal.
+Each file move is an external journalled transaction. The destination is copied first, the volume is marked dirty in `$Volume` and `$MFTMirr`, destination clusters are reserved, mapping pairs are switched, old clusters are released, and the original clean volume flags are restored. Recover inspects the actual on-disk MFT record and either completes the move forward or restores the original record and bitmap bytes.
 
-HFS+ and HFSX use a native Python engine. It relocates complete ordinary data and resource forks, updates allocation-file bits, inline and overflow extent descriptors, primary and alternate volume-header free counts, and uses an external recovery journal. The allocation, catalogue, extents-overflow and other special filesystem files remain fixed.
-
-Analyse and allocation-map operations may run against mounted volumes using read-only raw access. Because the filesystem remains active, the result is a live snapshot and may change while files are being created, removed or extended. All mutation commands refuse mounted volumes. The source allocation remains allocated until the catalogue metadata durably points to the destination.
-
-## Build
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-## Author
-
-Shannon Smith
+The first native implementation deliberately does not move NTFS system files, directories, compressed streams, sparse streams, encrypted streams, named streams, or streams split through `$ATTRIBUTE_LIST`. These remain valid but can limit how far the final allocation high-water mark falls.
