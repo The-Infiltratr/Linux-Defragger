@@ -253,7 +253,7 @@ def main() -> None:
         bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
         assert all(not (bitmap[c >> 3] & (1 << (c & 7)))
                    for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
-        assert "3 transactions and moved 16 clusters" in captured.getvalue()
+        assert "1 transactions and moved 16 clusters" in captured.getvalue()
 
         # An immovable high object must no longer prevent unrelated movable
         # data from filling lower gaps.  The boundary remains fixed by
