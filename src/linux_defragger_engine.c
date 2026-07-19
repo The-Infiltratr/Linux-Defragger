@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.5.6"
+#define PROGRAM_VERSION "1.6.0"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)

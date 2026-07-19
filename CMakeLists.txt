@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(linux_defragger VERSION 1.5.6 LANGUAGES C)
+project(linux_defragger VERSION 1.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -11,7 +11,7 @@ target_compile_options(linux-defragger-engine PRIVATE -Wall -Wextra -Wpedantic -
 target_compile_definitions(linux-defragger-engine PRIVATE _FILE_OFFSET_BITS=64 _GNU_SOURCE)
 
 install(TARGETS linux-defragger-engine RUNTIME DESTINATION bin)
-install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py gui/exfat_engine.py DESTINATION lib/linux-defragger)
+install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py gui/exfat_engine.py gui/affs_engine.py DESTINATION lib/linux-defragger)
 install(FILES
     gui/backends/__init__.py gui/backends/base.py gui/backends/registry.py
     gui/backends/fat_common.py gui/backends/fat12.py gui/backends/fat16.py
@@ -29,3 +29,5 @@ if(BUILD_TESTING)
     add_test(NAME linux-defragger-tests
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh $<TARGET_FILE:linux-defragger-engine>)
 endif()
+
+install(DIRECTORY vendor/amitools DESTINATION lib/linux-defragger/vendor)

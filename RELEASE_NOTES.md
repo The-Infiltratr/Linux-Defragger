@@ -1,15 +1,14 @@
-# Linux Defragger 1.5.6
+# Linux Defragger 1.6.0
 
-- exFAT analysis now reports regular files, directories, fragmented files and fragmented directories.
-- The exFAT pixel map now overlays fragmented clusters in red and directory clusters in purple.
-- The GUI summary and operation log now use the same fragmentation-count presentation as FAT12/16/32.
+## Amiga OFS/FFS support
 
-Author: Shannon Smith
+- Replaces the signature-only Amiga backend with exact bitmap and directory-tree analysis.
+- Reports file, directory, fragmented-file and fragmented-directory counts for DOS\0 through DOS\7.
+- Adds offline Compact, Defragment and Recover operations for ADF/HDF images and raw AFFS partitions.
+- Supports OFS, FFS, international, directory-cache and long-name variants.
+- Relocates file headers, extension blocks and data blocks into contiguous runs.
+- Relocates subdirectory headers and directory-cache chains while repairing child parent references.
+- Uses an external phase journal with rollback before the parent-link switch and forward recovery after it.
+- Bundles the GPL-2.0-or-later amitools filesystem library; no separate package is required.
 
-## Fixes
-
-- Corrects the exFAT summary card and status line.
-- The GUI now derives wording from backend capability flags rather than assuming every `read-only-domain` map is a read-only filesystem.
-- Writable exFAT volumes now display `Map · Compact / Defragment / Recover`.
-- NTFS and other analysis-only backends continue to display `Map only · read-only`.
-- No filesystem movement, journal or recovery algorithms changed.
+The Amiga root block and bitmap metadata remain fixed. Gzip-compressed images are read-only.

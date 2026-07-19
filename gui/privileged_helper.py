@@ -31,6 +31,7 @@ PROTOCOL_VERSION = 1
 ENGINE = Path("/usr/bin/linux-defragger-engine")
 MAPPER = Path("/usr/lib/linux-defragger/allocation_mapper.py")
 EXFAT_ENGINE = Path("/usr/lib/linux-defragger/exfat_engine.py")
+AFFS_ENGINE = Path("/usr/lib/linux-defragger/affs_engine.py")
 UDISKSCTL = Path("/usr/bin/udisksctl")
 
 _emit_lock = threading.Lock()
@@ -67,6 +68,12 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
         if not argv or argv[0] not in {"defrag", "compact", "recover"}:
             raise RuntimeError("exFAT engine command is not allowed")
         return [str(EXFAT_ENGINE), *argv]
+    if program == "affs-engine":
+        if not AFFS_ENGINE.is_file() or not os.access(AFFS_ENGINE, os.X_OK):
+            raise RuntimeError(f"Amiga filesystem engine is unavailable: {AFFS_ENGINE}")
+        if not argv or argv[0] not in {"defrag", "compact", "recover"}:
+            raise RuntimeError("Amiga filesystem engine command is not allowed")
+        return [str(AFFS_ENGINE), *argv]
     if program == "mapper":
         if not MAPPER.is_file() or not os.access(MAPPER, os.X_OK):
             raise RuntimeError(f"allocation mapper is unavailable: {MAPPER}")

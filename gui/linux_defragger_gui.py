@@ -43,7 +43,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.5.6"
+VERSION = "1.6.0"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -379,6 +379,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._load_backend_registry()
         self.privileged_helper = find_privileged_helper()
         self.exfat_engine = find_exfat_engine()
+        self.affs_engine = str(Path(__file__).resolve().parent / "affs_engine.py")
+        if not Path(self.affs_engine).is_file():
+            self.affs_engine = "/usr/lib/linux-defragger/affs_engine.py"
         self.volumes: list[Volume] = []
         self.current_volume: Volume | None = None
         self.map_data: dict[str, Any] | None = None
@@ -988,7 +991,8 @@ class MainWindow(Gtk.ApplicationWindow):
         ):
             return
 
-        operation_engine = self.exfat_engine if volume.normalized_fstype == "exfat" else self.engine
+        operation_engine = (self.exfat_engine if volume.normalized_fstype == "exfat" else
+                            self.affs_engine if volume.normalized_fstype == "affs" else self.engine)
         args = [operation_engine, operation, volume.path, "--write", "--confirm", volume.path, "--journal", journal]
         live_cells = len(self.map_data.get("cells", [])) if self.map_data else self._desired_map_cells()
         live_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(live_cells)))
@@ -1040,6 +1044,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return "mapper", args[1:]
         if executable == os.path.realpath(self.exfat_engine):
             return "exfat-engine", args[1:]
+        if executable == os.path.realpath(self.affs_engine):
+            return "affs-engine", args[1:]
         if os.path.basename(args[0]) == "udisksctl":
             return "udisksctl", args[1:]
         raise RuntimeError(f"The privileged helper does not permit: {args[0]}")
