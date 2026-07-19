@@ -53,9 +53,10 @@ def runlist(runs: list[tuple[int, int]]) -> bytes:
     return bytes(output)
 
 
-def nonresident(atype: int, runs: list[tuple[int, int]], data_size: int) -> bytes:
+def nonresident(atype: int, runs: list[tuple[int, int]], data_size: int,
+                mapping_slack: int = 0) -> bytes:
     mapping = runlist(runs)
-    length = (64 + len(mapping) + 7) & ~7
+    length = (64 + len(mapping) + mapping_slack + 7) & ~7
     attr = bytearray(length)
     struct.pack_into("<I", attr, 0, atype)
     struct.pack_into("<I", attr, 4, length)
@@ -106,7 +107,8 @@ def record(number: int, attrs: list[bytes]) -> bytes:
     return ntfs_engine._prepare_fixups(fixed, BPS)
 
 
-def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False) -> bytes:
+def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False,
+               split_destinations: bool = False) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -132,7 +134,10 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         records[1] = record(1, [nonresident(0x80, [(mirror_lcn, MIRROR_CLUSTERS)], 4 * RECORD_SIZE)])
     records[3] = record(3, [resident(0x70, bytes(volume_info))])
     records[6] = record(6, [nonresident(0x80, [(BITMAP_LCN, 1)], (TOTAL_CLUSTERS + 7) // 8)])
-    records[24] = record(24, [nonresident(0x80, [(DATA_LCN, DATA_CLUSTERS)], DATA_CLUSTERS * CLUSTER_SIZE)])
+    records[24] = record(24, [nonresident(
+        0x80, [(DATA_LCN, DATA_CLUSTERS)], DATA_CLUSTERS * CLUSTER_SIZE,
+        mapping_slack=0,
+    )])
     mft_offset = MFT_LCN * CLUSTER_SIZE
     for number, raw in enumerate(records):
         image[mft_offset + number * RECORD_SIZE:mft_offset + (number + 1) * RECORD_SIZE] = raw
@@ -144,6 +149,9 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
     used = set(range(MFT_LCN, MFT_LCN + MFT_CLUSTERS))
     used.add(BITMAP_LCN)
     used.update(range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
+    if split_destinations:
+        holes = set(range(200, 204)) | set(range(500, 505)) | set(range(1000, 1007))
+        used.update(cluster for cluster in range(DATA_LCN) if cluster not in holes)
     if high_mftmirr_blocker:
         used.update(range(mirror_lcn, mirror_lcn + MIRROR_CLUSTERS))
     for cluster in used:
@@ -170,19 +178,23 @@ def current_volume_flags(path: Path) -> int:
         ntfs_engine._close_volume(volume)
 
 
-def current_data_run(path: Path) -> tuple[int, int]:
+def current_data_runs(path: Path) -> tuple[ntfs_engine.Run, ...]:
     volume = ntfs_engine._open_volume(str(path), False)
     try:
         layout = ntfs_engine._read_layout(volume)
         _offset, _raw, fixed = ntfs_engine._read_mft_record(volume, layout.mft_runs, 24)
         attrs = [attr for attr in ntfs_engine._attributes(fixed)
                  if attr.atype == ntfs_engine.ATTR_DATA and attr.nonresident and not attr.name]
-        assert len(attrs) == 1 and len(attrs[0].runs) == 1
-        run = attrs[0].runs[0]
-        assert run.lcn is not None
-        return run.lcn, run.length
+        assert len(attrs) == 1
+        return attrs[0].runs
     finally:
         ntfs_engine._close_volume(volume)
+
+
+def current_data_run(path: Path) -> tuple[int, int]:
+    runs = current_data_runs(path)
+    assert len(runs) == 1 and runs[0].lcn is not None
+    return int(runs[0].lcn), runs[0].length
 
 
 def main() -> None:
@@ -205,6 +217,31 @@ def main() -> None:
         assert all(bitmap[c >> 3] & (1 << (c & 7)) for c in range(destination, destination + count))
         assert all(not (bitmap[c >> 3] & (1 << (c & 7))) for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
 
+        # No single lower hole is large enough for the file.  The high-water
+        # extent must be split across three lower extents while preserving the
+        # logical payload and freeing every original high cluster.
+        payload = make_image(image, split_destinations=True)
+        expected = hashlib.sha256(payload).hexdigest()
+        ntfs_engine._stop_requested = False
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            assert ntfs_engine.compact(str(image), journal) == 0
+        runs = current_data_runs(image)
+        assert len(runs) == 3
+        assert sum(run.length for run in runs) == DATA_CLUSTERS
+        assert all(run.lcn is not None and run.lcn < DATA_LCN for run in runs)
+        volume = ntfs_engine._open_volume(str(image), False)
+        try:
+            actual = ntfs_engine._read_stream(volume, runs, 0, len(payload))
+        finally:
+            ntfs_engine._close_volume(volume)
+        assert hashlib.sha256(actual).hexdigest() == expected
+        raw = image.read_bytes()
+        bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
+        assert all(not (bitmap[c >> 3] & (1 << (c & 7)))
+                   for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
+        assert "1 transactions and 16 clusters" in captured.getvalue()
+
         # An immovable object above an ordinary file must be diagnosed before
         # any unrelated lower file is moved.  This models the real-world case
         # where $MFTMirr fixes the high-water boundary near mid-volume.
@@ -219,7 +256,7 @@ def main() -> None:
             image.read_bytes()[DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE]
         ).hexdigest()
         report = captured.getvalue()
-        assert "moved 0 files" in report
+        assert "moved 0 file streams" in report
         assert "No effective NTFS volume compaction was achieved" in report
         assert "Compaction limited by $MFTMirr $DATA" in report
 
@@ -253,6 +290,90 @@ def main() -> None:
         destination, count = current_data_run(image)
         actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
         assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+        # Schema-3 recovery must also complete a partial move whose destination
+        # is represented by several physical extents.
+        payload = make_image(image, split_destinations=True)
+        volume = ntfs_engine._open_volume(str(image), True)
+        try:
+            layout = ntfs_engine._read_layout(volume)
+            candidate = ntfs_engine._candidate_records(layout)[0]
+            high = ntfs_engine._highest_used(layout.bitmap, TOTAL_CLUSTERS)
+            move, reason = ntfs_engine._plan_extent_move(layout, candidate, high)
+            assert move is not None, reason
+            assert len(move.destination_runs) == 3
+            new_record = ntfs_engine._updated_record_runs(candidate, move.new_runs, BPS)
+            old_clusters = [c for run in move.source_runs
+                            for c in range(int(run.lcn), int(run.lcn) + run.length)]
+            new_clusters = [c for run in move.destination_runs
+                            for c in range(int(run.lcn), int(run.lcn) + run.length)]
+            snapshots = ntfs_engine._bitmap_patches(layout, old_clusters + new_clusters)
+            ntfs_engine._copy_run_sequences(volume, move.source_runs, move.destination_runs)
+            volume_records = ntfs_engine._volume_record_state(layout)
+            state = ntfs_engine._journal_state(
+                layout, candidate, int(move.destination_runs[0].lcn), new_record,
+                snapshots, volume_records, "metadata-switched",
+                released_runs=move.source_runs, destination_runs=move.destination_runs,
+            )
+            ntfs_engine._write_journal(journal, state)
+            ntfs_engine._write_volume_records(layout, volume_records[1], volume_records[3])
+            for cluster in new_clusters:
+                ntfs_engine._set_bit(layout.bitmap, cluster, True)
+            ntfs_engine._write_bitmap_patches(
+                layout, ntfs_engine._current_bitmap_patches(layout, snapshots)
+            )
+            ntfs_engine._write_mft_record(volume, layout.mft_runs, candidate.record_number, new_record)
+            os.fsync(volume.fd)
+        finally:
+            ntfs_engine._close_volume(volume)
+        assert ntfs_engine.recover(str(image), journal) == 0
+        runs = current_data_runs(image)
+        volume = ntfs_engine._open_volume(str(image), False)
+        try:
+            actual = ntfs_engine._read_stream(volume, runs, 0, len(payload))
+        finally:
+            ntfs_engine._close_volume(volume)
+        assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+        # The same schema-3 multi-extent transaction must roll back when the
+        # destination was reserved but the MFT mapping had not switched yet.
+        payload = make_image(image, split_destinations=True)
+        volume = ntfs_engine._open_volume(str(image), True)
+        try:
+            layout = ntfs_engine._read_layout(volume)
+            candidate = ntfs_engine._candidate_records(layout)[0]
+            high = ntfs_engine._highest_used(layout.bitmap, TOTAL_CLUSTERS)
+            move, reason = ntfs_engine._plan_extent_move(layout, candidate, high)
+            assert move is not None, reason
+            new_record = ntfs_engine._updated_record_runs(candidate, move.new_runs, BPS)
+            old_clusters = [c for run in move.source_runs
+                            for c in range(int(run.lcn), int(run.lcn) + run.length)]
+            new_clusters = [c for run in move.destination_runs
+                            for c in range(int(run.lcn), int(run.lcn) + run.length)]
+            snapshots = ntfs_engine._bitmap_patches(layout, old_clusters + new_clusters)
+            ntfs_engine._copy_run_sequences(volume, move.source_runs, move.destination_runs)
+            volume_records = ntfs_engine._volume_record_state(layout)
+            state = ntfs_engine._journal_state(
+                layout, candidate, int(move.destination_runs[0].lcn), new_record,
+                snapshots, volume_records, "destination-allocated",
+                released_runs=move.source_runs, destination_runs=move.destination_runs,
+            )
+            ntfs_engine._write_journal(journal, state)
+            ntfs_engine._write_volume_records(layout, volume_records[1], volume_records[3])
+            for cluster in new_clusters:
+                ntfs_engine._set_bit(layout.bitmap, cluster, True)
+            ntfs_engine._write_bitmap_patches(
+                layout, ntfs_engine._current_bitmap_patches(layout, snapshots)
+            )
+            os.fsync(volume.fd)
+        finally:
+            ntfs_engine._close_volume(volume)
+        assert ntfs_engine.recover(str(image), journal) == 0
+        assert current_data_run(image) == (DATA_LCN, DATA_CLUSTERS)
+        original = image.read_bytes()[
+            DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE
+        ]
+        assert hashlib.sha256(original).hexdigest() == hashlib.sha256(payload).hexdigest()
 
         # A real-world NTFS volume may carry the undocumented 0x0080 bit.  It
         # is not the dirty bit and must survive our temporary dirty-state

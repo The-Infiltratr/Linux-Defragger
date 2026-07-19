@@ -3,4 +3,6 @@
 # Author: Shannon Smith
 # Purpose: Build, install or test support script.
 
+export PYTHONDONTWRITEBYTECODE=1
+
 exec /usr/bin/python3 /usr/lib/linux-defragger/linux_defragger_gui.py "$@"

@@ -81,6 +81,7 @@ def main() -> None:
             before = {item.record_number: item for item in ntfs_engine._candidate_records(layout)}
             payload_candidate = max(before.values(), key=lambda item: item.clusters)
             before_lcn = payload_candidate.lowest_lcn
+            before_high = payload_candidate.highest_lcn
         finally:
             ntfs_engine._close_volume(volume)
 
@@ -93,7 +94,8 @@ def main() -> None:
             layout = ntfs_engine._read_layout(volume)
             after = {item.record_number: item for item in ntfs_engine._candidate_records(layout)}
             moved = after[payload_candidate.record_number]
-            assert moved.lowest_lcn < before_lcn
+            assert moved.highest_lcn < before_high
+            assert moved.lowest_lcn <= before_lcn
         finally:
             ntfs_engine._close_volume(volume)
 

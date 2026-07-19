@@ -6,10 +6,11 @@
 """Conservative native NTFS compaction.
 
 The engine relocates ordinary, uncompressed, non-sparse, non-encrypted unnamed
-file data streams from high clusters into lower free contiguous runs.  It edits
-only the stream's mapping pairs, the volume $Bitmap and the affected MFT record.
-System files, directories, attribute-list streams and layouts that do not fit
-back into their existing MFT attribute are deliberately left untouched.
+file data streams from high clusters into lower free extents.  It can relocate
+only the high-water extent or a suffix of that extent, and may use several lower
+free extents when no single destination is large enough.  It edits only the
+stream's mapping pairs, the volume $Bitmap and the affected MFT record.  System
+files, directories and attribute-list streams are deliberately left untouched.
 
 Each stream move is a separate externally journalled transaction.  Destination
 clusters are copied first, then reserved in $Bitmap, then the MFT mapping pairs
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-SCHEMA = 2
+SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
 COPY_CHUNK = 8 * 1024 * 1024
@@ -198,6 +199,17 @@ class AllocationPlan:
     hibernation_active: bool
 
 
+@dataclass(frozen=True)
+class ExtentMove:
+    source_runs: tuple[Run, ...]
+    destination_runs: tuple[Run, ...]
+    new_runs: tuple[Run, ...]
+
+    @property
+    def clusters(self) -> int:
+        return sum(run.length for run in self.source_runs)
+
+
 SYSTEM_RECORD_NAMES = {
     0: "$MFT", 1: "$MFTMirr", 2: "$LogFile", 3: "$Volume",
     4: "$AttrDef", 5: "$Root", 6: "$Bitmap", 7: "$Boot",
@@ -342,9 +354,14 @@ def _unsigned_min_bytes(value: int) -> bytes:
     if value <= 0:
         raise NtfsCompactError("NTFS run length must be positive")
     size = max(1, (value.bit_length() + 7) // 8)
-    if size > 8:
-        raise NtfsCompactError("NTFS run length exceeds 64-bit encoding")
-    return value.to_bytes(size, "little")
+    encoded = value.to_bytes(size, "little")
+    # NTFS run lengths are decoded as signed integers by Windows and NTFS-3G.
+    # Preserve a positive sign when the most significant encoded bit is set.
+    if encoded[-1] & 0x80:
+        encoded += b"\0"
+    if len(encoded) > 8:
+        raise NtfsCompactError("NTFS run length exceeds signed 64-bit encoding")
+    return encoded
 
 
 def _decode_runlist(data: bytes) -> tuple[Run, ...]:
@@ -360,10 +377,13 @@ def _decode_runlist(data: bytes) -> tuple[Run, ...]:
         offset_size = header >> 4
         if not length_size or length_size > 8 or offset_size > 8 or pos + length_size + offset_size > len(data):
             raise NtfsCompactError("invalid NTFS mapping-pairs array")
-        length = int.from_bytes(data[pos:pos + length_size], "little")
+        # Windows NT and NTFS-3G interpret run lengths as signed values.
+        # A positive length whose top bit is set therefore requires a leading
+        # zero byte in the mapping-pairs array.
+        length = int.from_bytes(data[pos:pos + length_size], "little", signed=True)
         pos += length_size
         if length <= 0:
-            raise NtfsCompactError("invalid zero-length NTFS run")
+            raise NtfsCompactError("invalid non-positive NTFS run length")
         if offset_size == 0:
             lcn = None
         else:
@@ -763,22 +783,67 @@ def _highest_used(bitmap: bytes | bytearray, total_clusters: int) -> int:
     return 0
 
 
+def _free_runs_before(bitmap: bytes | bytearray, before: int) -> list[Run]:
+    """Return physical free extents below *before* without one Python loop per bit.
+
+    Large NTFS volumes can contain hundreds of millions of clusters.  Whole-byte
+    fast paths keep high-water planning practical while mixed bytes are still
+    decoded bit by bit.
+    """
+    limit = max(0, min(before, len(bitmap) * 8))
+    result: list[Run] = []
+    start: int | None = None
+    cluster = 0
+    while cluster < limit:
+        if cluster % 8 == 0 and cluster + 8 <= limit:
+            value = bitmap[cluster >> 3]
+            if value == 0x00:
+                if start is None:
+                    start = cluster
+                cluster += 8
+                continue
+            if value == 0xFF:
+                if start is not None:
+                    result.append(Run(start, cluster - start))
+                    start = None
+                cluster += 8
+                continue
+        if _bit(bitmap, cluster):
+            if start is not None:
+                result.append(Run(start, cluster - start))
+                start = None
+        elif start is None:
+            start = cluster
+        cluster += 1
+    if start is not None:
+        result.append(Run(start, limit - start))
+    return result
+
+
 def _find_free_run(bitmap: bytes | bytearray, length: int, before: int) -> int | None:
     if length <= 0:
         return None
-    run_start = -1
-    run_length = 0
-    for cluster in range(max(0, min(before, len(bitmap) * 8))):
-        if not _bit(bitmap, cluster):
-            if run_length == 0:
-                run_start = cluster
-            run_length += 1
-            if run_length >= length:
-                return run_start
-        else:
-            run_start = -1
-            run_length = 0
+    for run in _free_runs_before(bitmap, before):
+        if run.length >= length:
+            return int(run.lcn)
     return None
+
+
+def _coalesce_runs(runs: Iterable[Run]) -> tuple[Run, ...]:
+    merged: list[Run] = []
+    for run in runs:
+        if run.length <= 0:
+            continue
+        if (merged and merged[-1].lcn is not None and run.lcn is not None and
+                merged[-1].lcn + merged[-1].length == run.lcn):
+            previous = merged[-1]
+            merged[-1] = Run(previous.lcn, previous.length + run.length)
+        elif merged and merged[-1].lcn is None and run.lcn is None:
+            previous = merged[-1]
+            merged[-1] = Run(None, previous.length + run.length)
+        else:
+            merged.append(run)
+    return tuple(merged)
 
 
 def _decode_attribute_name(name: bytes) -> str:
@@ -1029,8 +1094,15 @@ def _load_candidate(layout: NtfsLayout, info: StreamInfo) -> Candidate:
     return Candidate(info.record_number, record_offset, raw, bytes(fixed), attr)
 
 
-def _update_moved_stream(plan: AllocationPlan, info: StreamInfo, destination: int,
-                         clusters: int) -> StreamInfo:
+def _update_moved_stream(plan: AllocationPlan, info: StreamInfo,
+                         destination: int | Iterable[Run],
+                         clusters: int | None = None) -> StreamInfo:
+    if isinstance(destination, int):
+        if clusters is None:
+            raise NtfsCompactError("cluster count is required for a contiguous stream update")
+        runs = (Run(destination, clusters),)
+    else:
+        runs = _coalesce_runs(destination)
     updated = StreamInfo(
         record_number=info.record_number,
         base_record_number=info.base_record_number,
@@ -1039,7 +1111,7 @@ def _update_moved_stream(plan: AllocationPlan, info: StreamInfo, destination: in
         attribute_name=info.attribute_name,
         file_name=info.file_name,
         flags=info.flags,
-        runs=(Run(destination, clusters),),
+        runs=runs,
         movable=True,
         blocker_reason="",
         generation=info.generation + 1,
@@ -1048,6 +1120,91 @@ def _update_moved_stream(plan: AllocationPlan, info: StreamInfo, destination: in
     heapq.heappush(plan.heap, (-updated.highest_lcn, updated.record_number,
                                updated.attribute_offset, updated.generation))
     return updated
+
+
+def _high_water_run_index(runs: tuple[Run, ...], high_water: int) -> int | None:
+    matches = [index for index, run in enumerate(runs)
+               if run.lcn is not None and run.lcn + run.length == high_water]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _destination_slice(runs: list[Run], clusters: int) -> tuple[Run, ...]:
+    remaining = clusters
+    selected: list[Run] = []
+    for run in sorted(runs, key=lambda item: int(item.lcn)):
+        if remaining <= 0:
+            break
+        take = min(run.length, remaining)
+        selected.append(Run(run.lcn, take))
+        remaining -= take
+    if remaining:
+        raise NtfsCompactError("free-extent selection is shorter than requested")
+    return tuple(selected)
+
+
+def _plan_extent_move(layout: NtfsLayout, candidate: Candidate,
+                      high_water: int) -> tuple[ExtentMove | None, str]:
+    """Plan relocation of the physical extent that owns the volume boundary.
+
+    The old writer required a single free run large enough for the complete file.
+    This planner instead moves the high-water physical run, or a suffix of it,
+    and can map that logical suffix across several lower free extents.  The plan
+    is accepted only when the regenerated mapping pairs fit the existing NTFS
+    attribute record.
+    """
+    runs = tuple(candidate.attribute.runs)
+    source_index = _high_water_run_index(runs, high_water)
+    if source_index is None:
+        return None, "the high-water extent could not be identified uniquely in the file runlist"
+    source = runs[source_index]
+    if source.lcn is None:
+        return None, "the high-water extent is sparse"
+    free_runs = _free_runs_before(layout.bitmap, int(source.lcn))
+    if not free_runs:
+        return None, "no lower free extent is available"
+
+    # Largest holes first maximises boundary reduction per extra mapping-pair
+    # entry.  The selected destinations are then placed in ascending LCN order
+    # so their deltas are stable and usually encode compactly.
+    ranked = sorted(free_runs, key=lambda item: (-item.length, int(item.lcn)))
+    max_entries = min(len(ranked), 128)
+    best: ExtentMove | None = None
+    best_encoded = 1 << 30
+    capacity = _maximum_mapping_capacity(candidate)
+    for count in range(1, max_entries + 1):
+        chosen = ranked[:count]
+        movable = min(source.length, sum(run.length for run in chosen))
+        if movable <= 0:
+            continue
+        destinations = _destination_slice(chosen, movable)
+        prefix = source.length - movable
+        replacement: list[Run] = list(runs[:source_index])
+        if prefix:
+            replacement.append(Run(source.lcn, prefix))
+        replacement.extend(destinations)
+        replacement.extend(runs[source_index + 1:])
+        new_runs = _coalesce_runs(replacement)
+        encoded_length = len(_encode_runlist(new_runs))
+        if encoded_length > capacity:
+            continue
+        moved_source = (Run(source.lcn + prefix, movable),)
+        plan = ExtentMove(moved_source, destinations, new_runs)
+        if (best is None or plan.clusters > best.clusters or
+                (plan.clusters == best.clusters and encoded_length < best_encoded)):
+            best = plan
+            best_encoded = encoded_length
+        if movable == source.length:
+            # More destination entries cannot improve boundary reduction once
+            # the complete high-water extent has a valid mapping.
+            break
+    if best is None:
+        return None, (
+            "lower free space exists, but a safe partial mapping does not fit "
+            "the available space in the existing MFT record"
+        )
+    return best, ""
 
 
 def _attribute_display(info: StreamInfo) -> str:
@@ -1103,43 +1260,100 @@ def _candidate_records(layout: NtfsLayout) -> list[Candidate]:
     return candidates
 
 
-def _updated_record(candidate: Candidate, destination: int, sector_size: int) -> bytes:
+def _maximum_mapping_capacity(candidate: Candidate) -> int:
+    attr = candidate.attribute
+    in_use = _u32(candidate.record_fixed, 24)
+    allocated = min(len(candidate.record_fixed), _u32(candidate.record_fixed, 28))
+    if in_use > allocated or attr.offset + attr.length > in_use:
+        raise NtfsCompactError("invalid MFT record free-space accounting")
+    expandable = max(0, allocated - in_use) // 8 * 8
+    return attr.length - attr.run_offset + expandable
+
+
+def _updated_record_runs(candidate: Candidate, new_runs: Iterable[Run], sector_size: int) -> bytes:
     fixed = bytearray(candidate.record_fixed)
     attr = candidate.attribute
-    new_runs = (Run(destination, candidate.clusters),)
-    encoded = _encode_runlist(new_runs)
-    capacity = attr.length - attr.run_offset
-    if len(encoded) > capacity:
-        raise NtfsCompactError("replacement NTFS mapping pairs do not fit the existing attribute")
+    normalized = _coalesce_runs(new_runs)
+    expected = attr.highest_vcn - attr.lowest_vcn + 1
+    if sum(run.length for run in normalized) != expected:
+        raise NtfsCompactError("replacement NTFS runlist changes the attribute VCN length")
+    encoded = _encode_runlist(normalized)
+    required_length = (attr.run_offset + len(encoded) + 7) & ~7
+    growth = max(0, required_length - attr.length)
+    in_use = _u32(fixed, 24)
+    allocated = min(len(fixed), _u32(fixed, 28))
+    if in_use > allocated or attr.offset + attr.length > in_use:
+        raise NtfsCompactError("invalid MFT record free-space accounting")
+    if in_use + growth > allocated:
+        raise NtfsCompactError(
+            "replacement NTFS mapping pairs do not fit the existing MFT record"
+        )
+    if growth:
+        old_end = attr.offset + attr.length
+        # Shift every following attribute and the end marker as one opaque,
+        # aligned region.  Attribute offsets are relative to their own records,
+        # so no other metadata pointers require adjustment.
+        fixed[old_end + growth:in_use + growth] = fixed[old_end:in_use]
+        fixed[old_end:old_end + growth] = b"\0" * growth
+        struct.pack_into("<I", fixed, attr.offset + 4, attr.length + growth)
+        struct.pack_into("<I", fixed, 24, in_use + growth)
+    capacity = attr.length + growth - attr.run_offset
     start = attr.offset + attr.run_offset
     fixed[start:start + capacity] = encoded + b"\0" * (capacity - len(encoded))
     return _prepare_fixups(fixed, sector_size)
 
 
-def _copy_runs(volume: Volume, runs: Iterable[Run], destination_lcn: int, clusters: int) -> None:
-    destination = destination_lcn * volume.cluster_size
-    remaining = clusters * volume.cluster_size
-    written = 0
-    for run in runs:
-        if run.lcn is None:
-            raise NtfsCompactError("sparse source stream cannot be compacted")
-        source = run.lcn * volume.cluster_size
-        run_bytes = run.length * volume.cluster_size
-        consumed = 0
-        while consumed < run_bytes:
-            if _stop_requested:
-                # A stop before metadata reservation is harmless.  Finish the
-                # current copy chunk so no partial write call is interrupted.
-                pass
-            take = min(COPY_CHUNK, run_bytes - consumed)
-            data = _pread_exact(volume.fd, take, source + consumed)
-            _pwrite_exact(volume.fd, data, destination + written)
-            consumed += take
-            written += take
-            remaining -= take
-    if remaining != 0:
-        raise NtfsCompactError("source runlist length changed during copy")
+def _updated_record(candidate: Candidate, destination: int, sector_size: int) -> bytes:
+    """Compatibility wrapper for a whole-stream contiguous relocation."""
+    return _updated_record_runs(candidate, (Run(destination, candidate.clusters),), sector_size)
+
+
+def _copy_run_sequences(volume: Volume, source_runs: Iterable[Run],
+                        destination_runs: Iterable[Run]) -> None:
+    sources = [run for run in source_runs if run.length]
+    destinations = [run for run in destination_runs if run.length]
+    if any(run.lcn is None for run in sources):
+        raise NtfsCompactError("sparse source stream cannot be compacted")
+    if any(run.lcn is None for run in destinations):
+        raise NtfsCompactError("sparse destination stream is invalid")
+    source_clusters = sum(run.length for run in sources)
+    destination_clusters = sum(run.length for run in destinations)
+    if source_clusters != destination_clusters:
+        raise NtfsCompactError("source and destination extent lengths differ")
+
+    source_index = destination_index = 0
+    source_offset = destination_offset = 0
+    remaining = source_clusters * volume.cluster_size
+    while remaining:
+        source = sources[source_index]
+        destination = destinations[destination_index]
+        source_left = source.length * volume.cluster_size - source_offset
+        destination_left = destination.length * volume.cluster_size - destination_offset
+        take = min(COPY_CHUNK, source_left, destination_left, remaining)
+        data = _pread_exact(
+            volume.fd, take, int(source.lcn) * volume.cluster_size + source_offset
+        )
+        _pwrite_exact(
+            volume.fd, data, int(destination.lcn) * volume.cluster_size + destination_offset
+        )
+        source_offset += take
+        destination_offset += take
+        remaining -= take
+        if source_offset == source.length * volume.cluster_size:
+            source_index += 1
+            source_offset = 0
+        if destination_offset == destination.length * volume.cluster_size:
+            destination_index += 1
+            destination_offset = 0
     os.fsync(volume.fd)
+
+
+def _copy_runs(volume: Volume, runs: Iterable[Run], destination_lcn: int, clusters: int) -> None:
+    """Compatibility wrapper for existing whole-stream tests."""
+    source_runs = tuple(runs)
+    if sum(run.length for run in source_runs) != clusters:
+        raise NtfsCompactError("source runlist length changed during copy")
+    _copy_run_sequences(volume, source_runs, (Run(destination_lcn, clusters),))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1175,8 +1389,8 @@ def _read_journal(path: Path) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise NtfsCompactError(f"cannot read NTFS recovery journal: {exc}") from exc
-    if state.get("schema") != SCHEMA or state.get("kind") != JOURNAL_KIND:
-        raise NtfsCompactError("recovery journal is not a native NTFS move journal")
+    if state.get("schema") not in (2, SCHEMA) or state.get("kind") != JOURNAL_KIND:
+        raise NtfsCompactError("recovery journal is not a supported native NTFS move journal")
     return state
 
 
@@ -1190,7 +1404,15 @@ def _remove_journal(path: Path) -> None:
 
 def _journal_state(layout: NtfsLayout, candidate: Candidate, destination: int,
                    new_record: bytes, bitmap_before: list[tuple[int, bytes]],
-                   volume_records: tuple[bytes, bytes, bytes, bytes], stage: str) -> dict:
+                   volume_records: tuple[bytes, bytes, bytes, bytes], stage: str,
+                   *, released_runs: Iterable[Run] | None = None,
+                   destination_runs: Iterable[Run] | None = None) -> dict:
+    released = tuple(released_runs) if released_runs is not None else tuple(candidate.attribute.runs)
+    destinations = (tuple(destination_runs) if destination_runs is not None
+                    else (Run(destination, candidate.clusters),))
+    clusters = sum(run.length for run in released)
+    if clusters != sum(run.length for run in destinations):
+        raise NtfsCompactError("journal source and destination lengths differ")
     return {
         "schema": SCHEMA,
         "kind": JOURNAL_KIND,
@@ -1201,9 +1423,13 @@ def _journal_state(layout: NtfsLayout, candidate: Candidate, destination: int,
         "record_number": candidate.record_number,
         "record_raw_before": base64.b64encode(candidate.record_raw).decode("ascii"),
         "record_raw_after": base64.b64encode(new_record).decode("ascii"),
+        # source_runs and destination are retained for diagnostics and backward
+        # readability; schema 3 recovery uses the exact changed extents below.
         "source_runs": [[run.lcn, run.length] for run in candidate.attribute.runs],
-        "destination": destination,
-        "clusters": candidate.clusters,
+        "released_runs": [[run.lcn, run.length] for run in released],
+        "destination_runs": [[run.lcn, run.length] for run in destinations],
+        "destination": int(destinations[0].lcn),
+        "clusters": clusters,
         "bitmap_before": [[offset, base64.b64encode(data).decode("ascii")]
                           for offset, data in bitmap_before],
         "volume_record_before": base64.b64encode(volume_records[0]).decode("ascii"),
@@ -1223,14 +1449,26 @@ def _validate_identity(layout: NtfsLayout, state: dict) -> None:
 
 
 def _affected_clusters(state: dict) -> tuple[list[int], list[int]]:
+    released_description = state.get("released_runs", state.get("source_runs", []))
     old: list[int] = []
-    for lcn, length in state["source_runs"]:
+    for lcn, length in released_description:
         if lcn is None:
             raise NtfsCompactError("journal contains an unsupported sparse source run")
         old.extend(range(int(lcn), int(lcn) + int(length)))
-    dest = int(state["destination"])
-    count = int(state["clusters"])
-    return old, list(range(dest, dest + count))
+    destinations = state.get("destination_runs")
+    new: list[int] = []
+    if destinations is None:
+        dest = int(state["destination"])
+        count = int(state["clusters"])
+        new.extend(range(dest, dest + count))
+    else:
+        for lcn, length in destinations:
+            if lcn is None:
+                raise NtfsCompactError("journal contains an invalid sparse destination run")
+            new.extend(range(int(lcn), int(lcn) + int(length)))
+    if len(old) != len(new):
+        raise NtfsCompactError("recovery journal extent lengths disagree")
+    return old, new
 
 
 def _recover_loaded(layout: NtfsLayout, state: dict, journal_path: Path) -> int:
@@ -1294,24 +1532,31 @@ def _detail(diagnostic: TextIO | None, message: str) -> None:
         diagnostic.flush()
 
 
-def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
-              journal_path: Path, diagnostic: TextIO | None = None) -> None:
+def _move_extent(layout: NtfsLayout, candidate: Candidate, move: ExtentMove,
+                 journal_path: Path, diagnostic: TextIO | None = None) -> None:
     volume = layout.volume
-    new_record = _updated_record(candidate, destination, volume.bytes_per_sector)
-    old_clusters = [cluster for run in candidate.attribute.runs
+    new_record = _updated_record_runs(candidate, move.new_runs, volume.bytes_per_sector)
+    old_clusters = [cluster for run in move.source_runs
                     for cluster in range(int(run.lcn), int(run.lcn) + run.length)]
-    new_clusters = list(range(destination, destination + candidate.clusters))
+    new_clusters = [cluster for run in move.destination_runs
+                    for cluster in range(int(run.lcn), int(run.lcn) + run.length)]
     bitmap_before = _bitmap_patches(layout, old_clusters + new_clusters)
     volume_records = _volume_record_state(layout)
 
+    destination_text = ", ".join(
+        f"{int(run.lcn)}+{run.length}" for run in move.destination_runs
+    )
     _detail(
         diagnostic,
-        f"MFT record {candidate.record_number}: {candidate.clusters} clusters "
-        f"from high LCN {candidate.highest_lcn - 1} to LCN {destination}",
+        f"MFT record {candidate.record_number}: moved {move.clusters} high-water clusters "
+        f"from {int(move.source_runs[0].lcn)} to extents [{destination_text}]",
     )
-    _copy_runs(volume, candidate.attribute.runs, destination, candidate.clusters)
-    state = _journal_state(layout, candidate, destination, new_record,
-                           bitmap_before, volume_records, "copied")
+    _copy_run_sequences(volume, move.source_runs, move.destination_runs)
+    state = _journal_state(
+        layout, candidate, int(move.destination_runs[0].lcn), new_record,
+        bitmap_before, volume_records, "copied",
+        released_runs=move.source_runs, destination_runs=move.destination_runs,
+    )
     _write_journal(journal_path, state)
 
     _write_volume_records(layout, volume_records[1], volume_records[3])
@@ -1343,6 +1588,17 @@ def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
     state["stage"] = "volume-clean"
     _write_journal(journal_path, state)
     _remove_journal(journal_path)
+
+
+def _move_one(layout: NtfsLayout, candidate: Candidate, destination: int,
+              journal_path: Path, diagnostic: TextIO | None = None) -> None:
+    """Compatibility wrapper for a whole-stream contiguous transaction."""
+    move = ExtentMove(
+        source_runs=tuple(candidate.attribute.runs),
+        destination_runs=(Run(destination, candidate.clusters),),
+        new_runs=(Run(destination, candidate.clusters),),
+    )
+    _move_extent(layout, candidate, move, journal_path, diagnostic)
 
 
 def _blocker_message(high_water: int, metadata_high: int,
@@ -1418,7 +1674,8 @@ def compact(device: str, journal_path: Path,
         )
         print("0.00 percent completed", flush=True)
 
-        moved_files = 0
+        moved_streams: set[tuple[int, int]] = set()
+        moved_transactions = 0
         moved_clusters = 0
         blocker = ""
         last_report_files = 0
@@ -1447,26 +1704,18 @@ def compact(device: str, journal_path: Path,
                     "no further streams were moved"
                 )
                 break
-            destination = _find_free_run(layout.bitmap, candidate.clusters, candidate.lowest_lcn)
-            if destination is None or destination + candidate.clusters >= candidate.highest_lcn:
+            move, reason = _plan_extent_move(layout, candidate, current_high)
+            if move is None:
                 blocker = (
-                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; "
-                    f"no lower contiguous free run of {candidate.clusters:,} clusters is available"
-                )
-                break
-            try:
-                _updated_record(candidate, destination, volume.bytes_per_sector)
-            except NtfsCompactError:
-                blocker = (
-                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; "
-                    "replacement mapping pairs do not fit its existing MFT attribute"
+                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; {reason}"
                 )
                 break
 
-            _move_one(layout, candidate, destination, journal_path, diagnostic)
-            moved_files += 1
-            moved_clusters += candidate.clusters
-            _update_moved_stream(plan, owner, destination, candidate.clusters)
+            _move_extent(layout, candidate, move, journal_path, diagnostic)
+            moved_streams.add(owner.key)
+            moved_transactions += 1
+            moved_clusters += move.clusters
+            _update_moved_stream(plan, owner, move.new_runs)
             new_high = _highest_used(layout.bitmap, volume.total_clusters)
             if new_high >= current_high:
                 blocker = (
@@ -1478,22 +1727,25 @@ def compact(device: str, journal_path: Path,
             print(f"{progress:.2f} percent completed", flush=True)
 
             now = time.monotonic()
-            if (moved_files - last_report_files >= REPORT_EVERY_FILES or
+            if (moved_transactions - last_report_files >= REPORT_EVERY_FILES or
                     moved_clusters - last_report_clusters >= REPORT_EVERY_CLUSTERS or
                     now - last_report_time >= REPORT_EVERY_SECONDS):
                 print(
-                    f"Moved {moved_files:,} high-water files ({_human_bytes(moved_clusters * volume.cluster_size)}); "
+                    f"Moved {len(moved_streams):,} high-water file streams in "
+                    f"{moved_transactions:,} transactions "
+                    f"({_human_bytes(moved_clusters * volume.cluster_size)}); "
                     f"current high-water cluster {new_high - 1:,}.",
                     flush=True,
                 )
-                last_report_files = moved_files
+                last_report_files = moved_transactions
                 last_report_clusters = moved_clusters
                 last_report_time = now
 
         after_high = _highest_used(layout.bitmap, volume.total_clusters)
         reduced = max(0, before_high - after_high)
         print(
-            f"Native NTFS compact moved {moved_files:,} files and {moved_clusters:,} clusters "
+            f"Native NTFS compact moved {len(moved_streams):,} file streams in "
+            f"{moved_transactions:,} transactions and {moved_clusters:,} clusters "
             f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
             flush=True,
         )
@@ -1519,7 +1771,8 @@ def compact(device: str, journal_path: Path,
             print("The allocation boundary reached the theoretical packed limit.", flush=True)
         print(
             "Only the stream that currently owns the physical high-water cluster is considered; "
-            "unrelated lower files are not moved.",
+            "its high extent may be split across several lower free extents, while unrelated lower "
+            "files are not moved.",
             flush=True,
         )
         if _stop_requested:
