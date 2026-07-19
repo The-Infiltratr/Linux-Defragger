@@ -43,7 +43,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -777,24 +777,35 @@ class MainWindow(Gtk.ApplicationWindow):
             self.free_card.set_value(
                 f"{human_bytes(free_bytes)} ({free_bytes * 100.0 / max(1, total_bytes):.1f}%)"
             )
-            self.files_card.set_value(f"{human_bytes(used_bytes)} allocated")
-
-            # A read-only-domain map describes the mapper output format, not
-            # necessarily the backend's mutation capabilities.  Derive the
-            # summary from the selected backend so writable exFAT volumes are
-            # not incorrectly labelled read-only.
-            capabilities = self.current_volume.capabilities if self.current_volume else 0
-            operations: list[str] = []
-            if capabilities & CAP_COMPACT:
-                operations.append("Compact")
-            if capabilities & CAP_DEFRAG:
-                operations.append("Defragment")
-            if capabilities & CAP_RECOVER:
-                operations.append("Recover")
-            if operations:
-                self.fragmented_card.set_value("Map · " + " / ".join(operations))
+            has_fragmentation_summary = all(
+                key in data
+                for key in ("regular_files", "directories", "fragmented_files", "fragmented_directories")
+            )
+            if has_fragmentation_summary:
+                self.files_card.set_value(
+                    f"{int(data['regular_files']):,} files · {int(data['directories']):,} dirs"
+                )
+                self.fragmented_card.set_value(
+                    f"{int(data['fragmented_files']):,} files · "
+                    f"{int(data['fragmented_directories']):,} dirs"
+                )
             else:
-                self.fragmented_card.set_value("Map only · read-only")
+                self.files_card.set_value(f"{human_bytes(used_bytes)} allocated")
+
+                # Analysis-only filesystems do not expose file-level
+                # fragmentation counts, so state their available operations.
+                capabilities = self.current_volume.capabilities if self.current_volume else 0
+                operations: list[str] = []
+                if capabilities & CAP_COMPACT:
+                    operations.append("Compact")
+                if capabilities & CAP_DEFRAG:
+                    operations.append("Defragment")
+                if capabilities & CAP_RECOVER:
+                    operations.append("Recover")
+                if operations:
+                    self.fragmented_card.set_value("Map · " + " / ".join(operations))
+                else:
+                    self.fragmented_card.set_value("Map only · read-only")
 
             unit_size = int(data.get("unit_size", 512))
             if unit_size == 512:
@@ -809,17 +820,31 @@ class MainWindow(Gtk.ApplicationWindow):
                 f"Pixel map: {cell_count:,} cells · approximately {per_cell:,.1f} {unit_name} per cell"
             )
             unknown = f" · {human_bytes(unknown_bytes)} unknown" if unknown_bytes else ""
-            if operations:
-                operation_text = ", ".join(operations)
+            if has_fragmentation_summary:
                 self.status_label.set_text(
-                    f"{filesystem} allocation map · available: {operation_text} · "
-                    f"{human_bytes(used_bytes)} allocated{unknown}"
+                    f"{filesystem} · {int(data['fragmented_files'])} fragmented files · "
+                    f"{int(data['fragmented_directories'])} fragmented directories"
                 )
             else:
-                self.status_label.set_text(
-                    f"{filesystem} read-only allocation map · "
-                    f"{human_bytes(used_bytes)} allocated{unknown}"
-                )
+                capabilities = self.current_volume.capabilities if self.current_volume else 0
+                operations = []
+                if capabilities & CAP_COMPACT:
+                    operations.append("Compact")
+                if capabilities & CAP_DEFRAG:
+                    operations.append("Defragment")
+                if capabilities & CAP_RECOVER:
+                    operations.append("Recover")
+                if operations:
+                    operation_text = ", ".join(operations)
+                    self.status_label.set_text(
+                        f"{filesystem} allocation map · available: {operation_text} · "
+                        f"{human_bytes(used_bytes)} allocated{unknown}"
+                    )
+                else:
+                    self.status_label.set_text(
+                        f"{filesystem} read-only allocation map · "
+                        f"{human_bytes(used_bytes)} allocated{unknown}"
+                    )
             return
 
         cluster_size = int(data["cluster_size"])
@@ -898,15 +923,24 @@ class MainWindow(Gtk.ApplicationWindow):
                         f"{data['fragmented_directories']} fragmented directories."
                     )
                 else:
-                    write_ops = []
-                    if volume.capabilities & CAP_COMPACT: write_ops.append("Compact")
-                    if volume.capabilities & CAP_DEFRAG: write_ops.append("Defragment")
-                    if volume.capabilities & CAP_RECOVER: write_ops.append("Recover")
-                    suffix = (" Available: " + ", ".join(write_ops) + ".") if write_ops else " Read-only analysis backend."
-                    self.append_log(
-                        f"Analysis complete: {human_bytes(int(data['used_bytes']))} allocated, "
-                        f"{human_bytes(int(data['free_bytes']))} free." + suffix
-                    )
+                    if all(
+                        key in data
+                        for key in ("regular_files", "directories", "fragmented_files", "fragmented_directories")
+                    ):
+                        self.append_log(
+                            f"Analysis complete: {data['fragmented_files']} fragmented files, "
+                            f"{data['fragmented_directories']} fragmented directories."
+                        )
+                    else:
+                        write_ops = []
+                        if volume.capabilities & CAP_COMPACT: write_ops.append("Compact")
+                        if volume.capabilities & CAP_DEFRAG: write_ops.append("Defragment")
+                        if volume.capabilities & CAP_RECOVER: write_ops.append("Recover")
+                        suffix = (" Available: " + ", ".join(write_ops) + ".") if write_ops else " Read-only analysis backend."
+                        self.append_log(
+                            f"Analysis complete: {human_bytes(int(data['used_bytes']))} allocated, "
+                            f"{human_bytes(int(data['free_bytes']))} free." + suffix
+                        )
 
         self._run_engine_with_permission_retry(args, "analysis", parsed)
 

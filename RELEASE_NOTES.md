@@ -1,4 +1,8 @@
-# Linux Defragger 1.5.5
+# Linux Defragger 1.5.6
+
+- exFAT analysis now reports regular files, directories, fragmented files and fragmented directories.
+- The exFAT pixel map now overlays fragmented clusters in red and directory clusters in purple.
+- The GUI summary and operation log now use the same fragmentation-count presentation as FAT12/16/32.
 
 Author: Shannon Smith
 

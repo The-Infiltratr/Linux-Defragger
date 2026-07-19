@@ -1,7 +1,8 @@
-# Linux Defragger 1.5.3 test status
+# Linux Defragger 1.5.6 test status
 
-- C engine compiled statically with warnings enabled.
-- Python modules passed bytecode compilation.
-- Backend registry imported successfully.
-- Debian package contents were audited for legacy names and duplicate launchers.
-- Package upgrade layout contains only the canonical Linux Defragger command and paths.
+- C engine compiled with warnings enabled and reports version 1.5.6.
+- Python GUI, mapper and exFAT backend passed bytecode compilation.
+- Exact packaged exFAT mapper test reported one fragmented file before relocation and zero afterward.
+- exFAT file and directory counts match FAT-family summary semantics, including the root directory.
+- Fragmented exFAT clusters are overlaid in red and directory clusters in purple.
+- The exact Debian package was inspected and reports package version 1.5.6.
