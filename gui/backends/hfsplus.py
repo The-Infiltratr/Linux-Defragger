@@ -15,12 +15,20 @@ import struct
 from dataclasses import dataclass
 
 from .base import (
-    BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, CAP_COMPACT, CAP_DEFRAG, CAP_RECOVER, CAP_LIVE_MAP, Reader, aggregate_bitmap,
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, CAP_COMPACT, CAP_DEFRAG, CAP_RECOVER, CAP_LIVE_MAP, FilesystemBackend, Reader, aggregate_bitmap, operation,
     u16be, u32be, u64be,
 )
 
-INFO = BackendInfo("hfsplus", "Apple HFS+/HFSX", ("hfsplus", "hfs+", "hfsx"),
-                   CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER | CAP_LIVE_MAP, "exact")
+INFO = BackendInfo(
+    "hfsplus", "Apple HFS+/HFSX", ("hfsplus", "hfs+", "hfsx"),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER | CAP_LIVE_MAP,
+    "exact",
+    (
+        operation("compact", "apple"),
+        operation("defrag", "apple"),
+        operation("recover", "apple"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -202,7 +210,7 @@ def _catalog_summary(reader: Reader, block_size: int, catalog_tuple, overflow):
     return files, directories, fragmented_files, fragmented_directories, fragment_blocks, directory_blocks
 
 
-class HFSPlusBackend:
+class HFSPlusBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:

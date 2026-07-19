@@ -1,4 +1,28 @@
-# Linux Defragger 1.8.0-33
+# Linux Defragger 1.8.0-35
+
+## Revision 35 — modular engine and filesystem-plugin standardisation
+
+- Adds one central `operation_engine.py` for every mutating operation. The GTK interface and privileged helper no longer duplicate filesystem-specific worker selection.
+- Defines a validated plugin ABI in `backends/contracts.py`. Capabilities must match declared operations, plugin IDs and aliases must be unique, and every mutation names a fixed registered worker.
+- Splits shared backend support into focused contracts, raw-I/O and range modules while retaining `backends/base.py` as a stable compatibility surface.
+- Adds shared core modules for executable resolution, operation-wide command policy, mount-state detection and durable JSON journal replacement.
+- Moves user-visible mutation descriptions and warnings into filesystem plugins, keeping presentation code independent of filesystem implementation details.
+- Replaces repeated per-cell range scans with a sorted linear-time aggregator. Synthetic 40,000-range/50,000-cell validation completes in approximately one tenth of a second in this build environment.
+- Makes raw positional reads robust against short `pread()` results.
+- Standardises previously compressed Minix, UFS, ZFS and APFS plugin source layout and names.
+- Uses `gui/version.py` as the package-version source for Python workers and the C FAT engine build.
+- Adds architecture, plugin-contract, operation-dispatch, range-equivalence, option-filtering and helper-surface regression tests.
+- Preserves the revision 34 filesystem algorithms; this release is an architectural and code-quality change rather than an intentional change to on-disk relocation policy.
+
+## Revision 34
+
+- Replaces the Linux 6.10-only XFS range-exchange requirement with a native compatibility compactor built on the long-established atomic `XFS_IOC_SWAPEXT` interface used by XFS file-reorganisation tools.
+- XFS Compact now reserves the free map, releases one exact low physical range, allocates a compatible temporary whole-file donor only inside that range, copies the complete source while retaining logical holes, and atomically swaps the complete data forks.
+- Verifies the donor's physical location, allocated byte count and extent count before every swap. A source is moved only when the new layout is entirely lower and has no more fragments than the original, so XFS Compact cannot create fragmentation.
+- Repeats native whole-file collector passes to a fixed point, supports live allocation-map updates, honours safe stop between atomic swaps, and adds no `xfs_fsr` or `xfsprogs` runtime dependency.
+- Adds ABI and dispatch regressions for legacy XFS bulk-stat and swap-extent requests, including exact amd64 ioctl layouts and whole-file transaction fields.
+
+## Revision 33
 
 - Fixes the EXT4 final-consolidation failure `Please run e2fsck -f /dev/... first`. Every private online extent-packing round is now followed by a forced offline `e2fsck -f -p` before `resize2fs -M` is allowed to run again. The final minimum-size shrink therefore starts from a filesystem state that e2fsprogs has explicitly validated.
 - Replaces NTFS slice packing with complete-stream packing. Compact now moves an entire supported file or directory stream into one lower contiguous gap and never splits an extent merely to consume a small hole. A fragmented source may become contiguous, but no Compact transaction can increase its physical fragment count.

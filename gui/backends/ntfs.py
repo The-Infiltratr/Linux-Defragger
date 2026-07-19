@@ -8,12 +8,37 @@
 """NTFS allocation analysis with native offline compact and defragment."""
 
 from __future__ import annotations
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_DEFRAG, CAP_MAP, CAP_RECOVER,
+    FilesystemBackend, Reader, aggregate_bitmap, merge_ranges, operation, overlay_ranges,
+    u16le, u32le, u64le,
+)
 
 INFO = BackendInfo(
     "ntfs", "NTFS", ("ntfs", "ntfs3"),
     CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER,
     "exact",
+    (
+        operation(
+            "compact",
+            "ntfs",
+            warning=(
+                "NTFS Compact fills lower gaps using complete higher supported file and directory "
+                "streams. Every moved stream remains contiguous, so Compact does not create "
+                "fragmentation merely to consume a small hole."
+            ),
+        ),
+        operation(
+            "defrag",
+            "ntfs",
+            warning=(
+                "NTFS Defragment rebuilds each supported fragmented stream as one contiguous "
+                "extent in the lowest suitable free run. Higher free space is only temporary staging."
+            ),
+            unsupported_options=("--transaction-files",),
+        ),
+        operation("recover", "ntfs"),
+    ),
 )
 
 _ATTR_DATA = 0x80
@@ -200,16 +225,6 @@ def _stream_fragments(segments) -> int:
     return fragments
 
 
-def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
 def _stream_ranges(streams: dict) -> list[tuple[int, int]]:
@@ -222,25 +237,6 @@ def _stream_ranges(streams: dict) -> list[tuple[int, int]]:
     return ranges
 
 
-def _overlay_ranges(cells: list[dict], ranges: list[tuple[int, int]], field: str) -> int:
-    """Overlay merged allocation-unit ranges onto already binned map cells."""
-    merged = _merge_ranges(ranges)
-    range_index = 0
-    total = sum(end - start for start, end in merged)
-    for cell in cells:
-        start = int(cell["start"])
-        end_ex = int(cell["end"]) + 1
-        while range_index < len(merged) and merged[range_index][1] <= start:
-            range_index += 1
-        overlap = 0
-        check = range_index
-        while check < len(merged) and merged[check][0] < end_ex:
-            overlap += max(0, min(end_ex, merged[check][1]) - max(start, merged[check][0]))
-            if merged[check][1] > end_ex:
-                break
-            check += 1
-        cell[field] = min(int(cell.get("used", 0)), overlap)
-    return total
 
 
 def _scan_fragmentation(reader: Reader, mft_lcn: int, cluster_size: int,
@@ -333,13 +329,13 @@ def _scan_fragmentation(reader: Reader, mft_lcn: int, cluster_size: int,
         "fragmentation_percent": 100.0 * fragmented_files / max(1, regular_files),
         "mft_records_scanned": records_scanned,
         "mft_malformed_records": malformed_records,
-        "fragmented_ranges": _merge_ranges(fragmented_ranges),
-        "directory_ranges": _merge_ranges(directory_ranges),
-        "metadata_ranges": _merge_ranges(metadata_ranges),
+        "fragmented_ranges": merge_ranges(fragmented_ranges),
+        "directory_ranges": merge_ranges(directory_ranges),
+        "metadata_ranges": merge_ranges(metadata_ranges),
     }
 
 
-class NtfsBackend:
+class NtfsBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:
@@ -433,9 +429,9 @@ class NtfsBackend:
             details["fragmentation_available"] = False
             details["fragmentation_note"] = str(exc)
             return
-        fragmented_units = _overlay_ranges(result["cells"], summary["fragmented_ranges"], "fragmented")
-        directory_units = _overlay_ranges(result["cells"], summary["directory_ranges"], "directory")
-        metadata_units = _overlay_ranges(result["cells"], summary["metadata_ranges"], "bad")
+        fragmented_units = overlay_ranges(result["cells"], summary["fragmented_ranges"], "fragmented")
+        directory_units = overlay_ranges(result["cells"], summary["directory_ranges"], "directory")
+        metadata_units = overlay_ranges(result["cells"], summary["metadata_ranges"], "bad")
         result.update({
             "regular_files": summary["regular_files"],
             "directories": summary["directories"],

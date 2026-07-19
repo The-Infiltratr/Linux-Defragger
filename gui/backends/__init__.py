@@ -1,11 +1,6 @@
-# Linux Defragger
-# Author: Shannon Smith
-# Purpose: Filesystem backend package.
-#
-# Comments describe design intent and non-obvious behaviour. They are kept
-# concise so that the implementation remains readable and maintainable.
+"""Filesystem plugin package for Linux Defragger."""
 
-"""Filesystem backend package for Linux Defragger."""
-
+from .base import BackendError, FilesystemBackend
 from .registry import Registry
-from .base import *
+
+__all__ = ["BackendError", "FilesystemBackend", "Registry"]

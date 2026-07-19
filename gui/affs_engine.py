@@ -14,8 +14,17 @@ import signal
 import sys
 from pathlib import Path
 
-_VENDOR = Path(__file__).resolve().parent / "vendor"
-if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from core.devices import is_mounted
+from core.journal import write_json_journal
+from version import VERSION
+
+_VENDOR_CANDIDATES = (SCRIPT_DIR / "vendor", SCRIPT_DIR.parent / "vendor")
+_VENDOR = next((candidate for candidate in _VENDOR_CANDIDATES if candidate.is_dir()), None)
+if _VENDOR is not None and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
 from amitools.fs.ADFSVolume import ADFSVolume
@@ -41,21 +50,7 @@ def on_signal(_sig, _frame):
 
 
 def mounted(path: str) -> bool:
-    real = os.path.realpath(path)
-    try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                parts = line.rstrip().split(" - ", 1)
-                if len(parts) != 2:
-                    continue
-                tail = parts[1].split()
-                source = tail[1] if len(tail) > 1 else ""
-                if source and os.path.realpath(source) == real:
-                    return True
-    except OSError:
-        pass
-    return False
-
+    return is_mounted(path)
 
 def open_block_device(path: str, read_only: bool = False):
     suffix = path.lower()
@@ -90,20 +85,7 @@ def sync_volume(blkdev, volume) -> None:
 
 
 def journal_write(path: str, record: dict) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, target)
-    directory = os.open(str(target.parent), os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-
+    write_json_journal(path, record)
 
 def extent_count(blocks: list[int]) -> int:
     if not blocks:
@@ -365,7 +347,8 @@ def operate(device: str, operation: str, journal: str, max_objects: int | None) 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Linux Defragger Amiga filesystem engine")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("operation", choices=("defrag", "compact", "recover"))
     parser.add_argument("device")
     parser.add_argument("--write", action="store_true")

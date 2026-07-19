@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-33
+# Linux Defragger 1.8.0-35
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -9,13 +9,21 @@ The user-visible operations are deliberately separate:
 - **Defragment** rebuilds fragmented files into contiguous allocation runs. It does not attempt to pack every free-space gap.
 - **Growth Defrag** is a FAT12/16/32 and exFAT layout operation. It verifies the existing layout first, then rebuilds allocated objects in physical order and deliberately leaves free expansion room after each regular file only when work is required.
 
+## Architecture
+
+Revision 35 standardises the program around one orchestration engine and a validated filesystem-plugin ABI. The GTK interface consumes plugin manifests; `operation_engine.py` dispatches every mutation; `gui/core` contains common policy, path, mount-state and journal modules; and each module in `gui/backends` declares its analysis implementation and exact mutation operations. Filesystem-specific algorithms remain in independent workers so they can be tested without the GUI.
+
+The root helper no longer contains separate FAT, exFAT, NTFS, Apple, Amiga, EXT4, Btrfs or XFS dispatch branches. It permits the read-only mapper and central operation engine, while the plugin registry selects only fixed known workers. Detailed contracts are documented in `docs/BACKEND_ABI.md` and `docs/DESIGN.md`.
+
+Shared raw-device reads now retry short positional reads, and shared range aggregation walks sorted ranges and display cells linearly rather than rescanning every range for every cell.
+
 ## EXT4 Compact boundary
 
-EXT4 Compact is an iterative filesystem-wide operation. It first runs an offline `e2fsck -D` pass to optimise directory indexes, alternates minimum-size shrink rounds with regular-file low-hole packing, and finally leaves the filesystem at its minimum valid size. The partition is not changed. Its remaining physical tail is outside ext4, so no file, directory, journal, inode table, bitmap or other ext4 allocation can remain there. The allocation map shows this tail separately from usable free space.
+EXT4 Compact is an iterative offline filesystem-wide operation. It starts with `e2fsck -D`, shrinks the filesystem to its current minimum, temporarily restores the original filesystem geometry only when a regular-file low-hole packing round is needed, checks it again, and repeats. A final minimum-size shrink is always performed after the last packing round.
 
-A minimum-size shrink alone can still leave lower holes inside the temporary minimum image. After each restore, Linux Defragger privately mounts the volume and uses `EXT4_IOC_MOVE_EXT` to exchange higher regular-file extents into those lower holes. It then shrinks and restores again so directory and metadata allocations can be relocated around the denser file layout. The rounds stop when a complete regular-file pass moves nothing, with a fixed safety limit and an additional final shrink after the last productive pass.
+The final compacted filesystem remains at that verified minimum size. The partition table and partition size are not changed; the remaining physical partition tail is outside ext4 and is displayed as **Packed tail outside filesystem**. No file, directory, journal, inode table, bitmap or other ext4 allocation can exist in that outside tail.
 
-The partition table is never changed. The final verification is read-only so it cannot allocate fresh directory or metadata blocks in the restored tail. Any allocations beyond the reported packed boundary are block-group structures required by the restored full-size EXT4 geometry, not ordinary file or directory data. The allocation map labels those structures **Filesystem metadata/reserved** and blends their colour by cell density.
+During an intermediate packing round Linux Defragger privately mounts the checked filesystem and uses `EXT4_IOC_MOVE_EXT` to exchange higher regular-file extents into lower holes. It then unmounts, runs another forced filesystem check and shrinks again so directory and relocatable metadata allocations are consolidated around the denser file layout. The final verification is read-only and cannot create fresh allocations.
 
 
 ## FAT and exFAT Growth Defrag
@@ -49,14 +57,14 @@ The operation refuses to start unless the volume has enough free clusters for bo
 - NTFS: analyse, map, native offline compact, native offline defragment and recover.
 - EXT2/3/4: read-only allocation maps and file/directory fragmentation analysis. Actual ext4 extent-format volumes also support native Compact; ext2, ext3 and ext4 bigalloc remain analysis-only.
 - Btrfs: genuine native physical allocation maps, file-fragmentation analysis and balance-and-shrink Compact for single-device filesystems using non-striped local profiles. Multi-device and striped RAID profiles remain conservatively unsupported.
-- XFS: genuine native physical allocation maps, file/directory fragmentation analysis and range-level Compact on kernels that provide `XFS_IOC_EXCHANGE_RANGE` (Linux 6.10 or newer). Realtime-file data on a separate realtime device is reported but is not moved by Compact.
+- XFS: genuine native physical allocation maps, file/directory fragmentation analysis and native whole-file Compact through the long-established atomic `XFS_IOC_SWAPEXT` interface. Linux 6.10 is not required. Realtime-file data on a separate realtime device is reported but is not moved by Compact.
 - UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
 
 ### Native ext4, XFS and Btrfs Compact semantics
 
 EXT4 Compact combines two kernel-supported mechanisms. Offline `resize2fs -M` rounds relocate the complete filesystem below the smallest currently valid boundary. Between those rounds, a private kernel mount reserves the free map in an unlinked collector and uses `EXT4_IOC_MOVE_EXT` to exchange high regular-file extents directly into verified low collector ranges. The final `resize2fs -M` result is deliberately not expanded again: a full-size ext4 filesystem requires block-group metadata throughout its geometry, so leaving the filesystem at minimum size is the only non-reformatting method that guarantees an allocation-free physical tail. The collector counts all `f_bfree` blocks, including the privileged reserve, while retaining a 64 MiB transaction-safety floor.
 
-XFS Compact retains the range-exchange collector design. It requires a kernel providing `XFS_IOC_EXCHANGE_RANGE`, verifies every donor mapping immediately before exchange, repeats collector passes to a fixed point, and reports live physical updates. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsafe extents are left unchanged.
+XFS Compact reserves the current free map in an unlinked collector, releases one exact low range at a time, creates a compatible temporary file in that range, copies one complete source file while preserving its logical holes, and atomically exchanges the complete XFS data forks with `XFS_IOC_SWAPEXT`. The source inode keeps its identity and metadata while receiving the lower donor allocation. A move is accepted only when the donor lies entirely inside the selected lower range and has no more physical extents than the source, so Compact cannot increase the moved file's fragment count. Collector passes repeat to a fixed point and report live physical updates. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsafe files are left unchanged.
 
 Btrfs Compact cannot safely exchange arbitrary file extents because they are copy-on-write and back-referenced. It therefore runs a native `BTRFS_IOC_BALANCE_V2` data/metadata balance to consolidate partially used block groups and release chunks, with live progress and cancellation through the balance-control ioctl. It then performs progressively tighter `BTRFS_IOC_RESIZE` shrink-and-restore cycles so the surviving chunks are forced toward the physical beginning. Up to three balance-and-shrink rounds are attempted before declaring a fixed point. File defragmentation is not invoked.
 

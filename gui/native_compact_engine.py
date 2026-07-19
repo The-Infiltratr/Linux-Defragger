@@ -12,9 +12,12 @@ rounds. The final minimum-size filesystem is intentionally left in place, so the
 unused physical partition tail is outside ext4 and cannot contain files,
 directories, journals, inode tables or other filesystem allocation.
 
-XFS continues to use temporary, unlinked space-collector files and kernel range
-exchange. The collector occupies existing free runs; low collector extents are
-used as donors for exchanges with the highest movable file extents.
+XFS uses temporary, unlinked space-collector files and the long-established
+atomic whole-file XFS extent-swap interface.  The collector owns the existing
+free map, releases one exact low destination at a time, and forces a compatible
+temporary donor into that range.  Swapping the complete data fork moves the
+original file lower without increasing its fragment count and works on kernels
+that predate the newer range-exchange interface.
 
 Btrfs cannot exchange arbitrary physical file extents because every extent is
 copy-on-write and back-referenced. Its compactor first runs a native filtered
@@ -50,6 +53,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from backends.base import Reader, u16le, u32le, u64le  # noqa: E402
+from core.devices import is_mounted  # noqa: E402
 from backends import ext4 as ext_backend  # noqa: E402
 from backends import xfs as xfs_backend  # noqa: E402
 from backends import btrfs as btrfs_backend  # noqa: E402
@@ -63,6 +67,10 @@ COPY_BUFFER = 8 * 1024 * 1024
 # The collector runs as root, so it must count f_bfree (all free blocks), not
 # f_bavail (only the blocks offered to an unprivileged process).
 COLLECTOR_FLOOR = 64 * 1024 * 1024
+# The legacy XFS whole-file fallback reserves nearly all free blocks so a
+# temporary donor can only allocate inside the precise low range released by
+# the collector.  The small remainder is for XFS transaction metadata.
+XFS_LEGACY_COLLECTOR_FLOOR = 1 * 1024 * 1024
 MAX_NO_PROGRESS = 8
 MAX_EXTENT_COMPACT_PASSES = 32
 MAX_EXT4_REPACK_ROUNDS = 4
@@ -72,8 +80,12 @@ MAX_BTRFS_COMPACT_ROUNDS = 3
 FS_XFLAG_REALTIME = 0x00000001
 FS_XFLAG_IMMUTABLE = 0x00000008
 FS_XFLAG_APPEND = 0x00000010
+FS_XFLAG_NODEFRAG = 0x00002000
 FS_XFLAG_DAX = 0x00008000
-UNMOVABLE_XFLAGS = FS_XFLAG_REALTIME | FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND | FS_XFLAG_DAX
+UNMOVABLE_XFLAGS = (
+    FS_XFLAG_REALTIME | FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND
+    | FS_XFLAG_NODEFRAG | FS_XFLAG_DAX
+)
 
 # Linux mount flags.
 MS_NOSUID = 2
@@ -128,10 +140,84 @@ def _ioc(direction: int, kind: int | str, number: int, size: int) -> int:
     )
 
 
+class _XfsBstime(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_int32)]
+
+
+class _XfsBstat(ctypes.Structure):
+    _fields_ = [
+        ("bs_ino", ctypes.c_uint64),
+        ("bs_mode", ctypes.c_uint16),
+        ("bs_nlink", ctypes.c_uint16),
+        ("bs_uid", ctypes.c_uint32),
+        ("bs_gid", ctypes.c_uint32),
+        ("bs_rdev", ctypes.c_uint32),
+        ("bs_blksize", ctypes.c_int32),
+        ("bs_size", ctypes.c_int64),
+        ("bs_atime", _XfsBstime),
+        ("bs_mtime", _XfsBstime),
+        ("bs_ctime", _XfsBstime),
+        ("bs_blocks", ctypes.c_int64),
+        ("bs_xflags", ctypes.c_uint32),
+        ("bs_extsize", ctypes.c_int32),
+        ("bs_extents", ctypes.c_int32),
+        ("bs_gen", ctypes.c_uint32),
+        ("bs_projid_lo", ctypes.c_uint16),
+        ("bs_forkoff", ctypes.c_uint16),
+        ("bs_projid_hi", ctypes.c_uint16),
+        ("bs_sick", ctypes.c_uint16),
+        ("bs_checked", ctypes.c_uint16),
+        ("bs_pad", ctypes.c_ubyte * 2),
+        ("bs_cowextsize", ctypes.c_uint32),
+        ("bs_dmevmask", ctypes.c_uint32),
+        ("bs_dmstate", ctypes.c_uint16),
+        ("bs_aextents", ctypes.c_uint16),
+    ]
+
+
+class _XfsSwapext(ctypes.Structure):
+    _fields_ = [
+        ("sx_version", ctypes.c_int64),
+        ("sx_fdtarget", ctypes.c_int64),
+        ("sx_fdtmp", ctypes.c_int64),
+        ("sx_offset", ctypes.c_int64),
+        ("sx_length", ctypes.c_int64),
+        ("sx_pad", ctypes.c_ubyte * 16),
+        ("sx_stat", _XfsBstat),
+    ]
+
+
+class _XfsFsopBulkreq(ctypes.Structure):
+    _fields_ = [
+        ("lastip", ctypes.POINTER(ctypes.c_uint64)),
+        ("icount", ctypes.c_int32),
+        ("ubuffer", ctypes.c_void_p),
+        ("ocount", ctypes.POINTER(ctypes.c_int32)),
+    ]
+
+
+if ctypes.sizeof(_XfsBstat) != 136 or ctypes.sizeof(_XfsSwapext) != 192:
+    raise RuntimeError("unsupported userspace ABI layout for legacy XFS extent exchange")
+
+
+_LIBC_IOCTL = ctypes.CDLL(None, use_errno=True)
+_LIBC_IOCTL.ioctl.restype = ctypes.c_int
+
+
+def _ctypes_ioctl(fd: int, request: int, structure: ctypes.Structure) -> None:
+    result = _LIBC_IOCTL.ioctl(fd, ctypes.c_ulong(request), ctypes.byref(structure))
+    if result != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
 FS_IOC_FIEMAP = _ioc(_IOC_READ | _IOC_WRITE, "f", 11, 32)
 FS_IOC_FSGETXATTR = _ioc(_IOC_READ, "X", 31, 28)
+FS_IOC_FSSETXATTR = _ioc(_IOC_WRITE, "X", 32, 28)
 EXT4_IOC_MOVE_EXT = _ioc(_IOC_READ | _IOC_WRITE, "f", 15, 40)
 XFS_IOC_EXCHANGE_RANGE = _ioc(_IOC_WRITE, "X", 129, 40)
+XFS_IOC_FSBULKSTAT_SINGLE = _ioc(_IOC_READ | _IOC_WRITE, "X", 102, ctypes.sizeof(_XfsFsopBulkreq))
+XFS_IOC_SWAPEXT = _ioc(_IOC_READ | _IOC_WRITE, "X", 109, ctypes.sizeof(_XfsSwapext))
 BTRFS_IOC_RESIZE = _ioc(_IOC_WRITE, 0x94, 3, 4096)
 BTRFS_IOC_BALANCE_V2 = _ioc(_IOC_READ | _IOC_WRITE, 0x94, 32, 1024)
 BTRFS_IOC_BALANCE_CTL = _ioc(_IOC_WRITE, 0x94, 33, 4)
@@ -159,6 +245,14 @@ class CompactError(RuntimeError):
 
 class SourceNotMovable(RuntimeError):
     pass
+
+
+class XfsRangeExchangeUnavailable(CompactError):
+    """The modern arbitrary-range XFS exchange ioctl is unavailable."""
+
+
+class XfsLegacySwapUnavailable(CompactError):
+    """The legacy whole-file XFS extent-swap ioctl is unavailable."""
 
 
 @dataclass
@@ -205,6 +299,17 @@ class SourceExtent:
     @property
     def physical_end(self) -> int:
         return self.physical + self.length
+
+
+@dataclass
+class XfsWholeFile:
+    path: str
+    size: int
+    extents: list[FiemapExtent]
+    logical_runs: list[tuple[int, int]]
+    allocated_bytes: int
+    physical_start: int
+    physical_end: int
 
 
 @dataclass(frozen=True)
@@ -329,7 +434,7 @@ class SpaceCollector:
             err = ctypes.get_errno()
             raise OSError(err, os.strerror(err))
 
-    def fill_available(self) -> tuple[int, int]:
+    def fill_available(self, floor: int = COLLECTOR_FLOOR) -> tuple[int, int]:
         fd = self._new_unlinked_file("collector")
         allocated = 0
         transactions = 0
@@ -343,7 +448,7 @@ class SpaceCollector:
             # authority and the retry loop safely backs off when a filesystem
             # cannot make every reported block available to this file.
             available = stats.f_bfree * stats.f_frsize
-            target = max(0, available - COLLECTOR_FLOOR)
+            target = max(0, available - floor)
             target -= target % self.block_size
             if target < self.block_size:
                 break
@@ -408,6 +513,17 @@ class SpaceCollector:
             f"range at byte {physical:,}; stopped before changing a file mapping"
         )
 
+    def release_slice(self, item: CollectorExtent, logical: int, physical: int, length: int) -> None:
+        """Punch one verified collector slice so a legacy XFS donor can own it."""
+        self.verify_slice(item, logical, physical, length)
+        self._fallocate(item.fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, logical, length)
+        os.fsync(item.fd)
+
+    def refill_slice(self, item: CollectorExtent, logical: int, length: int) -> None:
+        """Reallocate a released logical slice, normally into the newly freed high blocks."""
+        self._fallocate(item.fd, 0, logical, length)
+        os.fsync(item.fd)
+
 
 def _signal_handler(_signum, _frame) -> None:
     global _stop_requested
@@ -442,17 +558,11 @@ def _emit_live_range(source_physical: int, destination_physical: int,
 def _assert_unmounted(device: str) -> None:
     st = os.stat(device)
     if not stat.S_ISBLK(st.st_mode):
-        raise CompactError("ext4, XFS and Btrfs Compact currently require a real block-device partition")
-    major_minor = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
-    try:
-        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise CompactError(f"cannot verify mount state: {exc}") from exc
-    for line in lines:
-        fields = line.split()
-        if len(fields) > 2 and fields[2] == major_minor:
-            raise CompactError(f"{device} is already mounted; Compact requires an unmounted volume")
-
+        raise CompactError(
+            "ext4, XFS and Btrfs Compact currently require a real block-device partition"
+        )
+    if is_mounted(device):
+        raise CompactError(f"{device} is already mounted; Compact requires an unmounted volume")
 
 def fiemap(fd: int, start: int = 0, length: int = (1 << 64) - 1,
            batch: int = 512) -> list[FiemapExtent]:
@@ -936,13 +1046,400 @@ def _xfs_exchange(source_fd: int, donor_fd: int, source_offset: int,
         fcntl.ioctl(source_fd, XFS_IOC_EXCHANGE_RANGE, request)
     except OSError as exc:
         if exc.errno in (errno.ENOTTY, errno.EOPNOTSUPP):
-            raise CompactError(
-                "this kernel or XFS volume does not support XFS_IOC_EXCHANGE_RANGE; "
-                "range-level XFS compaction requires Linux 6.10 or newer with the feature enabled"
+            raise XfsRangeExchangeUnavailable(
+                "this kernel or XFS volume does not support XFS_IOC_EXCHANGE_RANGE"
             ) from exc
         if exc.errno in (errno.EINVAL, errno.EPERM, errno.ETXTBSY):
             raise SourceNotMovable(os.strerror(exc.errno)) from exc
         raise
+
+
+def _xfs_fsxattr(fd: int) -> bytes:
+    buffer = bytearray(28)
+    fcntl.ioctl(fd, FS_IOC_FSGETXATTR, buffer, True)
+    return bytes(buffer)
+
+
+def _xfs_set_fsxattr(fd: int, value: bytes) -> None:
+    if len(value) != 28:
+        raise ValueError("invalid fsxattr size")
+    fcntl.ioctl(fd, FS_IOC_FSSETXATTR, value)
+
+
+def _xfs_bulkstat_single(fd: int) -> _XfsBstat:
+    inode = ctypes.c_uint64(os.fstat(fd).st_ino)
+    result = _XfsBstat()
+    request = _XfsFsopBulkreq(
+        ctypes.pointer(inode),
+        1,
+        ctypes.cast(ctypes.pointer(result), ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int32)(),
+    )
+    try:
+        _ctypes_ioctl(fd, XFS_IOC_FSBULKSTAT_SINGLE, request)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTTY, errno.EOPNOTSUPP):
+            raise XfsLegacySwapUnavailable(
+                "legacy XFS bulk-stat support is unavailable on this kernel"
+            ) from exc
+        raise
+    return result
+
+
+def _xfs_match_attr_fork(donor_fd: int, source_stat: _XfsBstat) -> None:
+    """Give a temporary inode the same data/attribute fork split as the source.
+
+    XFS_IOC_SWAPEXT refuses to exchange data forks whose on-disk formats are
+    incompatible.  xfs_fsr solves this by adding temporary user attributes
+    until the donor's fork offset matches the source.  The attributes remain on
+    the unlinked donor and disappear after the exchange.
+    """
+    wanted = int(source_stat.bs_forkoff)
+    if wanted == 0:
+        return
+    fd_path = f"/proc/self/fd/{donor_fd}"
+    for index in range(128):
+        current = _xfs_bulkstat_single(donor_fd)
+        if int(current.bs_forkoff) == wanted:
+            return
+        if current.bs_forkoff and int(current.bs_forkoff) < wanted:
+            break
+        try:
+            os.setxattr(fd_path, f"user.linux_defragger_{index:03d}", b"XX")
+        except OSError as exc:
+            raise SourceNotMovable(
+                f"could not prepare a compatible XFS attribute fork: {exc}"
+            ) from exc
+    current = _xfs_bulkstat_single(donor_fd)
+    if int(current.bs_forkoff) != wanted:
+        raise SourceNotMovable(
+            f"temporary XFS inode fork offset {int(current.bs_forkoff)} does not match "
+            f"source offset {wanted}"
+        )
+
+
+def _xfs_legacy_swapext(source_fd: int, donor_fd: int,
+                        source_stat: _XfsBstat, length: int) -> None:
+    request = _XfsSwapext()
+    request.sx_version = 0
+    request.sx_fdtarget = source_fd
+    request.sx_fdtmp = donor_fd
+    request.sx_offset = 0
+    request.sx_length = length
+    request.sx_stat = source_stat
+    try:
+        _ctypes_ioctl(source_fd, XFS_IOC_SWAPEXT, request)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS):
+            raise XfsLegacySwapUnavailable(
+                "this kernel does not provide the legacy XFS_IOC_SWAPEXT fallback"
+            ) from exc
+        if exc.errno in (
+            errno.EINVAL, errno.EPERM, errno.ETXTBSY, errno.EBUSY,
+            errno.EFAULT, errno.ENOTSUP,
+        ):
+            raise SourceNotMovable(os.strerror(exc.errno)) from exc
+        raise
+
+
+def _logical_data_runs(extents: list[FiemapExtent]) -> list[tuple[int, int]]:
+    runs: list[list[int]] = []
+    for extent in sorted(extents, key=lambda item: item.logical):
+        start = extent.logical
+        end = extent.logical + extent.length
+        if runs and start <= runs[-1][1]:
+            runs[-1][1] = max(runs[-1][1], end)
+        else:
+            runs.append([start, end])
+    return [(start, end - start) for start, end in runs]
+
+
+def _scan_xfs_whole_files(mountpoint: str, block_size: int, device_bytes: int,
+                          excluded: Path) -> tuple[list[XfsWholeFile], int, int]:
+    candidates: list[XfsWholeFile] = []
+    files = 0
+    skipped = 0
+    seen: set[tuple[int, int]] = set()
+    stack = [Path(mountpoint)]
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if path == excluded:
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+                    except OSError:
+                        continue
+                    try:
+                        st = os.fstat(fd)
+                        identity = (st.st_dev, st.st_ino)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        files += 1
+                        if st.st_size <= 0 or _file_xflags(fd) & UNMOVABLE_XFLAGS:
+                            skipped += 1
+                            continue
+                        extents = fiemap(fd)
+                        if not extents:
+                            continue
+                        valid: list[FiemapExtent] = []
+                        bad = False
+                        for extent in extents:
+                            if extent.flags & UNMOVABLE_FIEMAP_FLAGS:
+                                bad = True
+                                break
+                            if (extent.logical % block_size or extent.physical % block_size
+                                    or extent.length % block_size):
+                                bad = True
+                                break
+                            if extent.length <= 0 or extent.physical < 0 or extent.physical_end > device_bytes:
+                                bad = True
+                                break
+                            valid.append(extent)
+                        if bad:
+                            skipped += 1
+                            continue
+                        logical_runs = _logical_data_runs(valid)
+                        allocated = sum(length for _logical, length in logical_runs)
+                        if allocated <= 0:
+                            continue
+                        candidates.append(XfsWholeFile(
+                            path=str(path),
+                            size=st.st_size,
+                            extents=valid,
+                            logical_runs=logical_runs,
+                            allocated_bytes=allocated,
+                            physical_start=min(item.physical for item in valid),
+                            physical_end=max(item.physical_end for item in valid),
+                        ))
+                    finally:
+                        os.close(fd)
+        except OSError:
+            continue
+    candidates.sort(key=lambda item: (item.physical_end, item.allocated_bytes), reverse=True)
+    return candidates, files, skipped
+
+
+def _xfs_create_legacy_donor(collector: SpaceCollector, source_fd: int,
+                             source: XfsWholeFile, source_stat: _XfsBstat,
+                             target_start: int, target_end: int) -> tuple[int, list[FiemapExtent]]:
+    donor_path = collector.workspace / f"legacy-donor-{time.time_ns()}"
+    donor_fd = os.open(
+        donor_path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    os.unlink(donor_path)
+    try:
+        _xfs_match_attr_fork(donor_fd, source_stat)
+        try:
+            attributes = _xfs_fsxattr(source_fd)
+            _xfs_set_fsxattr(donor_fd, attributes)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTTY):
+                raise SourceNotMovable(f"could not duplicate XFS inode flags: {exc}") from exc
+
+        for logical, length in source.logical_runs:
+            collector._fallocate(donor_fd, 0, logical, length)
+        os.ftruncate(donor_fd, source.size)
+        for logical, length in source.logical_runs:
+            _copy_range(source_fd, logical, donor_fd, length, logical)
+        os.ftruncate(donor_fd, source.size)
+        os.fchown(donor_fd, int(source_stat.bs_uid), int(source_stat.bs_gid))
+        os.fsync(donor_fd)
+
+        donor_extents = fiemap(donor_fd)
+        if not donor_extents:
+            raise SourceNotMovable("temporary XFS donor received no physical allocation")
+        if any(item.flags & UNMOVABLE_FIEMAP_FLAGS for item in donor_extents):
+            raise SourceNotMovable("temporary XFS donor has an unsupported extent type")
+        if len(donor_extents) > len(source.extents):
+            raise SourceNotMovable(
+                "legacy XFS donor would increase the file's physical fragment count"
+            )
+        donor_allocated = sum(item.length for item in donor_extents)
+        if donor_allocated != source.allocated_bytes:
+            raise SourceNotMovable(
+                "legacy XFS donor allocation does not match the source allocation"
+            )
+        if any(item.physical < target_start or item.physical_end > target_end
+               for item in donor_extents):
+            raise SourceNotMovable(
+                "XFS allocated the temporary donor outside the released low collector range"
+            )
+        return donor_fd, donor_extents
+    except Exception:
+        os.close(donor_fd)
+        raise
+
+
+def _emit_xfs_whole_file_exchange(source_extents: list[FiemapExtent],
+                                  donor_extents: list[FiemapExtent],
+                                  moved_before: int, pass_number: int,
+                                  live_cells: int) -> None:
+    """Describe a whole-file map swap as equal-length physical slices."""
+    old = [[item.physical, item.length] for item in source_extents]
+    new = [[item.physical, item.length] for item in donor_extents]
+    old_index = new_index = 0
+    moved = 0
+    while old_index < len(old) and new_index < len(new):
+        take = min(old[old_index][1], new[new_index][1])
+        _emit_live_range(
+            old[old_index][0], new[new_index][0], take,
+            moved_before + moved + take, pass_number, live_cells,
+        )
+        old[old_index][0] += take
+        old[old_index][1] -= take
+        new[new_index][0] += take
+        new[new_index][1] -= take
+        moved += take
+        if old[old_index][1] == 0:
+            old_index += 1
+        if new[new_index][1] == 0:
+            new_index += 1
+
+
+def _xfs_legacy_compact_pass(mountpoint: str, block_size: int, device_bytes: int,
+                             live_cells: int, pass_number: int,
+                             moved_before_pass: int) -> ExtentPassResult:
+    """Compact XFS on pre-6.10 kernels with atomic whole-file extent swaps.
+
+    All free space is first owned by the collector.  For each candidate, one
+    exact low slice is punched free, a compatible temporary file is allocated
+    into that slice, the source data is copied, and XFS_IOC_SWAPEXT atomically
+    gives the source inode the donor's lower extent map.  The donor then releases
+    the old high extents, which are immediately reabsorbed by the collector.
+    """
+    result = ExtentPassResult()
+    collector = SpaceCollector(mountpoint, block_size)
+    try:
+        allocated, operations = collector.fill_available(XFS_LEGACY_COLLECTOR_FLOOR)
+        gaps = collector.owned_extents(device_bytes)
+        candidates, file_count, skipped = _scan_xfs_whole_files(
+            mountpoint, block_size, device_bytes, collector.workspace
+        )
+        result.runtime_skipped += skipped
+        print(
+            f"XFS legacy Compact pass {pass_number}: collector reserved "
+            f"{allocated / (1024**3):.2f} GiB in {operations:,} fallocate operations "
+            f"and exposed {len(gaps):,} exact low physical ranges.",
+            flush=True,
+        )
+        print(
+            f"Scanned {file_count:,} regular files; {len(candidates):,} whole-file "
+            f"candidates can be relocated without increasing fragmentation.",
+            flush=True,
+        )
+        if not gaps or not candidates:
+            result.blocked_reason = "no suitable whole-file source and low free range remain"
+            return result
+
+        remaining = list(candidates)
+        total_target = sum(item.length for item in gaps)
+        processed_target = 0
+        for gap in gaps:
+            cursor_physical = gap.physical
+            cursor_logical = gap.logical
+            while cursor_physical < gap.physical_end:
+                if _stop_requested:
+                    result.stopped = True
+                    result.blocked_reason = "stop requested between atomic XFS file exchanges"
+                    return result
+                available = gap.physical_end - cursor_physical
+                selected_index = next((
+                    index for index, item in enumerate(remaining)
+                    if item.allocated_bytes <= available
+                    and cursor_physical + item.allocated_bytes < item.physical_end
+                ), None)
+                if selected_index is None:
+                    break
+                source = remaining.pop(selected_index)
+                length = source.allocated_bytes
+                target_end = cursor_physical + length
+                collector.release_slice(gap, cursor_logical, cursor_physical, length)
+                source_fd = donor_fd = None
+                donor_extents: list[FiemapExtent] = []
+                exchange_completed = False
+                try:
+                    source_fd = os.open(
+                        source.path,
+                        os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    current_extents = fiemap(source_fd)
+                    if [(e.logical, e.physical, e.length) for e in current_extents] != [
+                        (e.logical, e.physical, e.length) for e in source.extents
+                    ]:
+                        raise SourceNotMovable("source extent map changed before legacy exchange")
+                    source_stat = _xfs_bulkstat_single(source_fd)
+                    donor_fd, donor_extents = _xfs_create_legacy_donor(
+                        collector, source_fd, source, source_stat,
+                        cursor_physical, target_end,
+                    )
+                    _xfs_legacy_swapext(source_fd, donor_fd, source_stat, source.size)
+                    os.fsync(source_fd)
+                    os.fsync(donor_fd)
+                    exchange_completed = True
+                except SourceNotMovable as exc:
+                    result.runtime_skipped += 1
+                    print(
+                        f"Skipped {source.path}: legacy XFS whole-file relocation was not "
+                        f"safe ({exc}).",
+                        flush=True,
+                    )
+                finally:
+                    if source_fd is not None:
+                        os.close(source_fd)
+                    if donor_fd is not None:
+                        os.close(donor_fd)
+                    # If the exchange succeeded, this logical collector hole is
+                    # refilled from the source's newly freed high blocks.  If it
+                    # failed, it simply reclaims the released low target.
+                    collector.refill_slice(gap, cursor_logical, length)
+
+                if not exchange_completed:
+                    # The exact target has been restored. Try a different file;
+                    # do not advance the low cursor.
+                    if not remaining:
+                        break
+                    continue
+
+                result.moved_bytes += length
+                result.transactions += 1
+                _emit_xfs_whole_file_exchange(
+                    source.extents, donor_extents,
+                    moved_before_pass + result.moved_bytes - length,
+                    pass_number, live_cells,
+                )
+                cursor_physical += length
+                cursor_logical += length
+                processed_target += length
+                percent = min(99.0, 100.0 * processed_target / max(1, total_target))
+                print(
+                    f"XFS legacy Compact atomically moved one complete file "
+                    f"({length / (1024**2):.1f} MiB) into physical byte "
+                    f"{cursor_physical - length:,}; pass total "
+                    f"{result.moved_bytes / (1024**3):.2f} GiB.",
+                    flush=True,
+                )
+                print(f"{percent:.2f} percent completed", flush=True)
+
+        if result.moved_bytes == 0 and not result.blocked_reason:
+            result.blocked_reason = (
+                "no complete movable XFS file fits a lower collector range without "
+                "increasing its fragment count"
+            )
+        return result
+    finally:
+        collector.close()
 
 
 def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
@@ -1116,11 +1613,21 @@ def _run_extent_compaction(device: str, filesystem: str, live_cells: int = 0,
         raise CompactError(f"unsupported extent filesystem: {filesystem}")
 
     if not embedded:
-        print(
-            f"{filesystem.upper()} Compact will paste the highest movable regular-file extents "
-            "into the lowest accessible free ranges. It does not try to reduce fragmentation.",
-            flush=True,
-        )
+        if filesystem == "xfs":
+            print(
+                "XFS Compact uses native atomic whole-file extent swaps to place complete "
+                "movable files into the lowest accessible free ranges. It does not require "
+                "the Linux 6.10 range-exchange interface and it never increases a moved "
+                "file's fragment count.",
+                flush=True,
+            )
+        else:
+            print(
+                f"{filesystem.upper()} Compact will paste the highest movable regular-file "
+                "extents into the lowest accessible free ranges. It does not try to reduce "
+                "fragmentation.",
+                flush=True,
+            )
         print(
             "The engine repeats collector passes automatically until another pass can no "
             "longer move any regular-file allocation lower.",
@@ -1134,23 +1641,32 @@ def _run_extent_compaction(device: str, filesystem: str, live_cells: int = 0,
                 print("Stop requested before the next Compact pass.", flush=True)
                 summary.stopped = True
                 return summary
-            result = _compact_extent_pass(
-                mountpoint,
-                filesystem,
-                block_size,
-                device_bytes,
-                live_cells,
-                pass_number,
-                summary.moved_bytes,
-                emit_progress=not embedded,
-            )
+
+            if filesystem == "xfs":
+                result = _xfs_legacy_compact_pass(
+                    mountpoint, block_size, device_bytes, live_cells, pass_number,
+                    summary.moved_bytes,
+                )
+            else:
+                result = _compact_extent_pass(
+                    mountpoint,
+                    filesystem,
+                    block_size,
+                    device_bytes,
+                    live_cells,
+                    pass_number,
+                    summary.moved_bytes,
+                    emit_progress=not embedded,
+                )
+
             summary.moved_bytes += result.moved_bytes
             summary.transactions += result.transactions
             summary.runtime_skipped += result.runtime_skipped
             summary.final_reason = result.blocked_reason
 
+            mode_text = " whole-file" if filesystem == "xfs" else ""
             print(
-                f"{filesystem.upper()} Compact pass {pass_number} moved "
+                f"{filesystem.upper()} Compact{mode_text} pass {pass_number} moved "
                 f"{result.moved_bytes / (1024**3):.2f} GiB in "
                 f"{result.transactions:,} kernel-journalled transactions.",
                 flush=True,
@@ -1181,11 +1697,13 @@ def _run_extent_compaction(device: str, filesystem: str, live_cells: int = 0,
             )
 
     if not embedded:
+        mode_text = " using atomic whole-file XFS swaps" if filesystem == "xfs" else ""
         print(
-            f"{filesystem.upper()} Compact moved {summary.moved_bytes / (1024**3):.2f} GiB in "
+            f"{filesystem.upper()} Compact{mode_text} moved "
+            f"{summary.moved_bytes / (1024**3):.2f} GiB in "
             f"{summary.transactions:,} kernel-journalled transactions across "
             f"{summary.productive_passes:,} productive passes; "
-            f"{summary.runtime_skipped:,} additional source extents were skipped at runtime.",
+            f"{summary.runtime_skipped:,} unsupported sources were skipped safely.",
             flush=True,
         )
         if summary.final_reason:
@@ -1193,11 +1711,18 @@ def _run_extent_compaction(device: str, filesystem: str, live_cells: int = 0,
                 f"Compaction reached its current online boundary: {summary.final_reason}.",
                 flush=True,
             )
-        print(
-            "All movable regular-file extents have been packed as low as the current "
-            "filesystem metadata and directory allocations permit.",
-            flush=True,
-        )
+        if filesystem == "xfs":
+            print(
+                "All complete movable XFS files that fit a lower collector range were "
+                "relocated atomically without increasing their fragment count.",
+                flush=True,
+            )
+        else:
+            print(
+                "All movable regular-file extents have been packed as low as the current "
+                "filesystem metadata and directory allocations permit.",
+                flush=True,
+            )
     return summary
 
 

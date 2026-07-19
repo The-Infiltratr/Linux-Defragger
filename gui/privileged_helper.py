@@ -28,13 +28,8 @@ from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = 1
-ENGINE = Path("/usr/bin/linux-defragger-engine")
 MAPPER = Path("/usr/lib/linux-defragger/allocation_mapper.py")
-EXFAT_ENGINE = Path("/usr/lib/linux-defragger/exfat_engine.py")
-AFFS_ENGINE = Path("/usr/lib/linux-defragger/affs_engine.py")
-APPLE_ENGINE = Path("/usr/lib/linux-defragger/apple_engine.py")
-NTFS_ENGINE = Path("/usr/lib/linux-defragger/ntfs_engine.py")
-NATIVE_COMPACT_ENGINE = Path("/usr/lib/linux-defragger/native_compact_engine.py")
+OPERATION_ENGINE = Path("/usr/lib/linux-defragger/operation_engine.py")
 UDISKSCTL = Path("/usr/bin/udisksctl")
 
 _emit_lock = threading.Lock()
@@ -59,42 +54,16 @@ def fail(request_id: int | None, message: str) -> None:
 
 
 def allowed_command(program: str, argv: list[str]) -> list[str]:
-    if program == "engine":
-        if not ENGINE.is_file() or not os.access(ENGINE, os.X_OK):
-            raise RuntimeError(f"engine is unavailable: {ENGINE}")
-        if not argv or argv[0] not in {"analyze", "map", "defrag", "compact", "growth-defrag", "recover"}:
-            raise RuntimeError("engine command is not allowed")
-        return [str(ENGINE), *argv]
-    if program == "exfat-engine":
-        if not EXFAT_ENGINE.is_file() or not os.access(EXFAT_ENGINE, os.X_OK):
-            raise RuntimeError(f"exFAT engine is unavailable: {EXFAT_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
-            raise RuntimeError("exFAT engine command is not allowed")
-        return [str(EXFAT_ENGINE), *argv]
-    if program == "affs-engine":
-        if not AFFS_ENGINE.is_file() or not os.access(AFFS_ENGINE, os.X_OK):
-            raise RuntimeError(f"Amiga filesystem engine is unavailable: {AFFS_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
-            raise RuntimeError("Amiga filesystem engine command is not allowed")
-        return [str(AFFS_ENGINE), *argv]
-    if program == "apple-engine":
-        if not APPLE_ENGINE.is_file() or not os.access(APPLE_ENGINE, os.X_OK):
-            raise RuntimeError(f"Apple filesystem engine is unavailable: {APPLE_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
-            raise RuntimeError("Apple filesystem engine command is not allowed")
-        return [str(APPLE_ENGINE), *argv]
-    if program == "ntfs-engine":
-        if not NTFS_ENGINE.is_file() or not os.access(NTFS_ENGINE, os.X_OK):
-            raise RuntimeError(f"NTFS engine is unavailable: {NTFS_ENGINE}")
-        if not argv or argv[0] not in {"compact", "defrag", "recover"}:
-            raise RuntimeError("NTFS engine command is not allowed")
-        return [str(NTFS_ENGINE), *argv]
-    if program == "native-compact-engine":
-        if not NATIVE_COMPACT_ENGINE.is_file() or not os.access(NATIVE_COMPACT_ENGINE, os.X_OK):
-            raise RuntimeError(f"native Linux compact engine is unavailable: {NATIVE_COMPACT_ENGINE}")
-        if not argv or argv[0] != "compact":
-            raise RuntimeError("native Linux compact command is not allowed")
-        return [str(NATIVE_COMPACT_ENGINE), *argv]
+    """Translate a small protocol identifier into one fixed installed command."""
+
+    if program == "operation-engine":
+        if not OPERATION_ENGINE.is_file() or not os.access(OPERATION_ENGINE, os.X_OK):
+            raise RuntimeError(f"operation engine is unavailable: {OPERATION_ENGINE}")
+        if not argv or argv[0] not in {"compact", "defrag", "growth-defrag", "recover"}:
+            raise RuntimeError("operation-engine command is not allowed")
+        if "--filesystem" not in argv:
+            raise RuntimeError("operation-engine request has no filesystem plugin")
+        return [str(OPERATION_ENGINE), *argv]
     if program == "mapper":
         if not MAPPER.is_file() or not os.access(MAPPER, os.X_OK):
             raise RuntimeError(f"allocation mapper is unavailable: {MAPPER}")

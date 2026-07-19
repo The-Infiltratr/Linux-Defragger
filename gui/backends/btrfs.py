@@ -22,9 +22,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_MAP, FilesystemBackend, Reader,
+    aggregate_ranges, complement_ranges, merge_ranges, operation, overlay_ranges, u16le, u32le,
+    u64le,
+)
 
-INFO = BackendInfo("btrfs", "Btrfs", ("btrfs",), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact-single-device")
+INFO = BackendInfo(
+    "btrfs", "Btrfs", ("btrfs",),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT,
+    "exact-single-device",
+    (
+        operation(
+            "compact",
+            "linux-compact",
+            pass_filesystem=True,
+            warning=(
+                "Btrfs Compact balances data and metadata chunks, then uses shrink-and-restore "
+                "cycles to move the physical chunk boundary downward. It does not defragment files."
+            ),
+        ),
+    ),
+)
 
 _BTRFS_MAGIC = b"_BHRfS_M"
 _SUPER_OFFSET = 64 * 1024
@@ -148,50 +167,10 @@ def _key(data: bytes, offset: int = 0) -> _Key:
     return _Key(u64le(data, offset), data[offset + 8], u64le(data, offset + 9))
 
 
-def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if start < 0 or end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
-def _complement(total: int, used: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    cursor = 0
-    for start, end in _merge_ranges(used):
-        start = max(0, min(total, start))
-        end = max(0, min(total, end))
-        if start > cursor:
-            result.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < total:
-        result.append((cursor, total))
-    return result
 
 
-def _overlay_ranges(cells: list[dict], ranges: list[tuple[int, int]], field: str) -> int:
-    merged = _merge_ranges(ranges)
-    index = 0
-    total = sum(end - start for start, end in merged)
-    for cell in cells:
-        start = int(cell["start"])
-        end_ex = int(cell["end"]) + 1
-        while index < len(merged) and merged[index][1] <= start:
-            index += 1
-        overlap = 0
-        check = index
-        while check < len(merged) and merged[check][0] < end_ex:
-            overlap += max(0, min(end_ex, merged[check][1]) - max(start, merged[check][0]))
-            if merged[check][1] > end_ex:
-                break
-            check += 1
-        cell[field] = min(int(cell.get("used", 0)), overlap)
-    return total
 
 
 def _parse_chunk(data: bytes, logical: int) -> _Chunk:
@@ -506,7 +485,7 @@ def _scan_filesystem_trees(tree_reader: _TreeReader, roots: dict[int, tuple[int,
         "fragmented_files": fragmented_files,
         "fragmented_directories": 0,
         "fragmentation_percent": 100.0 * fragmented_files / max(1, regular_files),
-        "fragmented_ranges": _merge_ranges(fragmented_physical),
+        "fragmented_ranges": merge_ranges(fragmented_physical),
         "filesystem_roots_scanned": len(root_ids),
         "filesystem_tree_blocks": fs_tree_blocks,
         "malformed_items": malformed_items,
@@ -651,7 +630,7 @@ def kernel_chunk_layout(fd: int, total_bytes: int, devid: int) -> tuple[_Mapper,
         for stripe_devid, stripe_offset in chunk.stripes:
             if stripe_devid == devid:
                 physical.append((stripe_offset, stripe_offset + chunk.length))
-    return mapper, _merge_ranges(physical), {
+    return mapper, merge_ranges(physical), {
         "tree_search_calls": search.calls,
         "tree_search_items": search.items_returned,
         "tree_search_payload_bytes": search.payload_bytes,
@@ -801,7 +780,7 @@ def _kernel_scan_filesystem_trees(search: _KernelTreeSearch,
         "fragmented_files": fragmented_files,
         "fragmented_directories": 0,
         "fragmentation_percent": 100.0 * fragmented_files / max(1, regular_files),
-        "fragmented_ranges": _merge_ranges(fragmented_physical),
+        "fragmented_ranges": merge_ranges(fragmented_physical),
         "filesystem_roots_scanned": len(root_ids),
         "malformed_items": malformed_items,
     }
@@ -843,7 +822,7 @@ def _kernel_map(path: str, cells: int) -> dict:
                 if mirror + _SUPER_SIZE <= total_bytes:
                     used_bytes_ranges.append((mirror, mirror + _SUPER_SIZE))
 
-            used_units = _merge_ranges([
+            used_units = merge_ranges([
                 (start // sectorsize, (end + sectorsize - 1) // sectorsize)
                 for start, end in used_bytes_ranges
             ])
@@ -852,7 +831,7 @@ def _kernel_map(path: str, cells: int) -> dict:
                 (max(0, start), min(total_units, end)) for start, end in used_units
                 if start < total_units and end > 0
             ]
-            free_units = _complement(total_units, used_units)
+            free_units = complement_ranges(total_units, used_units)
             ranges = [(start, end, 0) for start, end in free_units]
             ranges.extend((start, end, 1) for start, end in used_units)
 
@@ -868,11 +847,11 @@ def _kernel_map(path: str, cells: int) -> dict:
                 },
             )
             summary = _kernel_scan_filesystem_trees(search, roots, mapper)
-            fragmented_units = _merge_ranges([
+            fragmented_units = merge_ranges([
                 (start // sectorsize, (end + sectorsize - 1) // sectorsize)
                 for start, end in summary["fragmented_ranges"]
             ])
-            fragmented_mapped = _overlay_ranges(result["cells"], fragmented_units, "fragmented")
+            fragmented_mapped = overlay_ranges(result["cells"], fragmented_units, "fragmented")
             result.update({
                 "regular_files": summary["regular_files"],
                 "directories": summary["directories"],
@@ -899,7 +878,7 @@ def _kernel_map(path: str, cells: int) -> dict:
             os.close(fd)
 
 
-class BtrfsBackend:
+class BtrfsBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:
@@ -983,14 +962,14 @@ class BtrfsBackend:
                 if mirror + _SUPER_SIZE <= total_bytes:
                     used_bytes_ranges.append((mirror, mirror + _SUPER_SIZE))
 
-            used_units = _merge_ranges([
+            used_units = merge_ranges([
                 (start // sectorsize, (end + sectorsize - 1) // sectorsize)
                 for start, end in used_bytes_ranges
             ])
             total_units = (total_bytes + sectorsize - 1) // sectorsize
             used_units = [(max(0, start), min(total_units, end)) for start, end in used_units
                           if start < total_units and end > 0]
-            free_units = _complement(total_units, used_units)
+            free_units = complement_ranges(total_units, used_units)
             ranges = [(start, end, 0) for start, end in free_units]
             ranges.extend((start, end, 1) for start, end in used_units)
 
@@ -1020,11 +999,11 @@ class BtrfsBackend:
                 result["details"]["fragmentation_note"] = str(exc)
                 return result
 
-            fragmented_units = _merge_ranges([
+            fragmented_units = merge_ranges([
                 (start // sectorsize, (end + sectorsize - 1) // sectorsize)
                 for start, end in summary["fragmented_ranges"]
             ])
-            fragmented_mapped = _overlay_ranges(result["cells"], fragmented_units, "fragmented")
+            fragmented_mapped = overlay_ranges(result["cells"], fragmented_units, "fragmented")
             result.update({
                 "regular_files": summary["regular_files"],
                 "directories": summary["directories"],

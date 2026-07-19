@@ -31,13 +31,20 @@ import signal
 import stat
 import struct
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-33"
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from core.devices import is_mounted
+from core.journal import fsync_directory, write_json_journal
+from version import VERSION
+
+ENGINE_VERSION = VERSION
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -264,12 +271,7 @@ def _device_size(path: str) -> int:
 
 
 def _is_mounted(path: str) -> bool:
-    st = os.stat(path)
-    if not stat.S_ISBLK(st.st_mode):
-        return False
-    dev = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
-    with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as stream:
-        return any(len(fields := line.split()) > 2 and fields[2] == dev for line in stream)
+    return is_mounted(path)
 
 
 def _open_volume(path: str, write: bool) -> Volume:
@@ -1632,33 +1634,8 @@ def _copy_runs(volume: Volume, runs: Iterable[Run], destination_lcn: int, cluste
     _copy_run_sequences(volume, source_runs, (Run(destination_lcn, clusters),))
 
 
-def _fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _write_journal(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(state, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-
+    write_json_journal(path, state, trailing_newline=True)
 
 def _read_journal(path: Path) -> dict:
     try:
@@ -1673,7 +1650,7 @@ def _read_journal(path: Path) -> dict:
 def _remove_journal(path: Path) -> None:
     try:
         path.unlink()
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
     except FileNotFoundError:
         pass
 

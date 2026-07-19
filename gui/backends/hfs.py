@@ -11,13 +11,21 @@ import subprocess
 from pathlib import Path
 
 from .base import (BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, CAP_COMPACT,
-                   CAP_DEFRAG, CAP_RECOVER, Reader, aggregate_bitmap, u16be, u32be)
+                   CAP_DEFRAG, CAP_RECOVER, FilesystemBackend, Reader, aggregate_bitmap, operation, u16be, u32be)
 
-INFO = BackendInfo("hfs", "Apple HFS", ("hfs",),
-                   CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER, "exact")
+INFO = BackendInfo(
+    "hfs", "Apple HFS", ("hfs",),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER,
+    "exact",
+    (
+        operation("compact", "apple"),
+        operation("defrag", "apple"),
+        operation("recover", "apple"),
+    ),
+)
 
 
-class HFSBackend:
+class HFSBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:

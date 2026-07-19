@@ -12,7 +12,10 @@ from __future__ import annotations
 import os
 import re
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_MAP, FilesystemBackend, Reader,
+    aggregate_ranges, u32le,
+)
 
 INFO = BackendInfo(
     "swap",
@@ -74,7 +77,7 @@ def _state_ranges(total_units: int, bad_pages: list[int], active: bool) -> list[
     return ranges
 
 
-class SwapBackend:
+class SwapBackend(FilesystemBackend):
     info = INFO
 
     def _header(self, reader: Reader):

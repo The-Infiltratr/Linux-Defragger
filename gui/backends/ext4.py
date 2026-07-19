@@ -11,9 +11,28 @@ from __future__ import annotations
 
 import struct
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_MAP, FilesystemBackend, Reader,
+    count_set_bits, merge_ranges, operation, overlay_ranges, u16le, u32le,
+)
 
-INFO = BackendInfo("ext4", "ext2/3/4", ("ext2", "ext3", "ext4"), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact")
+INFO = BackendInfo(
+    "ext4", "ext2/3/4", ("ext2", "ext3", "ext4"),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT,
+    "exact",
+    (
+        operation(
+            "compact",
+            "linux-compact",
+            pass_filesystem=True,
+            warning=(
+                "EXT4 Compact is fully offline. It checks the filesystem, performs minimum-size "
+                "shrink and packing rounds, and leaves the verified compacted filesystem boundary "
+                "in place without changing the partition table."
+            ),
+        ),
+    ),
+)
 
 _EXT4_EXTENTS_FL = 0x00080000
 _EXT4_INLINE_DATA_FL = 0x10000000
@@ -32,37 +51,8 @@ _MAX_EXTENT_DEPTH = 5
 _MAX_INDIRECT_DEPTH = 3
 
 
-def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if start < 0 or end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
-def _overlay_ranges(cells: list[dict], ranges: list[tuple[int, int]], field: str) -> int:
-    """Overlay merged filesystem-block ranges onto the allocation-map cells."""
-    merged = _merge_ranges(ranges)
-    range_index = 0
-    total = sum(end - start for start, end in merged)
-    for cell in cells:
-        start = int(cell["start"])
-        end_ex = int(cell["end"]) + 1
-        while range_index < len(merged) and merged[range_index][1] <= start:
-            range_index += 1
-        overlap = 0
-        check = range_index
-        while check < len(merged) and merged[check][0] < end_ex:
-            overlap += max(0, min(end_ex, merged[check][1]) - max(start, merged[check][0]))
-            if merged[check][1] > end_ex:
-                break
-            check += 1
-        cell[field] = min(int(cell.get("used", 0)), overlap)
-    return total
 
 
 def _extent_length(raw: int) -> int:
@@ -314,13 +304,13 @@ def _scan_fragmentation(reader: Reader, descriptors: list[dict], block_size: int
         "fragmentation_percent": 100.0 * fragmented_files / max(1, regular_files),
         "inodes_scanned": inodes_scanned,
         "malformed_inodes": malformed_inodes,
-        "fragmented_ranges": _merge_ranges(fragmented_ranges),
-        "directory_ranges": _merge_ranges(directory_ranges),
-        "reserved_inode_ranges": _merge_ranges(reserved_inode_ranges),
+        "fragmented_ranges": merge_ranges(fragmented_ranges),
+        "directory_ranges": merge_ranges(directory_ranges),
+        "reserved_inode_ranges": merge_ranges(reserved_inode_ranges),
     }
 
 
-class ExtBackend:
+class ExtBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:
@@ -500,14 +490,14 @@ class ExtBackend:
                 details["fragmentation_note"] = str(exc)
                 return result
 
-            fragmented_blocks = _overlay_ranges(
+            fragmented_blocks = overlay_ranges(
                 result["cells"], summary["fragmented_ranges"], "fragmented"
             )
-            directory_blocks = _overlay_ranges(
+            directory_blocks = overlay_ranges(
                 result["cells"], summary["directory_ranges"], "directory"
             )
             reserved_ranges.extend(summary["reserved_inode_ranges"])
-            reserved_blocks = _overlay_ranges(
+            reserved_blocks = overlay_ranges(
                 result["cells"], reserved_ranges, "bad"
             )
             result.update({

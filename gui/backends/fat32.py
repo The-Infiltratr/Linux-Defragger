@@ -8,4 +8,6 @@
 """FAT32 backend declaration using the shared FAT implementation."""
 
 from .fat_common import FatBackend
+
+
 BACKEND = FatBackend(32)

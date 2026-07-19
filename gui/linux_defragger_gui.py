@@ -28,6 +28,17 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from version import VERSION
+from backends.base import (
+    CAP_ANALYSE,
+    CAP_COMPACT,
+    CAP_DEFRAG,
+    CAP_GROWTH_DEFRAG,
+    CAP_LIVE_MAP,
+    CAP_MAP,
+    CAP_RECOVER,
+)
+from core.operations import build_standard_arguments
+from core.paths import resolve_program
 
 try:
     import gi
@@ -49,14 +60,8 @@ APP_NAME = "Linux Defragger"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
-CAP_ANALYSE = 1 << 0
-CAP_MAP = 1 << 1
-CAP_COMPACT = 1 << 2
-CAP_DEFRAG = 1 << 3
-CAP_RECOVER = 1 << 4
-CAP_LIVE_MAP = 1 << 5
-CAP_GROWTH_DEFRAG = 1 << 6
 BACKEND_CAPABILITIES: dict[str, int] = {}
+BACKEND_OPERATIONS: dict[str, dict[str, dict[str, Any]]] = {}
 # Linux filesystem names are normalised to backend identifiers here.
 SUPPORTED_FILESYSTEMS = {
     "vfat": "fat",
@@ -103,68 +108,19 @@ def state_dir() -> Path:
     return target
 
 
-def _configured_executable(variable: str, installed_path: str, description: str) -> str:
-    candidate = os.environ.get(variable, installed_path)
-    path = Path(candidate)
-    if path.is_file() and os.access(path, os.X_OK):
-        return str(path)
-    raise FileNotFoundError(f"Could not locate {description}: {path}")
-
-
-def find_engine() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_ENGINE",
-        "/usr/bin/linux-defragger-engine",
-        "the Linux Defragger engine",
-    )
+PROGRAM_ANCHOR = Path(__file__).resolve().parent / "core"
 
 
 def find_mapper() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_MAPPER",
-        "/usr/lib/linux-defragger/allocation_mapper.py",
-        "the allocation mapper",
-    )
+    return resolve_program("mapper", anchor=PROGRAM_ANCHOR)
 
 
-def find_exfat_engine() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_EXFAT_ENGINE",
-        "/usr/lib/linux-defragger/exfat_engine.py",
-        "the native exFAT engine",
-    )
-
-
-def find_apple_engine() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_APPLE_ENGINE",
-        "/usr/lib/linux-defragger/apple_engine.py",
-        "the native Apple filesystem engine",
-    )
-
-
-def find_ntfs_engine() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_NTFS_ENGINE",
-        "/usr/lib/linux-defragger/ntfs_engine.py",
-        "the native NTFS maintenance engine",
-    )
-
-
-def find_native_compact_engine() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_NATIVE_COMPACT_ENGINE",
-        "/usr/lib/linux-defragger/native_compact_engine.py",
-        "the native ext4, XFS and Btrfs compact engine",
-    )
+def find_operation_engine() -> str:
+    return resolve_program("operation-engine", anchor=PROGRAM_ANCHOR)
 
 
 def find_privileged_helper() -> str:
-    return _configured_executable(
-        "LINUX_DEFRAGGER_HELPER",
-        "/usr/lib/linux-defragger/privileged_helper.py",
-        "the privileged helper",
-    )
+    return resolve_program("helper", anchor=PROGRAM_ANCHOR)
 
 
 @dataclass
@@ -188,15 +144,6 @@ class Volume:
     @property
     def normalized_fstype(self) -> str:
         return SUPPORTED_FILESYSTEMS.get(self.fstype.lower(), self.fstype.lower())
-
-    @property
-    def is_fat(self) -> bool:
-        return self.normalized_fstype in {"fat", "fat12", "fat16", "fat32"}
-
-    @property
-    def is_fat32(self) -> bool:
-        """Compatibility alias: all supported FAT variants use the native FAT engine."""
-        return self.is_fat
 
     @property
     def capabilities(self) -> int:
@@ -440,17 +387,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.set_default_size(1050, 760)
         self.set_position(Gtk.WindowPosition.CENTER)
 
-        self.engine = find_engine()
         self.mapper = find_mapper()
+        self.operation_engine = find_operation_engine()
         self._load_backend_registry()
         self.privileged_helper = find_privileged_helper()
-        self.exfat_engine = find_exfat_engine()
-        self.apple_engine = find_apple_engine()
-        self.ntfs_engine = find_ntfs_engine()
-        self.native_compact_engine = find_native_compact_engine()
-        self.affs_engine = str(Path(__file__).resolve().parent / "affs_engine.py")
-        if not Path(self.affs_engine).is_file():
-            self.affs_engine = "/usr/lib/linux-defragger/affs_engine.py"
         self.volumes: list[Volume] = []
         self.current_volume: Volume | None = None
         self.map_data: dict[str, Any] | None = None
@@ -490,7 +430,7 @@ class MainWindow(Gtk.ApplicationWindow):
         """Read the installed native-engine version instead of duplicating its label."""
         try:
             result = subprocess.run(
-                [self.engine, "--version"], check=True, text=True,
+                [self.operation_engine, "--version"], check=True, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env={**os.environ, "LC_ALL": "C"},
             )
@@ -500,29 +440,36 @@ class MainWindow(Gtk.ApplicationWindow):
             return VERSION
 
     def _load_backend_registry(self) -> None:
-        global SUPPORTED_FILESYSTEMS, BACKEND_CAPABILITIES
+        global SUPPORTED_FILESYSTEMS, BACKEND_CAPABILITIES, BACKEND_OPERATIONS
         result = subprocess.run(
-            [self.mapper, "--list-backends"], check=True, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [self.mapper, "--list-backends"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env={**os.environ, "LC_ALL": "C"},
         )
         data = json.loads(result.stdout)
         aliases: dict[str, str] = {}
         capabilities: dict[str, int] = {}
+        operations: dict[str, dict[str, dict[str, Any]]] = {}
         for entry in data.get("backends", []):
             backend_id = str(entry["id"]).lower()
-            caps = int(entry.get("capabilities", 0))
-            capabilities[backend_id] = caps
+            capabilities[backend_id] = int(entry.get("capabilities", 0))
             aliases[backend_id] = backend_id
+            operations[backend_id] = {
+                str(item["name"]): dict(item) for item in entry.get("operations", [])
+            }
             for alias in entry.get("aliases", []):
                 aliases[str(alias).lower()] = backend_id
         # Linux normally reports all classic FAT variants as vfat. The native
-        # engine probes the precise FAT width after opening the volume.
+        # worker probes the precise FAT width after opening the volume.
         aliases.setdefault("vfat", "fat32")
         aliases.setdefault("fat", "fat32")
         aliases.setdefault("msdos", "fat32")
         SUPPORTED_FILESYSTEMS = aliases
         BACKEND_CAPABILITIES = capabilities
+        BACKEND_OPERATIONS = operations
 
     def _build_ui(self) -> None:
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -734,7 +681,7 @@ class MainWindow(Gtk.ApplicationWindow):
         dialog.set_comments(
             "Filesystem allocation analysis, free-space compaction, defragmentation, "
             "FAT and exFAT growth-space layouts and journalled recovery.\n"
-            f"Native engine: {self.engine_version}"
+            f"Operation engine: {self.engine_version}"
         )
         dialog.set_authors(["Shannon Smith"])
         dialog.set_website(PROJECT_URL)
@@ -1134,16 +1081,10 @@ class MainWindow(Gtk.ApplicationWindow):
         map_cells = target_cells if target_cells is not None else self._desired_map_cells()
         map_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(map_cells)))
 
-        if volume.is_fat32:
-            args = [
-                self.engine, "map", volume.path, "--cells", str(map_cells),
-                "--journal", self.journal_path(),
-            ]
-        else:
-            args = [
-                self.mapper, volume.path, "--fstype", volume.normalized_fstype,
-                "--cells", str(map_cells),
-            ]
+        args = [
+            self.mapper, volume.path, "--fstype", volume.normalized_fstype,
+            "--cells", str(map_cells),
+        ]
 
         def parsed(output: str) -> None:
             try:
@@ -1158,7 +1099,7 @@ class MainWindow(Gtk.ApplicationWindow):
             if volume.mounted:
                 self.status_label.set_text(self.status_label.get_text() + " · live mounted snapshot")
             if not quiet:
-                if volume.is_fat32:
+                if "cluster_size" in data:
                     self.append_log(
                         f"Analysis complete: {data['fragmented_files']} fragmented files, "
                         f"{data['fragmented_directories']} fragmented directories."
@@ -1241,100 +1182,44 @@ class MainWindow(Gtk.ApplicationWindow):
             self.show_error("No recovery journal", "There is no unfinished transaction for this volume.")
             return
 
-        descriptions = {
-            "defrag": "Rebuild fragmented files as contiguous runs without compacting free space.",
-            "compact": "Fill internal free-space gaps without attempting to defragment files.",
-            "growth-defrag": (
-                "FAT/exFAT: compact allocation, rebuild files contiguously in physical order, "
-                "and leave a 10% free expansion gap after each regular file."
-            ),
-            "recover": "Complete or roll back the interrupted journalled transaction.",
-        }
-        extra_warning = ""
-        if operation == "compact" and volume.normalized_fstype == "ext4":
-            extra_warning = (
-                "\n\nEXT4 Compact remains fully offline. It runs a filesystem check, temporarily "
-                "shrinks the complete filesystem to its minimum valid size so files, directories, "
-                "the journal and relocatable metadata are forced toward the beginning. It leaves the "
-                "verified minimum-size filesystem in place; the partition table is not changed and "
-                "the remaining physical partition tail is outside EXT4."
+        operation_manifest = BACKEND_OPERATIONS.get(volume.normalized_fstype, {}).get(operation)
+        if operation_manifest is None:
+            self.show_error(
+                "Operation unavailable",
+                f"The {volume.normalized_fstype.upper()} plugin did not provide a standard "
+                f"operation manifest for {operation}.",
             )
-        elif operation == "compact" and volume.normalized_fstype == "xfs":
-            extra_warning = (
-                "\n\nThis XFS Compact pass mounts the otherwise-unmounted volume privately and uses "
-                "the filesystem kernel driver to exchange high regular-file extents into low "
-                "free ranges. It may increase fragmentation and does not move filesystem metadata. "
-                "XFS range exchange requires Linux 6.10 or newer."
-            )
-        elif operation == "compact" and volume.normalized_fstype == "btrfs":
-            extra_warning = (
-                "\n\nBtrfs Compact temporarily shrinks the filesystem so the kernel "
-                "relocates high physical chunks into lower free chunk ranges, then restores "
-                "the exact original size. It does not run file defragmentation."
-            )
-        elif volume.normalized_fstype == "ntfs":
-            if operation == "compact":
-                extra_warning = (
-                    "\n\nNTFS Compact fills lower gaps using complete higher supported file and directory "
-                    "streams. Every moved stream is written as one contiguous extent, so Compact "
-                    "never creates fragmentation merely to consume a small hole."
-                )
-            elif operation == "defrag":
-                extra_warning = (
-                    "\n\nNTFS Defragment rebuilds each supported fragmented stream as one "
-                    "contiguous extent in the lowest suitable free run. Higher free space is used "
-                    "only as temporary staging, followed by downward settling passes."
-                )
-            else:
-                extra_warning = (
-                    "\n\nNTFS Recover completes or rolls back the one journalled native NTFS "
-                    "file transaction that was interrupted."
-                )
-        operation_names = {
-            "compact": "Compact",
-            "defrag": "Defragment",
-            "growth-defrag": "Growth Defrag",
-            "recover": "Recover",
-        }
+            return
+        description = str(operation_manifest.get("description") or operation)
+        warning = str(operation_manifest.get("warning") or "")
+        extra_warning = f"\n\n{warning}" if warning else ""
+        operation_name = str(operation_manifest.get("label") or operation.replace("-", " ").title())
         if not self.confirm(
-            f"{operation_names[operation]} {volume.path}?",
-            f"{descriptions[operation]}{extra_warning}\n\nThe volume must remain connected and unmounted. "
-            "A clean Stop request finishes the active transaction before exiting.",
+            f"{operation_name} {volume.path}?",
+            f"{description}{extra_warning}\n\nThe volume must remain connected and unmounted. "
+            "A clean Stop request finishes the active journalled transaction before exiting.",
         ):
             return
 
-        operation_engine = (self.exfat_engine if volume.normalized_fstype == "exfat" else
-                            self.affs_engine if volume.normalized_fstype == "affs" else
-                            self.apple_engine if volume.normalized_fstype in {"hfs", "hfsplus"} else
-                            self.ntfs_engine if volume.normalized_fstype == "ntfs" else
-                            self.native_compact_engine if (
-                                operation == "compact" and volume.normalized_fstype in {"ext4", "btrfs", "xfs"}
-                            ) else self.engine)
-        args = [operation_engine, operation, volume.path, "--write", "--confirm", volume.path, "--journal", journal]
-        if operation_engine == self.native_compact_engine:
-            args += ["--filesystem", volume.normalized_fstype]
+        args = [
+            self.operation_engine,
+            operation,
+            volume.path,
+            "--filesystem",
+            volume.normalized_fstype,
+            "--write",
+            "--confirm",
+            volume.path,
+            "--journal",
+            journal,
+        ]
         live_cells = len(self.map_data.get("cells", [])) if self.map_data else self._desired_map_cells()
         live_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(live_cells)))
-        if operation == "defrag":
-            if volume.normalized_fstype == "ntfs":
-                args += ["--ram-buffer", "auto", "--workers", "auto",
-                         "--live-map-cells", str(live_cells)]
-            else:
-                args += ["--transaction-files", "32", "--ram-buffer", "auto", "--workers", "auto",
-                         "--live-map-cells", str(live_cells)]
-        elif operation == "growth-defrag":
-            args += ["--growth-percent", "10", "--batch-clusters", "4096",
-                     "--ram-buffer", "auto", "--workers", "auto",
-                     "--live-map-cells", str(live_cells)]
-        elif operation == "compact":
-            args += ["--ram-buffer", "auto", "--workers", "auto",
-                     "--live-map-cells", str(live_cells)]
-        else:
-            args += ["--ram-buffer", "auto", "--workers", "auto"]
+        args.extend(build_standard_arguments(operation, live_cells))
 
         self.map_cache.pop(volume.path, None)
         self.clear_log()
-        self.append_log(f"Starting {operation_names[operation]} on {volume.path}…")
+        self.append_log(f"Starting {operation_name} on {volume.path}…")
         self._run_command(
             args,
             privileged=not volume.image or not os.access(volume.path, os.R_OK | os.W_OK),
@@ -1366,20 +1251,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _helper_program_and_args(self, args: list[str]) -> tuple[str, list[str]]:
         executable = os.path.realpath(args[0])
-        if executable == os.path.realpath(self.engine):
-            return "engine", args[1:]
         if executable == os.path.realpath(self.mapper):
             return "mapper", args[1:]
-        if executable == os.path.realpath(self.exfat_engine):
-            return "exfat-engine", args[1:]
-        if executable == os.path.realpath(self.affs_engine):
-            return "affs-engine", args[1:]
-        if executable == os.path.realpath(self.apple_engine):
-            return "apple-engine", args[1:]
-        if executable == os.path.realpath(self.ntfs_engine):
-            return "ntfs-engine", args[1:]
-        if executable == os.path.realpath(self.native_compact_engine):
-            return "native-compact-engine", args[1:]
+        if executable == os.path.realpath(self.operation_engine):
+            return "operation-engine", args[1:]
         if os.path.basename(args[0]) == "udisksctl":
             return "udisksctl", args[1:]
         raise RuntimeError(f"The privileged helper does not permit: {args[0]}")

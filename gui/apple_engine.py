@@ -26,6 +26,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from core.devices import is_mounted
+from core.journal import write_json_journal
+from version import VERSION
+
 STOP = False
 
 
@@ -58,37 +66,10 @@ def pack32(value: int) -> bytes:
 
 
 def mounted(path: str) -> bool:
-    real = os.path.realpath(path)
-    try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                parts = line.rstrip().split(" - ", 1)
-                if len(parts) != 2:
-                    continue
-                tail = parts[1].split()
-                source = tail[1] if len(tail) > 1 else ""
-                if source and os.path.realpath(source) == real:
-                    return True
-    except OSError:
-        pass
-    return False
-
+    return is_mounted(path)
 
 def journal_write(path: str, obj: dict) -> None:
-    tmp = path + ".tmp"
-    parent = Path(path).parent
-    parent.mkdir(parents=True, exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, separators=(",", ":"), sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    dfd = os.open(str(parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
-
+    write_json_journal(path, obj)
 
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
@@ -730,6 +711,7 @@ def operation(device: str, mode: str, journal: str, max_files: int | None,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Linux Defragger Apple filesystem engine")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("operation", choices=("defrag", "compact", "recover"))
     parser.add_argument("device")
     parser.add_argument("--write", action="store_true")

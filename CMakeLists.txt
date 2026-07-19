@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(linux_defragger VERSION 1.8.0 LANGUAGES C)
 
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/gui/version.py" VERSION_LINE
+     REGEX "^VERSION = \"[^\"]+\"")
+string(REGEX REPLACE "^VERSION = \"([^\"]+)\".*" "\\1"
+       LINUX_DEFRAGGER_PACKAGE_VERSION "${VERSION_LINE}")
+if(NOT LINUX_DEFRAGGER_PACKAGE_VERSION)
+    message(FATAL_ERROR "Could not read Linux Defragger version from gui/version.py")
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
@@ -8,7 +16,10 @@ find_package(Threads REQUIRED)
 add_executable(linux-defragger-engine src/linux_defragger_engine.c)
 target_link_libraries(linux-defragger-engine PRIVATE Threads::Threads)
 target_compile_options(linux-defragger-engine PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2)
-target_compile_definitions(linux-defragger-engine PRIVATE _FILE_OFFSET_BITS=64 _GNU_SOURCE)
+target_compile_definitions(linux-defragger-engine PRIVATE
+    _FILE_OFFSET_BITS=64
+    _GNU_SOURCE
+    PROGRAM_VERSION="${LINUX_DEFRAGGER_PACKAGE_VERSION}")
 
 set(HFSUTILS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hfsutils-3.2.6)
 set(HFSUTILS_LIB_DIR ${HFSUTILS_DIR}/libhfs)
@@ -38,12 +49,16 @@ set_target_properties(linux-defragger-hfs-engine PROPERTIES OUTPUT_NAME hfs_engi
 
 install(TARGETS linux-defragger-engine RUNTIME DESTINATION bin)
 install(TARGETS linux-defragger-hfs-engine RUNTIME DESTINATION lib/linux-defragger)
-install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py
+install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py gui/operation_engine.py
                  gui/exfat_engine.py gui/affs_engine.py gui/apple_engine.py gui/ntfs_engine.py gui/native_compact_engine.py
         DESTINATION lib/linux-defragger)
 install(FILES gui/version.py DESTINATION lib/linux-defragger)
+install(FILES gui/core/__init__.py gui/core/devices.py gui/core/journal.py
+              gui/core/operations.py gui/core/paths.py
+        DESTINATION lib/linux-defragger/core)
 install(FILES
-    gui/backends/__init__.py gui/backends/base.py gui/backends/registry.py
+    gui/backends/__init__.py gui/backends/base.py gui/backends/contracts.py
+    gui/backends/io.py gui/backends/ranges.py gui/backends/registry.py
     gui/backends/fat_common.py gui/backends/fat12.py gui/backends/fat16.py
     gui/backends/fat32.py gui/backends/exfat.py gui/backends/ntfs.py
     gui/backends/ext4.py gui/backends/btrfs.py gui/backends/xfs.py
@@ -65,5 +80,6 @@ endif()
 install(DIRECTORY vendor/amitools DESTINATION lib/linux-defragger/vendor
         PATTERN "__pycache__" EXCLUDE
         PATTERN "*.pyc" EXCLUDE)
-install(FILES README.md RELEASE_NOTES.md TEST_STATUS.md DESTINATION share/doc/linux-defragger)
+install(FILES README.md RELEASE_NOTES.md TEST_STATUS.md docs/BACKEND_ABI.md docs/DESIGN.md
+        DESTINATION share/doc/linux-defragger)
 install(FILES vendor/hfsutils-3.2.6/COPYING DESTINATION share/doc/linux-defragger RENAME COPYING.hfsutils)

@@ -11,7 +11,10 @@ import os
 import sys
 from pathlib import Path
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_DEFRAG, CAP_MAP, CAP_RECOVER,
+    FilesystemBackend, aggregate_states, operation,
+)
 
 _HERE = Path(__file__).resolve()
 _VENDOR_CANDIDATES = (
@@ -34,6 +37,11 @@ INFO = BackendInfo(
     ("affs", "amiga", "ofs", "ffs", "dostype"),
     CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER,
     "exact",
+    (
+        operation("compact", "affs"),
+        operation("defrag", "affs"),
+        operation("recover", "affs"),
+    ),
 )
 
 _VARIANTS = {
@@ -64,7 +72,7 @@ def _extent_count(blocks: list[int]) -> int:
     return 1 + sum(1 for left, right in zip(blocks, blocks[1:]) if right != left + 1)
 
 
-class AffsBackend:
+class AffsBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:

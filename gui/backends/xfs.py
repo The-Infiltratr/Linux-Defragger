@@ -13,9 +13,29 @@ from __future__ import annotations
 import stat
 from dataclasses import dataclass
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_MAP, FilesystemBackend, Reader,
+    aggregate_ranges, complement_ranges, merge_ranges, operation, overlay_ranges, u16be, u32be,
+    u64be,
+)
 
-INFO = BackendInfo("xfs", "XFS", ("xfs",), CAP_ANALYSE | CAP_MAP | CAP_COMPACT, "exact")
+INFO = BackendInfo(
+    "xfs", "XFS", ("xfs",),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT,
+    "exact",
+    (
+        operation(
+            "compact",
+            "linux-compact",
+            pass_filesystem=True,
+            warning=(
+                "XFS Compact privately mounts the volume, reserves the free map and atomically "
+                "swaps complete movable files into lower ranges. XFS metadata and unsupported "
+                "special mappings remain fixed."
+            ),
+        ),
+    ),
+)
 
 _XFS_SB_MAGIC = b"XFSB"
 _XFS_AGF_MAGIC = b"XAGF"
@@ -49,50 +69,10 @@ class _Extent:
     unwritten: bool = False
 
 
-def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(ranges):
-        if start < 0 or end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
-def _complement(total: int, free: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    used: list[tuple[int, int]] = []
-    cursor = 0
-    for start, end in _merge_ranges(free):
-        start = max(0, min(total, start))
-        end = max(0, min(total, end))
-        if start > cursor:
-            used.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < total:
-        used.append((cursor, total))
-    return used
 
 
-def _overlay_ranges(cells: list[dict], ranges: list[tuple[int, int]], field: str) -> int:
-    merged = _merge_ranges(ranges)
-    index = 0
-    total = sum(end - start for start, end in merged)
-    for cell in cells:
-        start = int(cell["start"])
-        end_ex = int(cell["end"]) + 1
-        while index < len(merged) and merged[index][1] <= start:
-            index += 1
-        overlap = 0
-        check = index
-        while check < len(merged) and merged[check][0] < end_ex:
-            overlap += max(0, min(end_ex, merged[check][1]) - max(start, merged[check][0]))
-            if merged[check][1] > end_ex:
-                break
-            check += 1
-        cell[field] = min(int(cell.get("used", 0)), overlap)
-    return total
 
 
 def _decode_bmbt_record(data: bytes, offset: int, agblocks: int,
@@ -367,7 +347,7 @@ def _free_space(reader: Reader, g: _XfsGeometry) -> tuple[list[tuple[int, int]],
             "free_extents": extents,
             "free_count_matches_agf": actual_free == freeblks,
         })
-    return _merge_ranges(free_ranges), ag_details, btree_blocks
+    return merge_ranges(free_ranges), ag_details, btree_blocks
 
 
 def _inode_records(reader: Reader, g: _XfsGeometry, agno: int) -> tuple[list[tuple[int, int, int]], int]:
@@ -484,12 +464,12 @@ def _scan_inodes(reader: Reader, g: _XfsGeometry) -> dict:
         "realtime_inodes": realtime_inodes,
         "inobt_blocks": inobt_blocks,
         "bmap_blocks": bmap.blocks_read,
-        "fragmented_ranges": _merge_ranges(fragmented_ranges),
-        "directory_ranges": _merge_ranges(directory_ranges),
+        "fragmented_ranges": merge_ranges(fragmented_ranges),
+        "directory_ranges": merge_ranges(directory_ranges),
     }
 
 
-class XfsBackend:
+class XfsBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:
@@ -503,7 +483,7 @@ class XfsBackend:
                 raise BackendError("not an XFS volume")
             g = _XfsGeometry(superblock, reader.size)
             free_ranges, ag_details, bnobt_blocks = _free_space(reader, g)
-            used_ranges = _complement(g.dblocks, free_ranges)
+            used_ranges = complement_ranges(g.dblocks, free_ranges)
             ranges = [(start, end, 0) for start, end in free_ranges]
             ranges.extend((start, end, 1) for start, end in used_ranges)
             result = aggregate_ranges(
@@ -532,10 +512,10 @@ class XfsBackend:
                 result["details"]["fragmentation_note"] = str(exc)
                 return result
 
-            fragmented_blocks = _overlay_ranges(
+            fragmented_blocks = overlay_ranges(
                 result["cells"], summary["fragmented_ranges"], "fragmented"
             )
-            directory_blocks = _overlay_ranges(
+            directory_blocks = overlay_ranges(
                 result["cells"], summary["directory_ranges"], "directory"
             )
             result.update({

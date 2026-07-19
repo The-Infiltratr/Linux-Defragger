@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/linux-defragger-engine.dir/link.d "CMakeFiles/linux-defragger-engine.dir/src/linux_defragger_engine.c.o" -o linux-defragger-engine

@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 from __future__ import annotations
 import heapq
+import ctypes
+import errno
 import io
 import json
 import os
@@ -45,6 +47,108 @@ def test_ioctl_layouts():
         'amount': b'7:123456789',
     }
 
+
+
+
+def test_legacy_xfs_ioctl_abi_layouts():
+    assert ctypes.sizeof(n._XfsBstat) == 136
+    assert ctypes.sizeof(n._XfsSwapext) == 192
+    assert ctypes.sizeof(n._XfsFsopBulkreq) == 32
+    assert n.XFS_IOC_FSBULKSTAT_SINGLE == 0xC0205866
+    assert n.XFS_IOC_SWAPEXT == 0xC0C0586D
+
+
+def test_modern_xfs_exchange_unavailable_selects_fallback_signal():
+    original = n.fcntl.ioctl
+    try:
+        def unsupported(*_args, **_kwargs):
+            raise OSError(errno.ENOTTY, 'unsupported')
+        n.fcntl.ioctl = unsupported
+        try:
+            n._xfs_exchange(3, 4, 0, 0, 4096)
+        except n.XfsRangeExchangeUnavailable:
+            pass
+        else:
+            raise AssertionError('modern XFS exchange did not request the fallback')
+    finally:
+        n.fcntl.ioctl = original
+
+
+def test_legacy_xfs_swapext_request_is_whole_file_and_atomic():
+    captured = {}
+    source_stat = n._XfsBstat()
+    source_stat.bs_ino = 12345
+    source_stat.bs_size = 65536
+    original = n._ctypes_ioctl
+    try:
+        def capture(fd, request_code, request):
+            captured['fd'] = fd
+            captured['request_code'] = request_code
+            captured['version'] = request.sx_version
+            captured['target'] = request.sx_fdtarget
+            captured['temporary'] = request.sx_fdtmp
+            captured['offset'] = request.sx_offset
+            captured['length'] = request.sx_length
+            captured['inode'] = request.sx_stat.bs_ino
+        n._ctypes_ioctl = capture
+        n._xfs_legacy_swapext(17, 19, source_stat, 65536)
+    finally:
+        n._ctypes_ioctl = original
+    assert captured == {
+        'fd': 17,
+        'request_code': n.XFS_IOC_SWAPEXT,
+        'version': 0,
+        'target': 17,
+        'temporary': 19,
+        'offset': 0,
+        'length': 65536,
+        'inode': 12345,
+    }
+
+
+def test_xfs_compact_uses_legacy_whole_file_path_without_modern_probe():
+    calls = []
+    original_geometry = n.xfs_compact_geometry
+    original_mount = n.PrivateMount
+    original_modern = n._compact_extent_pass
+    original_legacy = n._xfs_legacy_compact_pass
+    original_stop = n._stop_requested
+
+    class FakeMount:
+        def __init__(self, *_args):
+            pass
+        def __enter__(self):
+            return '/fake-xfs'
+        def __exit__(self, *_args):
+            return False
+
+    try:
+        n.xfs_compact_geometry = lambda _device: (4096, 1024 * 1024)
+        n.PrivateMount = FakeMount
+        def modern(*_args, **_kwargs):
+            calls.append('modern')
+            raise AssertionError('XFS must not use fragment-producing range packing')
+        def legacy(*_args, **_kwargs):
+            calls.append('legacy')
+            return n.ExtentPassResult(blocked_reason='fixed point')
+        n._compact_extent_pass = modern
+        n._xfs_legacy_compact_pass = legacy
+        n._stop_requested = False
+        output = io.StringIO()
+        with redirect_stdout(output):
+            summary = n._run_extent_compaction('/dev/test', 'xfs')
+    finally:
+        n.xfs_compact_geometry = original_geometry
+        n.PrivateMount = original_mount
+        n._compact_extent_pass = original_modern
+        n._xfs_legacy_compact_pass = original_legacy
+        n._stop_requested = original_stop
+
+    assert calls == ['legacy']
+    assert summary.final_reason == 'fixed point'
+    report = output.getvalue()
+    assert 'does not require the Linux 6.10 range-exchange interface' in report
+    assert 'without increasing their fragment count' in report
 
 
 def test_native_compact_argument_parser_is_present_and_accepts_gui_abi():
@@ -111,11 +215,10 @@ def test_backend_capabilities():
 def test_gui_and_helper_dispatch_are_wired():
     gui = (ROOT / 'gui' / 'linux_defragger_gui.py').read_text()
     helper = (ROOT / 'gui' / 'privileged_helper.py').read_text()
-    assert 'find_native_compact_engine' in gui
-    assert 'native-compact-engine' in gui
-    assert 'volume.normalized_fstype in {"ext4", "btrfs", "xfs"}' in gui
-    assert 'NATIVE_COMPACT_ENGINE' in helper
-    assert 'native-compact-engine' in helper
+    assert 'self.operation_engine' in gui
+    assert 'find_native_compact_engine' not in gui
+    assert 'program == "operation-engine"' in helper
+    assert 'NATIVE_COMPACT_ENGINE' not in helper
 
 
 def test_collector_uses_total_free_blocks_including_privileged_reserve():
@@ -137,16 +240,13 @@ def test_collector_uses_total_free_blocks_including_privileged_reserve():
     responses = iter((Stats(10, 2), Stats(1, 1)))
     original_statvfs = n.os.statvfs
     original_fsync = n.os.fsync
-    original_floor = n.COLLECTOR_FLOOR
     try:
         n.os.statvfs = lambda _path: next(responses)
         n.os.fsync = lambda _fd: None
-        n.COLLECTOR_FLOOR = 4096
-        allocated, transactions = collector.fill_available()
+        allocated, transactions = collector.fill_available(4096)
     finally:
         n.os.statvfs = original_statvfs
         n.os.fsync = original_fsync
-        n.COLLECTOR_FLOOR = original_floor
 
     assert allocated == 9 * 4096
     assert transactions == 1

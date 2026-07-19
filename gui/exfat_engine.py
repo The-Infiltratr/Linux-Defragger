@@ -13,6 +13,14 @@ import argparse, json, math, os, signal, struct, sys, tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from core.devices import is_mounted
+from core.journal import write_json_journal
+from version import VERSION
+
 EOC=0xFFFFFFFF
 STOP=False
 
@@ -181,10 +189,7 @@ def update_entry(v:Volume,e:Entry,new_first:int,new_nofat=True):
     v.write_stream(e.parent_clusters,data)
 
 def journal_write(path,obj):
-    tmp=path+'.tmp'
-    with open(tmp,'w') as f:json.dump(obj,f);f.flush();os.fsync(f.fileno())
-    os.replace(tmp,path)
-    d=os.open(str(Path(path).parent),os.O_RDONLY);os.fsync(d);os.close(d)
+    write_json_journal(path,obj)
 
 def recover(device,journal):
     if mounted(device): raise Error('refusing to recover a mounted exFAT volume')
@@ -290,20 +295,7 @@ def move_tail_cluster(v,e,index,destination,journal):
     v.flush_fat_bitmap();v.sync();os.unlink(journal)
 
 def mounted(path):
-    real=os.path.realpath(path)
-    try:
-        with open('/proc/self/mountinfo','r',encoding='utf-8',errors='replace') as fh:
-            for line in fh:
-                fields=line.rstrip().split(' - ',1)
-                if len(fields)!=2:
-                    continue
-                tail=fields[1].split()
-                src=tail[1] if len(tail)>1 else ''
-                if src and os.path.realpath(src)==real:
-                    return True
-    except OSError:
-        pass
-    return False
+    return is_mounted(path)
 
 def fragments(clusters):
     if not clusters: return 0
@@ -481,7 +473,7 @@ def command(device,op,journal,max_files=None):
     finally:v.close()
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('operation',choices=['defrag','compact','growth-defrag','recover']);ap.add_argument('device')
+    ap=argparse.ArgumentParser();ap.add_argument('--version',action='version',version=f'%(prog)s {VERSION}');ap.add_argument('operation',choices=['defrag','compact','growth-defrag','recover']);ap.add_argument('device')
     ap.add_argument('--write',action='store_true');ap.add_argument('--confirm');ap.add_argument('--journal',required=True);ap.add_argument('--max-files',type=int)
     ap.add_argument('--ram-buffer');ap.add_argument('--workers');ap.add_argument('--live-map-cells');ap.add_argument('--transaction-files');ap.add_argument('--growth-percent',type=int,default=10);ap.add_argument('--batch-clusters')
     a=ap.parse_args()

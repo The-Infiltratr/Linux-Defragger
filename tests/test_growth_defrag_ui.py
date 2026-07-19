@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
-# Linux Defragger
-# Author: Shannon Smith
-# Purpose: Verify the FAT-only Growth Defrag capability and GUI wiring.
+"""Verify Growth Defrag capability, plugin declarations and generic GUI wiring."""
 
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-gui = (ROOT / "gui" / "linux_defragger_gui.py").read_text()
-helper = (ROOT / "gui" / "privileged_helper.py").read_text()
-base = (ROOT / "gui" / "backends" / "base.py").read_text()
-fat = (ROOT / "gui" / "backends" / "fat_common.py").read_text()
+sys.path.insert(0, str(ROOT / "gui"))
 
-assert "CAP_GROWTH_DEFRAG = 1 << 6" in base
-assert "CAP_GROWTH_DEFRAG" in fat
-assert "growth_10_satisfied" in gui
-assert 'Gtk.Button.new_with_label("Growth Defrag")' in gui
-assert 'self.start_mutation("growth-defrag")' in gui
-assert '"--growth-percent", "10"' in gui
-assert '"growth-defrag"' in helper
-assert 'Growth Defrag status:          Not needed;' in gui
-assert 'Growth Defrag not needed · existing 10% growth-space layout verified' in gui
-assert 'FAT/exFAT' in gui
-assert 'stopped_safely = returncode == 130' in gui
-assert 'self.post_analysis_progress_text = "Stopped safely"' in gui
-assert 'Growth Defrag stopped safely · allocation map refreshed' not in gui
-assert 'f"{display_name} stopped safely · allocation map refreshed"' in gui
-print("FAT Growth Defrag GUI wiring test passed")
+from backends.contracts import CAP_GROWTH_DEFRAG
+from backends.exfat import BACKEND as EXFAT
+from backends.fat12 import BACKEND as FAT12
+from backends.fat16 import BACKEND as FAT16
+from backends.fat32 import BACKEND as FAT32
+from core.operations import build_standard_arguments
+
+GUI = (ROOT / "gui" / "linux_defragger_gui.py").read_text()
+HELPER = (ROOT / "gui" / "privileged_helper.py").read_text()
+
+for backend in (FAT12, FAT16, FAT32, EXFAT):
+    assert backend.info.capabilities & CAP_GROWTH_DEFRAG
+    operation = backend.info.operation("growth-defrag")
+    assert operation is not None
+
+arguments = build_standard_arguments("growth-defrag", 262080)
+assert arguments == [
+    "--growth-percent", "10",
+    "--batch-clusters", "4096",
+    "--ram-buffer", "auto",
+    "--workers", "auto",
+    "--live-map-cells", "262080",
+]
+assert "growth_10_satisfied" in GUI
+assert 'Gtk.Button.new_with_label("Growth Defrag")' in GUI
+assert 'self.start_mutation("growth-defrag")' in GUI
+assert 'program == "operation-engine"' in HELPER
+assert 'Growth Defrag status:          Not needed;' in GUI
+assert 'Growth Defrag not needed · existing 10% growth-space layout verified' in GUI
+assert 'stopped_safely = returncode == 130' in GUI
+assert 'self.post_analysis_progress_text = "Stopped safely"' in GUI
+assert 'f"{display_name} stopped safely · allocation map refreshed"' in GUI
+print("FAT/exFAT Growth Defrag plugin wiring test passed")

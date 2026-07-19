@@ -11,11 +11,25 @@ from __future__ import annotations
 
 import math
 
-from .base import *
+from .base import (
+    BackendError, BackendInfo, CAP_ANALYSE, CAP_COMPACT, CAP_DEFRAG, CAP_GROWTH_DEFRAG,
+    CAP_MAP, CAP_RECOVER, FilesystemBackend, Reader, aggregate_bitmap, operation, u16le, u32le,
+    u64le,
+)
 
-INFO = BackendInfo("exfat", "exFAT", ("exfat",), CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_DEFRAG|CAP_RECOVER|CAP_GROWTH_DEFRAG, "exact")
+INFO = BackendInfo(
+    "exfat", "exFAT", ("exfat",),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER | CAP_GROWTH_DEFRAG,
+    "exact",
+    (
+        operation("compact", "exfat"),
+        operation("defrag", "exfat"),
+        operation("growth-defrag", "exfat"),
+        operation("recover", "exfat"),
+    ),
+)
 
-class ExfatBackend:
+class ExfatBackend(FilesystemBackend):
     info = INFO
 
     def probe(self, path: str) -> bool:
