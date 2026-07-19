@@ -92,6 +92,92 @@ def test_gui_and_helper_dispatch_are_wired():
     assert 'native-compact-engine' in helper
 
 
+def test_collector_extents_keep_fd_and_logical_offsets():
+    collector = object.__new__(n.SpaceCollector)
+    collector.fds = [17]
+    collector.block_size = 4096
+    original = n.fiemap
+    try:
+        n.fiemap = lambda fd, start=0, length=(1 << 64) - 1, batch=512: [
+            n.FiemapExtent(logical=8192, physical=16384, length=12288, flags=0)
+        ]
+        extents = collector.owned_extents(1 << 30)
+    finally:
+        n.fiemap = original
+    assert len(extents) == 1
+    item = extents[0]
+    assert (item.fd, item.logical, item.physical, item.length) == (17, 8192, 16384, 12288)
+
+
+def test_collector_slice_verification_uses_existing_mapping():
+    collector = object.__new__(n.SpaceCollector)
+    collector.block_size = 4096
+    item = n.CollectorExtent(fd=19, logical=8192, physical=32768, length=16384, flags=0)
+    original = n.fiemap
+    try:
+        n.fiemap = lambda fd, start=0, length=(1 << 64) - 1, batch=512: [
+            n.FiemapExtent(logical=8192, physical=32768, length=16384, flags=0)
+        ]
+        collector.verify_slice(item, 12288, 36864, 4096)
+    finally:
+        n.fiemap = original
+
+
+def test_copy_range_supports_nonzero_donor_offset():
+    with tempfile.TemporaryDirectory() as directory:
+        source_path = Path(directory) / 'source-offset'
+        donor_path = Path(directory) / 'donor-offset'
+        source_path.write_bytes(b'abcdefgh')
+        donor_path.write_bytes(b'_' * 20)
+        source_fd = os.open(source_path, os.O_RDONLY)
+        donor_fd = os.open(donor_path, os.O_RDWR)
+        try:
+            n._copy_range(source_fd, 2, donor_fd, 4, 8)
+        finally:
+            os.close(source_fd)
+            os.close(donor_fd)
+        assert donor_path.read_bytes() == b'_' * 8 + b'cdef' + b'_' * 8
+
+
+def test_ext4_exchange_uses_collector_logical_offset():
+    original = n.fcntl.ioctl
+    captured = {}
+    def fake_ioctl(fd, request_code, request, mutate=True):
+        values = list(struct.unpack('=IIQQQQ', request))
+        captured['values'] = values[:]
+        values[5] = values[4]
+        request[:] = struct.pack('=IIQQQQ', *values)
+        return 0
+    try:
+        n.fcntl.ioctl = fake_ioctl
+        n._ext4_exchange(3, 4, 8192, 16384, 4096, 4096)
+    finally:
+        n.fcntl.ioctl = original
+    assert captured['values'][2:5] == [2, 4, 1]
+
+
+def test_xfs_exchange_uses_collector_logical_offset():
+    original = n.fcntl.ioctl
+    captured = {}
+    def fake_ioctl(fd, request_code, request):
+        captured['values'] = struct.unpack('=iIQQQQ', request)
+        return 0
+    try:
+        n.fcntl.ioctl = fake_ioctl
+        n._xfs_exchange(3, 4, 8192, 16384, 4096)
+    finally:
+        n.fcntl.ioctl = original
+    assert captured['values'][2:5] == (16384, 8192, 4096)
+
+
+def test_extent_compactor_does_not_allocate_second_donor_file():
+    source = (ROOT / 'gui' / 'native_compact_engine.py').read_text()
+    assert 'allocate_donor' not in source
+    assert 'punch_physical' not in source
+    assert 'collector.verify_slice' in source
+    assert '_copy_range(source_fd, source_offset, gap.fd, move, donor_logical)' in source
+
+
 if __name__ == '__main__':
     for name, value in sorted(globals().items()):
         if name.startswith('test_') and callable(value):

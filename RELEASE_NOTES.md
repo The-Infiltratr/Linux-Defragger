@@ -1,4 +1,13 @@
-# Linux Defragger 1.8.0-23
+# Linux Defragger 1.8.0-24
+
+- Fixes the first physical EXT4 Compact failure, where the space collector reserved the free-space map and then attempted to allocate a second donor file, causing `ENOSPC` despite abundant free space.
+- Uses the collector's already allocated low extents directly as exchange donors for both ext4 and XFS. No hole punch or second `fallocate` is performed after the collector pass.
+- Preserves the collector file descriptor, logical offset and physical offset for every reserved range and re-verifies that mapping immediately before each exchange.
+- Copies staged file data into the exact collector logical range, passes the nonzero donor offset to `EXT4_IOC_MOVE_EXT` or `XFS_IOC_EXCHANGE_RANGE`, and leaves the old high extent owned by the collector until final cleanup.
+- Raises the untouched free-space floor from 4 MiB to 64 MiB and uses `f_bavail` accounting, leaving room for filesystem metadata and kernel transactions.
+- Adds focused regression tests for collector mapping preservation, nonzero donor offsets, direct-donor request packing and the absence of the failed second-allocation path.
+
+# Revision 23
 
 - Adds native Compact capability to actual ext4, supported single-device Btrfs and XFS volumes. Existing FAT, exFAT, NTFS, Amiga and Apple compactors are unchanged.
 - Keeps Compact separate from Defragment: ext4 and XFS paste high regular-file extents into low physical holes even when that increases fragmentation; Btrfs consolidates physical chunks through filtered balance transactions and never invokes file defragmentation.

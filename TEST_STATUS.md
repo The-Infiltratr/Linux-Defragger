@@ -1,4 +1,4 @@
-# Test status for 1.8.0-23
+# Test status for 1.8.0-24
 
 Validated in this build environment:
 
@@ -8,7 +8,16 @@ Validated in this build environment:
 - Python syntax checks for the native compact engine, GUI and privileged helper.
 - Existing synthetic Btrfs and XFS analyser tests, including corrected Btrfs leaf offsets and multi-level XFS trees.
 - Existing focused FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper, Growth Defrag and GUI tests remain present.
-- Unified version reporting and package metadata identify revision `1.8.0-23`.
+- Unified version reporting and package metadata identify revision `1.8.0-24`.
+
+
+Revision-24 regression coverage additionally validates:
+
+- Collector extents retain their owning file descriptor and logical offset as well as their physical address.
+- The direct donor slice is rechecked through FIEMAP before every move.
+- Staged writes honour nonzero donor-file offsets.
+- ext4 and XFS ioctl requests carry the correct collector donor offset.
+- The extent compactor no longer contains the hole-punch/second-`fallocate` donor path that caused the physical EXT4 `ENOSPC` failure.
 
 The new ext4, XFS and Btrfs mutation paths require a real block device and a private kernel mount. This container does not have `CAP_SYS_ADMIN`, so it cannot mount loop images and could not execute a destructive physical relocation test. Shannon's removable-media ext4, Btrfs and XFS partitions are therefore the first physical validation targets for these three new compactors. The program must be treated as experimental on them until those tests complete.
 
@@ -24,4 +33,4 @@ Safety boundaries retained in the untested physical paths:
 
 ## Long-suite status
 
-Focused revision-23 tests pass. The complete historical regression suite is substantially longer and was not used as a substitute for the missing real-device mutation tests.
+Focused revision-24 tests pass. The complete historical regression suite is substantially longer and was not used as a substitute for the missing real-device mutation tests.

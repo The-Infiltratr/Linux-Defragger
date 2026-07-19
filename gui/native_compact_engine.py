@@ -10,12 +10,13 @@ volume is offline.  ext4, XFS and Btrfs already have kernel transaction code
 for relocating mappings, so this engine mounts an otherwise unmounted volume
 privately and asks the filesystem itself to perform each relocation.
 
-ext4 and XFS use a temporary, unlinked space-collector file.  The collector
-occupies existing free runs, one low run is punched out, and a donor extent is
-allocated into that run.  The highest movable file extent is then exchanged
-with the donor.  The donor remains open and unlinked so the old high extent is
-kept occupied until the pass ends.  Closing all collector descriptors releases
-those old high extents together, leaving free space at the physical tail.
+ext4 and XFS use temporary, unlinked space-collector files.  The collector
+occupies existing free runs.  Each low collector extent is then used directly
+as the donor for a mapping exchange with the highest movable file extent.  No
+second allocation is attempted after the free space has been reserved.  After
+an exchange, the collector owns the old high extent and keeps it allocated
+until the pass ends.  Closing the collector descriptors releases those old
+high extents together, leaving free space at the physical tail.
 
 Btrfs cannot exchange arbitrary physical file extents because every extent is
 copy-on-write and back-referenced.  Its compactor therefore uses the native
@@ -54,7 +55,7 @@ from version import VERSION  # noqa: E402
 EXIT_STOPPED = 130
 MAX_TRANSACTION_BYTES = 256 * 1024 * 1024
 COPY_BUFFER = 8 * 1024 * 1024
-COLLECTOR_FLOOR = 4 * 1024 * 1024
+COLLECTOR_FLOOR = 64 * 1024 * 1024
 MAX_NO_PROGRESS = 8
 
 # Generic inode flags returned by FS_IOC_FSGETXATTR.
@@ -182,6 +183,19 @@ class FreeRange:
         return self.end - self.start
 
 
+@dataclass(frozen=True)
+class CollectorExtent:
+    fd: int
+    logical: int
+    physical: int
+    length: int
+    flags: int
+
+    @property
+    def physical_end(self) -> int:
+        return self.physical + self.length
+
+
 class PrivateMount:
     def __init__(self, device: str, filesystem: str):
         self.device = os.path.realpath(device)
@@ -288,7 +302,7 @@ class SpaceCollector:
         current = 0
         while True:
             stats = os.statvfs(self.mountpoint)
-            available = stats.f_bfree * stats.f_frsize
+            available = stats.f_bavail * stats.f_frsize
             target = max(0, available - COLLECTOR_FLOOR)
             target -= target % self.block_size
             if target < self.block_size:
@@ -314,47 +328,45 @@ class SpaceCollector:
         os.fsync(fd)
         return allocated, transactions
 
-    def physical_ranges(self) -> list[FreeRange]:
-        ranges: list[tuple[int, int]] = []
+    def owned_extents(self, device_bytes: int) -> list[CollectorExtent]:
+        """Return the collector's allocated physical extents with their file offsets.
+
+        These extents are the original filesystem free ranges.  Compact uses them
+        directly as exchange donors instead of punching them free and attempting a
+        second fallocate, which can fail with ENOSPC while the collector owns the
+        rest of the free-space map.
+        """
+        result: list[CollectorExtent] = []
         for fd in self.fds:
             for extent in fiemap(fd):
-                ranges.append((extent.physical, extent.physical_end))
-        return _merge_ranges(ranges)
-
-    def punch_physical(self, start: int, length: int) -> int:
-        end = start + length
-        punched = 0
-        for fd in self.fds:
-            for extent in fiemap(fd):
-                overlap_start = max(start, extent.physical)
-                overlap_end = min(end, extent.physical_end)
-                if overlap_end <= overlap_start:
+                length = min(extent.length, max(0, device_bytes - extent.physical))
+                length -= length % self.block_size
+                if length <= 0:
                     continue
-                logical = extent.logical + (overlap_start - extent.physical)
-                amount = overlap_end - overlap_start
-                logical -= logical % self.block_size
-                amount -= amount % self.block_size
-                if amount <= 0:
-                    continue
-                self._fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, logical, amount)
-                punched += amount
-        return punched
+                result.append(CollectorExtent(
+                    fd=fd,
+                    logical=extent.logical,
+                    physical=extent.physical,
+                    length=length,
+                    flags=extent.flags,
+                ))
+        result.sort(key=lambda item: (item.physical, item.logical, item.fd))
+        return result
 
-    def allocate_donor(self, length: int) -> int:
-        fd = self._new_unlinked_file("donor")
-        self._fallocate(fd, 0, 0, length)
-        return fd
-
-    def discard(self, fd: int) -> None:
-        """Release a temporary file that has not participated in an exchange."""
-        try:
-            self.fds.remove(fd)
-        except ValueError:
-            pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    def verify_slice(self, item: CollectorExtent, logical: int, physical: int, length: int) -> None:
+        """Confirm that an unconsumed collector slice still owns the expected blocks."""
+        mapped = fiemap(item.fd, logical, length)
+        for extent in mapped:
+            if extent.logical <= logical < extent.logical + extent.length:
+                actual = extent.physical + (logical - extent.logical)
+                available = extent.length - (logical - extent.logical)
+                if actual == physical and available >= length:
+                    return
+                break
+        raise CompactError(
+            "the temporary space collector no longer owns the expected low physical "
+            f"range at byte {physical:,}; stopped before changing a file mapping"
+        )
 
 
 def _signal_handler(_signum, _frame) -> None:
@@ -597,7 +609,8 @@ def _verify_source(fd: int, source: SourceExtent, logical: int, physical: int, l
     raise CompactError(f"source extent changed before relocation: {source.path}")
 
 
-def _copy_range(source_fd: int, source_offset: int, donor_fd: int, length: int) -> None:
+def _copy_range(source_fd: int, source_offset: int, donor_fd: int, length: int,
+                donor_offset: int = 0) -> None:
     copied = 0
     file_size = os.fstat(source_fd).st_size
     while copied < length:
@@ -612,7 +625,7 @@ def _copy_range(source_fd: int, source_offset: int, donor_fd: int, length: int) 
             data += b"\0" * (take - available)
         written = 0
         while written < len(data):
-            amount = os.pwrite(donor_fd, data[written:], copied + written)
+            amount = os.pwrite(donor_fd, data[written:], donor_offset + copied + written)
             if amount <= 0:
                 raise CompactError("short write while staging a file extent")
             written += amount
@@ -620,11 +633,11 @@ def _copy_range(source_fd: int, source_offset: int, donor_fd: int, length: int) 
 
 
 def _ext4_exchange(source_fd: int, donor_fd: int, source_offset: int,
-                   length: int, block_size: int) -> None:
-    if source_offset % block_size or length % block_size:
+                   donor_offset: int, length: int, block_size: int) -> None:
+    if source_offset % block_size or donor_offset % block_size or length % block_size:
         raise CompactError("unaligned ext4 extent exchange")
     request = bytearray(struct.pack(
-        "=IIQQQQ", 0, donor_fd, source_offset // block_size, 0,
+        "=IIQQQQ", 0, donor_fd, source_offset // block_size, donor_offset // block_size,
         length // block_size, 0,
     ))
     try:
@@ -638,9 +651,10 @@ def _ext4_exchange(source_fd: int, donor_fd: int, source_offset: int,
         raise CompactError(f"ext4 moved only {moved} of {requested} requested blocks")
 
 
-def _xfs_exchange(source_fd: int, donor_fd: int, source_offset: int, length: int) -> None:
+def _xfs_exchange(source_fd: int, donor_fd: int, source_offset: int,
+                  donor_offset: int, length: int) -> None:
     # DSYNC asks XFS to persist the atomic mapping exchange before returning.
-    request = struct.pack("=iIQQQQ", donor_fd, 0, 0, source_offset, length, 1 << 1)
+    request = struct.pack("=iIQQQQ", donor_fd, 0, donor_offset, source_offset, length, 1 << 1)
     try:
         fcntl.ioctl(source_fd, XFS_IOC_EXCHANGE_RANGE, request)
     except OSError as exc:
@@ -673,12 +687,17 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
         collector = SpaceCollector(mountpoint, block_size)
         try:
             allocated, collector_ops = collector.fill_available()
-            gaps = [item for item in collector.physical_ranges() if item.end <= device_bytes]
+            gaps = collector.owned_extents(device_bytes)
             total_target = sum(item.length for item in gaps)
             print(
                 f"Temporary space collector mapped {allocated / (1024**3):.2f} GiB of "
                 f"accessible free space in {collector_ops} fallocate operations and "
                 f"{len(gaps):,} physical ranges.",
+                flush=True,
+            )
+            print(
+                "Compact will exchange file mappings directly with those reserved low ranges; "
+                "it will not allocate a second donor file.",
                 flush=True,
             )
             if not gaps:
@@ -703,8 +722,9 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
             runtime_skipped = 0
             blocked_reason = ""
             for gap in gaps:
-                cursor = gap.start
-                while cursor < gap.end:
+                cursor = gap.physical
+                donor_logical = gap.logical
+                while cursor < gap.physical_end:
                     if _stop_requested:
                         print("Stop requested; ending Compact between kernel-journalled transactions.", flush=True)
                         return EXIT_STOPPED
@@ -715,7 +735,7 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                             f"no movable regular-file extent remains above the free range at byte {cursor:,}"
                         )
                         break
-                    available = gap.end - cursor
+                    available = gap.physical_end - cursor
                     move = min(available, source.length, MAX_TRANSACTION_BYTES)
                     move -= move % block_size
                     if move <= 0:
@@ -734,44 +754,21 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                         runtime_skipped += 1
                         continue
 
-                    donor_fd: int | None = None
                     try:
                         _verify_source(source_fd, source, source_offset, source_physical, move)
-                        punched = collector.punch_physical(cursor, move)
-                        if punched != move:
-                            blocked_reason = (
-                                f"the space collector released only {punched:,} of {move:,} requested "
-                                f"bytes at physical byte {cursor:,}"
-                            )
-                            break
-                        donor_fd = collector.allocate_donor(move)
-                        donor_extents = fiemap(donor_fd)
-                        donor = next(
-                            (extent for extent in donor_extents
-                             if extent.logical == 0 and extent.length >= move),
-                            None,
-                        )
-                        if donor is None or donor.physical != cursor:
-                            actual = "none" if donor is None else f"byte {donor.physical:,}"
-                            blocked_reason = (
-                                f"the {filesystem} allocator placed the donor at {actual} instead of "
-                                f"the requested low free range at byte {cursor:,}; stopped without "
-                                "performing a non-compacting exchange"
-                            )
-                            collector.discard(donor_fd)
-                            donor_fd = None
-                            break
-
-                        _copy_range(source_fd, source_offset, donor_fd, move)
-                        os.fsync(donor_fd)
+                        collector.verify_slice(gap, donor_logical, cursor, move)
+                        _copy_range(source_fd, source_offset, gap.fd, move, donor_logical)
+                        os.fsync(gap.fd)
                         try:
                             if filesystem == "ext4":
-                                _ext4_exchange(source_fd, donor_fd, source_offset, move, block_size)
+                                _ext4_exchange(
+                                    source_fd, gap.fd, source_offset, donor_logical, move, block_size
+                                )
                             else:
-                                _xfs_exchange(source_fd, donor_fd, source_offset, move)
+                                _xfs_exchange(
+                                    source_fd, gap.fd, source_offset, donor_logical, move
+                                )
                         except SourceNotMovable as exc:
-                            collector.discard(donor_fd)
-                            donor_fd = None
                             source.length = 0
                             runtime_skipped += 1
                             print(
@@ -781,7 +778,7 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                             )
                             continue
                         os.fsync(source_fd)
-                        os.fsync(donor_fd)
+                        os.fsync(gap.fd)
                     finally:
                         os.close(source_fd)
 
@@ -791,6 +788,7 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
                     moved_bytes += move
                     transactions += 1
                     cursor += move
+                    donor_logical += move
                     gap_bytes_completed += move
                     percent = min(100.0, 100.0 * gap_bytes_completed / max(1, total_target))
                     print(
