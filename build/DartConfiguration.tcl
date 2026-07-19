@@ -4,8 +4,8 @@
 
 
 # Configuration directories and files
-SourceDirectory: /mnt/data/linux-defragger-1.8.0-31-source
-BuildDirectory: /mnt/data/linux-defragger-1.8.0-31-source/build
+SourceDirectory: /mnt/data/linux-defragger-1.8.0-32-source
+BuildDirectory: /mnt/data/linux-defragger-1.8.0-32-source/build
 
 # Where to place the cost data store
 CostDataFile: 
@@ -27,7 +27,7 @@ SubmitInactivityTimeout:
 NightlyStartTime: 00:00:00 EDT
 
 # Commands for the build/test/submit cycle
-ConfigureCommand: "/usr/bin/cmake" "/mnt/data/linux-defragger-1.8.0-31-source"
+ConfigureCommand: "/usr/bin/cmake" "/mnt/data/linux-defragger-1.8.0-32-source"
 MakeCommand: /usr/bin/cmake --build . --config "${CTEST_CONFIGURATION_TYPE}"
 DefaultCTestConfigurationType: Release
 

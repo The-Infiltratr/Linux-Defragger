@@ -143,6 +143,20 @@ def verify(path: Path, filesystem: str, files: int, directories: int,
     assert result["details"]["reserved_blocks_mapped"] > 0, result
 
 
+
+def verify_packed_tail(path: Path) -> None:
+    original = path.read_bytes()
+    tail_blocks = 1024
+    path.write_bytes(original + bytes(tail_blocks * BLOCK_SIZE))
+    result = BACKEND.map(str(path), 128)
+    assert result["filesystem_units"] == TOTAL_BLOCKS, result
+    physical_blocks = path.stat().st_size // BLOCK_SIZE
+    outside_blocks = physical_blocks - TOTAL_BLOCKS
+    assert result["total_units"] == physical_blocks, result
+    assert result["outside_bytes"] == outside_blocks * BLOCK_SIZE, result
+    assert sum(int(cell.get("outside", 0)) for cell in result["cells"]) == outside_blocks, result
+    assert result["free_bytes"] < result["total_bytes"], result
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="linux-defragger-ext-") as directory:
         root = Path(directory)
@@ -151,6 +165,7 @@ def main() -> None:
         make_ext4(ext4)
         make_ext2(ext2)
         verify(ext4, "ext4", 3, 2, 1, 1)
+        verify_packed_tail(ext4)
         verify(ext2, "ext2", 2, 1, 1, 0)
     print("ext2/ext4 allocation and inode fragmentation tests passed")
 

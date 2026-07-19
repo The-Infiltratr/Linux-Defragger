@@ -4,7 +4,7 @@
 # compile C with /usr/bin/cc
 C_DEFINES = -DHAVE_CONFIG_H -D_FILE_OFFSET_BITS=64
 
-C_INCLUDES = -I/mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6 -I/mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs
+C_INCLUDES = -I/mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6 -I/mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs
 
 C_FLAGS = -O3 -DNDEBUG -std=gnu11 -std=gnu89
 

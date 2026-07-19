@@ -271,6 +271,7 @@ class DiskMap(Gtk.DrawingArea):
 
     COLORS = {
         "free": (0.92, 0.94, 0.96),
+        "outside": (0.98, 0.98, 0.99),
         "used": (0.13, 0.43, 0.76),
         "fragmented": (0.94, 0.28, 0.22),
         "directory": (0.48, 0.28, 0.72),
@@ -315,9 +316,15 @@ class DiskMap(Gtk.DrawingArea):
         return tuple(a[i] * (1.0 - ratio) + b[i] * ratio for i in range(3))
 
     def _cell_colour(self, cell: dict[str, int]) -> tuple[float, float, float]:
-        known_total = max(1, cell["free"] + cell["used"])
-        used_ratio = cell["used"] / known_total
-        colour = self._mix(self.COLORS["free"], self.COLORS["used"], used_ratio)
+        free = int(cell.get("free", 0))
+        outside = int(cell.get("outside", 0))
+        used = int(cell.get("used", 0))
+        free_like = free + outside
+        known_total = max(1, free_like + used)
+        outside_ratio = outside / max(1, free_like)
+        free_colour = self._mix(self.COLORS["free"], self.COLORS["outside"], outside_ratio)
+        used_ratio = used / known_total
+        colour = self._mix(free_colour, self.COLORS["used"], used_ratio)
 
         # Overlay categories according to how much of the sampled cell they
         # actually occupy.  The former any-nonzero rule painted an entire map
@@ -337,7 +344,7 @@ class DiskMap(Gtk.DrawingArea):
                                min(1.0, (metadata / known_total) ** 0.5))
 
         unknown = cell.get("unknown", 0)
-        total = cell["free"] + cell["used"] + unknown
+        total = free + outside + used + unknown
         if unknown and total:
             colour = self._mix(colour, self.COLORS["unknown"], unknown / total)
         return colour
@@ -397,7 +404,7 @@ class DiskMap(Gtk.DrawingArea):
         cell = self.cells[index]
         tooltip.set_text(
             f"{self.unit_label.capitalize()} {cell['start']:,}–{cell['end']:,}\n"
-            f"Used {cell['used']:,} · Free {cell['free']:,} · Unknown {cell.get('unknown', 0):,}\n"
+            f"Used {cell['used']:,} · Free {cell['free']:,} · Outside filesystem {cell.get('outside', 0):,} · Unknown {cell.get('unknown', 0):,}\n"
             f"Fragmented {cell['fragmented']:,} · Directory {cell['directory']:,} · Metadata/reserved {cell.get('bad', 0):,}"
         )
         return True
@@ -458,6 +465,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.post_analysis_progress_text: str | None = None
         self.map_resize_timeout_id: int | None = None
         self.last_map_cell_target = 0
+        self.live_redraw_timeout_id: int | None = None
 
         self.helper_process: subprocess.Popen[str] | None = None
         self.helper_ready = False
@@ -583,6 +591,7 @@ class MainWindow(Gtk.ApplicationWindow):
         legend = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         for label, colour in (
             ("Free", DiskMap.COLORS["free"]),
+            ("Packed tail outside filesystem", DiskMap.COLORS["outside"]),
             ("Used", DiskMap.COLORS["used"]),
             ("Fragmented", DiskMap.COLORS["fragmented"]),
             ("Directory", DiskMap.COLORS["directory"]),
@@ -962,9 +971,16 @@ class MainWindow(Gtk.ApplicationWindow):
             total_units = int(data["total_units"])
             cell_count = int(data["cell_count"])
             self.capacity_card.set_value(human_bytes(total_bytes))
-            self.free_card.set_value(
-                f"{human_bytes(free_bytes)} ({free_bytes * 100.0 / max(1, total_bytes):.1f}%)"
-            )
+            outside_bytes = int(data.get("outside_bytes", 0))
+            filesystem_bytes = int(data.get("filesystem_bytes", total_bytes))
+            if outside_bytes:
+                self.free_card.set_value(
+                    f"{human_bytes(free_bytes)} usable · {human_bytes(outside_bytes)} packed tail"
+                )
+            else:
+                self.free_card.set_value(
+                    f"{human_bytes(free_bytes)} ({free_bytes * 100.0 / max(1, filesystem_bytes):.1f}%)"
+                )
             details = data.get("details") if isinstance(data.get("details"), dict) else {}
             is_swap = filesystem == "SWAP"
             has_fragmentation_summary = all(
@@ -1026,6 +1042,10 @@ class MainWindow(Gtk.ApplicationWindow):
             elif is_swap:
                 self.map_caption.set_text(
                     f"Inactive swap area · approximately {per_cell:,.1f} {unit_name} per cell"
+                )
+            elif int(data.get("outside_bytes", 0)):
+                self.map_caption.set_text(
+                    f"Pixel map: {cell_count:,} cells · white tail is outside the compacted filesystem"
                 )
             else:
                 self.map_caption.set_text(
@@ -1455,11 +1475,36 @@ class MainWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._command_finished(127, str(exc), purpose, on_success, raw_completion)
 
+    def _schedule_live_redraw(self) -> None:
+        """Coalesce rapid physical-range updates into at most ten redraws per second."""
+        if self.live_redraw_timeout_id is None:
+            self.live_redraw_timeout_id = GLib.timeout_add(100, self._flush_live_redraw)
+
+    def _flush_live_redraw(self) -> bool:
+        self.live_redraw_timeout_id = None
+        self.disk_map.queue_draw()
+        return False
+
+    @staticmethod
+    def _first_overlapping_cell(cells: list[dict[str, int]], unit: int) -> int:
+        """Find the first cell whose inclusive end is not below *unit*."""
+        low = 0
+        high = len(cells)
+        while low < high:
+            middle = (low + high) // 2
+            if int(cells[middle]["end"]) < unit:
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
     def _handle_engine_stream_line(self, line: str) -> bool:
         range_prefix = "@@LIVE_RANGE "
-        if line.startswith(range_prefix):
+        ranges_prefix = "@@LIVE_RANGES "
+        if line.startswith(range_prefix) or line.startswith(ranges_prefix):
             try:
-                delta = json.loads(line[len(range_prefix):])
+                prefix = ranges_prefix if line.startswith(ranges_prefix) else range_prefix
+                delta = json.loads(line[len(prefix):])
                 if not self.map_data or not isinstance(self.map_data.get("cells"), list):
                     return True
                 cells = self.map_data["cells"]
@@ -1476,38 +1521,52 @@ class MainWindow(Gtk.ApplicationWindow):
                         return
                     start_unit = start_byte // unit_size
                     end_unit = (start_byte + length_byte + unit_size - 1) // unit_size
-                    for cell in cells:
+                    index = self._first_overlapping_cell(cells, start_unit)
+                    while index < len(cells):
+                        cell = cells[index]
                         cell_start = int(cell["start"])
+                        if cell_start >= end_unit:
+                            break
                         cell_end = int(cell["end"]) + 1
                         overlap = max(0, min(end_unit, cell_end) - max(start_unit, cell_start))
-                        if overlap <= 0:
-                            continue
-                        if make_used:
-                            moved = min(overlap, int(cell.get("free", 0)))
-                            cell["free"] = max(0, int(cell.get("free", 0)) - moved)
-                            cell["used"] = int(cell.get("used", 0)) + moved
-                        else:
-                            old_used = max(1, int(cell.get("used", 0)))
-                            moved = min(overlap, int(cell.get("used", 0)))
-                            # The live view shows physical allocation movement.  Exact
-                            # fragmentation colours are rebuilt by the final analysis.
-                            frag = int(round(moved * int(cell.get("fragmented", 0)) / old_used))
-                            directory = int(round(moved * int(cell.get("directory", 0)) / old_used))
-                            cell["used"] = max(0, int(cell.get("used", 0)) - moved)
-                            cell["free"] = int(cell.get("free", 0)) + moved
-                            cell["fragmented"] = max(
-                                0, min(int(cell.get("fragmented", 0)) - frag, cell["used"])
-                            )
-                            cell["directory"] = max(
-                                0, min(int(cell.get("directory", 0)) - directory, cell["used"])
-                            )
+                        if overlap > 0:
+                            if make_used:
+                                moved = min(overlap, int(cell.get("free", 0)))
+                                cell["free"] = max(0, int(cell.get("free", 0)) - moved)
+                                cell["used"] = int(cell.get("used", 0)) + moved
+                            else:
+                                old_used = max(1, int(cell.get("used", 0)))
+                                moved = min(overlap, int(cell.get("used", 0)))
+                                # The live view shows physical allocation movement. Exact
+                                # fragmentation colours are rebuilt by the final analysis.
+                                frag = int(round(moved * int(cell.get("fragmented", 0)) / old_used))
+                                directory = int(round(moved * int(cell.get("directory", 0)) / old_used))
+                                cell["used"] = max(0, int(cell.get("used", 0)) - moved)
+                                cell["free"] = int(cell.get("free", 0)) + moved
+                                cell["fragmented"] = max(
+                                    0, min(int(cell.get("fragmented", 0)) - frag, cell["used"])
+                                )
+                                cell["directory"] = max(
+                                    0, min(int(cell.get("directory", 0)) - directory, cell["used"])
+                                )
+                        index += 1
 
-                source = int(delta["source_start_byte"])
-                destination = int(delta["destination_start_byte"])
-                length = int(delta["length_bytes"])
-                apply_range(source, length, False)
-                apply_range(destination, length, True)
-                self.disk_map.set_cells(cells)
+                if prefix == ranges_prefix:
+                    physical_ranges = delta.get("ranges", [])
+                else:
+                    physical_ranges = [[
+                        delta["source_start_byte"],
+                        delta["destination_start_byte"],
+                        delta["length_bytes"],
+                    ]]
+                for physical_range in physical_ranges:
+                    if not isinstance(physical_range, list) or len(physical_range) != 3:
+                        continue
+                    source, destination, length = (int(value) for value in physical_range)
+                    apply_range(source, length, False)
+                    apply_range(destination, length, True)
+                self.disk_map.cells = cells
+                self._schedule_live_redraw()
                 moved_total = int(delta.get("moved_total_bytes", 0))
                 pass_number = int(delta.get("pass", 1))
                 current = getattr(self, "_helper_current", None)
@@ -1541,6 +1600,8 @@ class MainWindow(Gtk.ApplicationWindow):
                         "end": int(changed["end"]),
                         "free": int(changed["free"]),
                         "used": int(changed["used"]),
+                        "unknown": int(changed.get("unknown", 0)),
+                        "outside": int(changed.get("outside", 0)),
                         "fragmented": int(changed["fragmented"]),
                         "directory": int(changed["directory"]),
                         "bad": int(changed["bad"]),
@@ -1553,7 +1614,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.map_data["free_clusters"] = int(delta["free_clusters"])
             if "free_gaps_below_highest" in delta:
                 self.map_data["free_gaps_below_highest"] = int(delta["free_gaps_below_highest"])
-            self.disk_map.set_cells(cells)
+            self.disk_map.cells = cells
+            self._schedule_live_redraw()
             if "fragmented_files" in self.map_data and "fragmented_directories" in self.map_data:
                 self.fragmented_card.set_value(
                     f"{self.map_data['fragmented_files']:,} files · "
@@ -1739,7 +1801,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 assert process.stdout is not None
                 for line in process.stdout:
                     clean = line.rstrip("\n")
-                    if clean.startswith("@@LIVE_MAP "):
+                    if clean.startswith(("@@LIVE_MAP ", "@@LIVE_RANGE ", "@@LIVE_RANGES ")):
                         GLib.idle_add(self._handle_engine_stream_line, clean)
                         continue
                     output_parts.append(line)
@@ -1782,6 +1844,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.process_privileged = False
         self.stop_requested = False
         self.determinate_progress = False
+        if self.live_redraw_timeout_id is not None:
+            GLib.source_remove(self.live_redraw_timeout_id)
+            self.live_redraw_timeout_id = None
+            self.disk_map.queue_draw()
         if self.pulse_id is not None:
             GLib.source_remove(self.pulse_id)
             self.pulse_id = None
@@ -1854,7 +1920,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.progress.set_text("Stopping after current transaction…")
         if self.process_privileged:
             try:
-                self._helper_send({"action": "stop", "id": self.helper_request_id + 1})
+                stop_id = self.helper_active_id if self.helper_active_id is not None else self.helper_request_id
+                self._helper_send({"action": "stop", "id": stop_id})
             except Exception as exc:
                 self.stop_requested = False
                 self._update_controls()

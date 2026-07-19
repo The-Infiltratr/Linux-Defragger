@@ -6,11 +6,11 @@
 """Native Linux filesystem compaction engine.
 
 The FAT, exFAT and NTFS engines edit their own on-disk metadata while the
-volume is offline. ext4 Compact now also works offline: it temporarily shrinks
-the complete filesystem to its minimum size, forcing regular files, directory
-blocks, journals and relocatable metadata below that boundary, and then restores
-the original filesystem size. This is a true filesystem-wide packing pass rather
-than the earlier regular-file-only EXT4_IOC_MOVE_EXT loop.
+volume is offline. ext4 Compact works offline: it repeatedly shrinks the complete
+filesystem to its minimum size and uses regular-file extent exchange between
+rounds. The final minimum-size filesystem is intentionally left in place, so the
+unused physical partition tail is outside ext4 and cannot contain files,
+directories, journals, inode tables or other filesystem allocation.
 
 XFS continues to use temporary, unlinked space-collector files and kernel range
 exchange. The collector occupies existing free runs; low collector extents are
@@ -538,13 +538,14 @@ def _run_ext4_tool(command: list[str], accepted: set[int] | None = None) -> int:
 
 
 def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
-    """Iteratively pack ext4 data, directories and relocatable metadata.
+    """Pack ext4 completely at the physical beginning of its partition.
 
-    A minimum-size shrink clears the physical tail and relocates directory and
-    metadata blocks. After each restore, the regular-file extent exchanger fills
-    the lower holes left inside that minimum image. Shrinking again can then move
-    the remaining directory and metadata allocations below the newly lowered
-    file boundary. The process stops at a fixed point.
+    ext4 requires block-group metadata throughout every block group that belongs
+    to the filesystem. Restoring the filesystem to the full partition size would
+    therefore recreate inode tables and bitmaps in the physical tail. Compact
+    instead leaves the final minimum-size filesystem in place. The partition is
+    not changed; its remaining tail is outside ext4 and contains no filesystem
+    allocation at all.
     """
     _assert_unmounted(device)
     e2fsck = shutil.which("e2fsck")
@@ -556,22 +557,22 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
 
     block_size, original_bytes = ext4_compact_geometry(device)
     original_blocks = original_bytes // block_size
-    restored = True
     final_boundary = original_blocks
     total_file_moved = 0
     total_transactions = 0
     rounds_completed = 0
+    final_minimum_committed = False
 
     print(
-        "EXT4 Compact is performing an iterative offline filesystem-wide repack. "
-        "Each round shrinks the filesystem to its minimum valid size, restores it, "
-        "then fills the remaining low holes with higher regular-file extents. The "
-        "next shrink relocates directories and metadata around that denser file layout.",
+        "EXT4 Compact is performing a complete offline physical-tail repack. "
+        "It will iterate minimum-size shrink and regular-file packing rounds, then "
+        "leave the filesystem at its final minimum size. The partition itself is "
+        "not changed, and the remaining physical tail will be outside ext4.",
         flush=True,
     )
     print(
         f"Original ext4 size: {original_blocks:,} blocks of {block_size:,} bytes "
-        f"({original_bytes / (1024**3):.2f} GiB). The partition itself will not be changed.",
+        f"({original_bytes / (1024**3):.2f} GiB).",
         flush=True,
     )
     print("2.00 percent completed", flush=True)
@@ -581,13 +582,10 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
             "EXT4 Compact phase 1: mandatory offline filesystem check and directory optimisation.",
             flush=True,
         )
-        # -D rebuilds/optimises directory indexes and can collapse avoidable
-        # directory-block fragmentation before the packing rounds begin.
         _run_ext4_tool([e2fsck, "-f", "-D", "-p", device], {0, 1})
         print("8.00 percent completed", flush=True)
 
         previous_boundary: int | None = None
-        need_final_shrink = False
         for round_number in range(1, MAX_EXT4_REPACK_ROUNDS + 1):
             if _stop_requested:
                 print("Stop requested before the next EXT4 repack round.", flush=True)
@@ -599,7 +597,6 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
                 "is relocated lower.",
                 flush=True,
             )
-            restored = False
             _run_ext4_tool([resize2fs, "-M", "-p", device])
             _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
             shrunk_blocks = shrunk_bytes // block_size
@@ -612,13 +609,15 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
                 flush=True,
             )
 
+            # The online extent exchanger needs the original geometry as workspace.
+            # This is only an intermediate state; the final stage shrinks again and
+            # deliberately does not restore the filesystem.
             print(
-                f"EXT4 repack round {round_number}: restoring the exact original filesystem "
-                "size without changing the partition.",
+                f"EXT4 repack round {round_number}: temporarily restoring the original "
+                "filesystem size for low-hole regular-file packing.",
                 flush=True,
             )
             _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
-            restored = True
             rounds_completed = round_number
 
             if _stop_requested:
@@ -638,25 +637,22 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
             if file_summary.stopped:
                 return EXIT_STOPPED
 
-            percent = min(88.0, 8.0 + 80.0 * round_number / MAX_EXT4_REPACK_ROUNDS)
+            percent = min(82.0, 8.0 + 70.0 * round_number / MAX_EXT4_REPACK_ROUNDS)
             print(f"{percent:.2f} percent completed", flush=True)
 
             boundary_stable = previous_boundary is not None and shrunk_blocks >= previous_boundary
             previous_boundary = shrunk_blocks
             if file_summary.moved_bytes == 0:
                 print(
-                    f"EXT4 reached a fixed point after round {round_number}: no ordinary file "
-                    "extent can be moved into any lower free range.",
+                    f"EXT4 reached a regular-file packing fixed point after round {round_number}.",
                     flush=True,
                 )
-                need_final_shrink = False
                 break
-            need_final_shrink = True
             if boundary_stable:
                 print(
-                    "The minimum boundary did not fall in this round, but file allocations "
-                    "were still moved lower; one more offline shrink is required to relocate "
-                    "directory and metadata blocks around the new layout.",
+                    "The minimum boundary did not fall in this round, but regular-file "
+                    "allocations moved lower; the final offline shrink will consolidate "
+                    "directories and metadata around the new layout.",
                     flush=True,
                 )
         else:
@@ -665,61 +661,64 @@ def compact_ext4_offline(device: str, live_cells: int = 0) -> int:
                 flush=True,
             )
 
-        if need_final_shrink:
-            print(
-                "EXT4 final consolidation: applying one last minimum-size shrink after the "
-                "last productive regular-file packing pass.",
-                flush=True,
-            )
-            restored = False
-            _run_ext4_tool([resize2fs, "-M", "-p", device])
-            _block_size_after, shrunk_bytes = ext4_compact_geometry(device)
-            final_boundary = shrunk_bytes // block_size
-            _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
-            restored = True
+        if _stop_requested:
+            print("Stop requested before final EXT4 tail removal.", flush=True)
+            return EXIT_STOPPED
 
-        print("EXT4 final read-only verification.", flush=True)
-        # Do not let the verifier allocate anything on the restored full-size
-        # geometry. All corrective and directory-optimisation work happened
-        # before the packing rounds; this final pass is deliberately read-only.
-        _run_ext4_tool([e2fsck, "-f", "-n", device])
+        print(
+            "EXT4 final consolidation: shrinking to the minimum valid size and leaving "
+            "that filesystem boundary in place so no ext4 allocation can remain in the tail.",
+            flush=True,
+        )
+        _run_ext4_tool([resize2fs, "-M", "-p", device])
         final_block_size, final_bytes = ext4_compact_geometry(device)
-        if final_block_size != block_size or final_bytes != original_bytes:
-            raise CompactError(
-                "ext4 verification completed, but the original filesystem size was not restored"
-            )
+        if final_block_size != block_size or final_bytes > original_bytes:
+            raise CompactError("ext4 final minimum geometry is invalid")
+        final_boundary = final_bytes // block_size
+        final_minimum_committed = True
+        print("90.00 percent completed", flush=True)
+
+        print("EXT4 final read-only verification of the compacted minimum filesystem.", flush=True)
+        _run_ext4_tool([e2fsck, "-f", "-n", device])
+        verified_block_size, verified_bytes = ext4_compact_geometry(device)
+        if verified_block_size != block_size or verified_bytes != final_bytes:
+            raise CompactError("ext4 verification changed the compacted filesystem geometry")
 
         cleared_tail = max(0, original_blocks - final_boundary) * block_size
         print(
-            f"EXT4 filesystem-wide Compact completed after {rounds_completed:,} repack round(s). "
+            f"EXT4 physical-tail Compact completed after {rounds_completed:,} repack round(s). "
             f"Regular-file packing moved {total_file_moved / (1024**3):.2f} GiB in "
-            f"{total_transactions:,} kernel-journalled exchanges. All ordinary file and "
-            f"directory allocations now fit below block {max(0, final_boundary - 1):,}; "
-            f"{cleared_tail / (1024**3):.2f} GiB of physical tail was cleared.",
+            f"{total_transactions:,} kernel-journalled exchanges.",
             flush=True,
         )
         print(
-            "Allocations beyond that boundary can only be ext4 block-group structures "
-            "created or required by the restored full-size filesystem, not ordinary files.",
+            f"The ext4 filesystem now ends at block {max(0, final_boundary - 1):,} "
+            f"({final_bytes / (1024**3):.2f} GiB). The unchanged partition has "
+            f"{cleared_tail / (1024**3):.2f} GiB of physical tail outside the filesystem. "
+            "No file, directory or ext4 metadata allocation can exist in that tail.",
             flush=True,
         )
         print("100.00 percent completed", flush=True)
         return EXIT_STOPPED if _stop_requested else 0
     finally:
-        if not restored:
+        # Intermediate rounds temporarily restore the original geometry. If a
+        # failure interrupts a shrink before the deliberate final minimum has
+        # been committed, return to the known original size. Once the final
+        # minimum is committed, leaving it smaller is the requested result.
+        if not final_minimum_committed:
             try:
                 _current_block_size, current_bytes = ext4_compact_geometry(device)
                 current_blocks = current_bytes // block_size
                 if current_blocks < original_blocks:
                     print(
                         "EXT4 Compact cleanup: restoring the original filesystem size after an "
-                        "interrupted or failed shrink stage.",
+                        "interrupted intermediate shrink stage.",
                         flush=True,
                     )
                     _run_ext4_tool([resize2fs, "-p", device, str(original_blocks)])
             except Exception as restore_exc:
                 print(
-                    "CRITICAL: ext4 remains at its smaller but valid filesystem size because "
+                    "CRITICAL: ext4 remains at a smaller but valid filesystem size because "
                     f"automatic restoration failed: {restore_exc}",
                     file=sys.stderr, flush=True,
                 )

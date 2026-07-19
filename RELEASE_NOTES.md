@@ -1,10 +1,16 @@
-# Linux Defragger 1.8.0-31
+# Linux Defragger 1.8.0-32
+
+- EXT4 Compact now leaves the final minimum-size filesystem in place instead of expanding it back across the partition. This removes the remaining inode-table and bitmap islands: the unchanged partition tail is physically outside ext4 and cannot contain any file, directory or filesystem metadata allocation. Analyse renders that packed tail separately from usable filesystem free space.
+- Fixed the NTFS live-map path that could freeze the GTK main thread. Physical range updates are emitted in bounded transaction batches, locate only overlapping map cells with binary search instead of rescanning every map cell, and redraws are coalesced to ten per second.
+- Fixed safe-stop dispatch to use the active privileged request identifier. NTFS Compact and Defragment can now receive the stop command while live allocation updates are arriving.
+
+## Revision 31
 
 - EXT4 Compact now iterates to a filesystem-wide fixed point instead of stopping after one minimum-size shrink. Each round shrinks and restores the complete filesystem, fills remaining lower holes with higher regular-file extents through `EXT4_IOC_MOVE_EXT`, then shrinks again so directory and metadata blocks can be relocated around the denser file layout.
 - Adds an initial offline `e2fsck -D` directory optimisation pass. The final verification is read-only, preventing the verifier from creating fresh allocations in the restored physical tail.
 - Btrfs Compact now performs a native full data/metadata balance through `BTRFS_IOC_BALANCE_V2` before progressively tighter shrink-and-restore cycles. This releases partially used chunks and supplies the lower relocation workspace that revision 30 lacked. Balance progress and safe cancellation use the kernel progress and control ioctls; no `btrfs` command-line dependency is added.
 - Btrfs analysis requests up to 131,072 tree items in a 16 MiB buffer and no longer copies payloads for unwanted intermediate key types. Exact allocation and fragmentation semantics are retained with substantially lower Python overhead.
-- NTFS Compact and Defragment now emit exact `@@LIVE_RANGE` events after every completed journalled stream transaction. The GTK map moves used/free allocation live during the operation and performs the exact fragmentation rescan at completion.
+- NTFS Compact and Defragment now emit physical allocation movement events after every completed journalled stream transaction. The GTK map moves used/free allocation live during the operation and performs the exact fragmentation rescan at completion.
 - Adds `gi.require_version("Gdk", "3.0")`, eliminating the GTK startup warning seen on Linux Mint.
 
 ## Revision 30

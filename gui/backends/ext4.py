@@ -343,6 +343,7 @@ class ExtBackend:
             has_64bit = bool(incompat & _EXT4_FEATURE_INCOMPAT_64BIT)
             blocks_hi = u32le(superblock, 0x150) if has_64bit else 0
             total_blocks = blocks_lo | (blocks_hi << 32)
+            physical_blocks = max(total_blocks, reader.size // block_size)
             first_data = u32le(superblock, 20)
             blocks_per_group = u32le(superblock, 32)
             inodes_per_group = u32le(superblock, 40)
@@ -403,23 +404,24 @@ class ExtBackend:
                     if 0 < block_bitmap < total_blocks else None
                 )
 
-            cell_count = max(1, min(cells, total_blocks))
+            cell_count = max(1, min(cells, physical_blocks))
             out = []
-            free_total = used_total = unknown_total = 0
+            free_total = used_total = unknown_total = outside_total = 0
             for cell_index in range(cell_count):
-                start = (cell_index * total_blocks) // cell_count
-                end_ex = ((cell_index + 1) * total_blocks) // cell_count
-                free = used = unknown = 0
+                start = (cell_index * physical_blocks) // cell_count
+                end_ex = ((cell_index + 1) * physical_blocks) // cell_count
+                free = used = unknown = outside = 0
                 position = start
                 if position < first_data:
                     count = min(end_ex, first_data) - position
                     unknown += count
                     position += count
-                while position < end_ex:
+                filesystem_end = min(end_ex, total_blocks)
+                while position < filesystem_end:
                     relative = position - first_data
                     group = relative // blocks_per_group
                     within = relative % blocks_per_group
-                    take = min(end_ex - position, group_lengths[group] - within)
+                    take = min(filesystem_end - position, group_lengths[group] - within)
                     bitmap = block_bitmaps[group]
                     if bitmap is None:
                         unknown += take
@@ -428,15 +430,20 @@ class ExtBackend:
                         used += set_bits
                         free += take - set_bits
                     position += take
+                if position < end_ex:
+                    outside += end_ex - position
+                    position = end_ex
                 free_total += free
                 used_total += used
                 unknown_total += unknown
+                outside_total += outside
                 out.append({
                     "start": start,
                     "end": end_ex - 1,
                     "free": free,
                     "used": used,
                     "unknown": unknown,
+                    "outside": outside,
                     "bad": 0,
                     "fragmented": 0,
                     "directory": 0,
@@ -448,9 +455,12 @@ class ExtBackend:
                 "filesystem": filesystem,
                 "map_accuracy": "exact",
                 "unit_size": block_size,
-                "total_units": total_blocks,
+                "total_units": physical_blocks,
+                "filesystem_units": total_blocks,
                 "cell_count": cell_count,
-                "total_bytes": total_blocks * block_size,
+                "total_bytes": physical_blocks * block_size,
+                "filesystem_bytes": total_blocks * block_size,
+                "outside_bytes": outside_total * block_size,
                 "free_bytes": free_total * block_size,
                 "used_bytes": used_total * block_size,
                 "unknown_bytes": unknown_total * block_size,
@@ -458,6 +468,9 @@ class ExtBackend:
                 "details": {
                     "block_size": block_size,
                     "groups": groups,
+                    "physical_blocks": physical_blocks,
+                    "filesystem_blocks": total_blocks,
+                    "outside_filesystem_blocks": outside_total,
                     "inode_size": inode_size,
                 },
             }

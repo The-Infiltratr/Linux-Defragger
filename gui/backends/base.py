@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import stat
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,10 +42,25 @@ class BackendInfo:
 
 class Reader:
     """Small positional-read wrapper that enforces complete raw-device reads."""
+    _BLKGETSIZE64 = 0x80081272
+
     def __init__(self, path: str):
         self.path = path
         self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-        self.size = os.fstat(self.fd).st_size
+        info = os.fstat(self.fd)
+        self.size = int(info.st_size)
+        if stat.S_ISBLK(info.st_mode):
+            try:
+                raw = bytearray(8)
+                fcntl.ioctl(self.fd, self._BLKGETSIZE64, raw, True)
+                self.size = struct.unpack("=Q", raw)[0]
+            except OSError:
+                # A seek-to-end fallback covers unusual block-like devices that
+                # do not implement BLKGETSIZE64. Positional reads are unaffected.
+                try:
+                    self.size = os.lseek(self.fd, 0, os.SEEK_END)
+                except OSError:
+                    pass
 
     def close(self) -> None:
         if self.fd >= 0:

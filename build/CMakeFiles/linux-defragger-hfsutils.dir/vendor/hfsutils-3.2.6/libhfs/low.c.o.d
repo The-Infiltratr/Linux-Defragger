@@ -1,7 +1,7 @@
 CMakeFiles/linux-defragger-hfsutils.dir/vendor/hfsutils-3.2.6/libhfs/low.c.o: \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/low.c \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/low.c \
  /usr/include/stdc-predef.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/config.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/config.h \
  /usr/include/stdlib.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
  /usr/include/features.h /usr/include/features-time64.h \
@@ -49,13 +49,13 @@ CMakeFiles/linux-defragger-hfsutils.dir/vendor/hfsutils-3.2.6/libhfs/low.c.o: \
  /usr/include/x86_64-linux-gnu/bits/errno.h /usr/include/linux/errno.h \
  /usr/lib/linux/uapi/x86/asm/errno.h /usr/include/asm-generic/errno.h \
  /usr/include/asm-generic/errno-base.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/libhfs.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/hfs.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/libhfs.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/hfs.h \
  /usr/include/time.h /usr/include/x86_64-linux-gnu/bits/time.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/apple.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/low.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/data.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/block.h \
- /mnt/data/linux-defragger-1.8.0-31-source/vendor/hfsutils-3.2.6/libhfs/file.h
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/apple.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/low.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/data.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/block.h \
+ /mnt/data/linux-defragger-1.8.0-32-source/vendor/hfsutils-3.2.6/libhfs/file.h

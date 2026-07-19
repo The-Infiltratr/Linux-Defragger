@@ -352,17 +352,19 @@ def test_ext4_compact_iterates_shrink_and_regular_file_packing():
         n._run_ext4_tool = original_run
         n._run_extent_compaction = original_extent
         n._stop_requested = original_stop
-    assert state['blocks'] == 1000
+    assert state['blocks'] == 420
     assert [item[0] for item in commands] == [
         ('/usr/sbin/e2fsck', '-f', '-D', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
         ('/usr/sbin/resize2fs', '-p', '/dev/test', '1000'),
+        ('/usr/sbin/resize2fs', '-M', '-p', '/dev/test'),
         ('/usr/sbin/e2fsck', '-f', '-n', '/dev/test'),
     ]
     report = output.getvalue()
-    assert 'iterative offline filesystem-wide repack' in report
-    assert 'reached a fixed point after round 1' in report
-    assert 'fit below block 419' in report
+    assert 'complete offline physical-tail repack' in report
+    assert 'regular-file packing fixed point after round 1' in report
+    assert 'now ends at block 419' in report
+    assert 'outside the filesystem' in report
 
 
 if __name__ == '__main__':

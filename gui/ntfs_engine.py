@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-31"
+ENGINE_VERSION = "1.8.0-32"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -1984,19 +1984,33 @@ def _iter_physical_move_slices(source_runs: Iterable[Run],
 def _emit_live_move(move: ExtentMove, cluster_size: int,
                     moved_total_clusters: int, live_cells: int,
                     pass_number: int = 1) -> None:
+    """Emit bounded batches so highly fragmented files cannot flood GTK."""
     if live_cells <= 0:
         return
+    batch: list[list[int]] = []
     for source_lcn, destination_lcn, clusters in _iter_physical_move_slices(
         move.source_runs, move.destination_runs
     ):
+        batch.append([
+            source_lcn * cluster_size,
+            destination_lcn * cluster_size,
+            clusters * cluster_size,
+        ])
+        if len(batch) >= 256:
+            payload = {
+                "ranges": batch,
+                "moved_total_bytes": moved_total_clusters * cluster_size,
+                "pass": pass_number,
+            }
+            print("@@LIVE_RANGES " + json.dumps(payload, separators=(",", ":")), flush=True)
+            batch = []
+    if batch:
         payload = {
-            "source_start_byte": source_lcn * cluster_size,
-            "destination_start_byte": destination_lcn * cluster_size,
-            "length_bytes": clusters * cluster_size,
+            "ranges": batch,
             "moved_total_bytes": moved_total_clusters * cluster_size,
             "pass": pass_number,
         }
-        print("@@LIVE_RANGE " + json.dumps(payload, separators=(",", ":")), flush=True)
+        print("@@LIVE_RANGES " + json.dumps(payload, separators=(",", ":")), flush=True)
 
 
 def compact(device: str, journal_path: Path,

@@ -31,18 +31,33 @@ def test_split_run_event_sequence() -> None:
     events = [
         json.loads(line.split(" ", 1)[1])
         for line in output.getvalue().splitlines()
-        if line.startswith("@@LIVE_RANGE ")
+        if line.startswith("@@LIVE_RANGES ")
     ]
-    assert len(events) == 3
+    assert len(events) == 1
     assert events[0] == {
-        "source_start_byte": 100 * 4096,
-        "destination_start_byte": 10 * 4096,
-        "length_bytes": 3 * 4096,
+        "ranges": [
+            [100 * 4096, 10 * 4096, 3 * 4096],
+            [200 * 4096, 13 * 4096, 1 * 4096],
+            [201 * 4096, 30 * 4096, 4 * 4096],
+        ],
         "moved_total_bytes": 8 * 4096,
         "pass": 1,
     }
-    assert events[-1]["source_start_byte"] == 201 * 4096
-    assert events[-1]["destination_start_byte"] == 30 * 4096
+
+
+def test_live_batches_are_bounded() -> None:
+    sources = tuple(n.Run(1000 + index * 2, 1) for index in range(600))
+    destinations = (n.Run(10, 600),)
+    move = n.ExtentMove(sources, destinations, destinations)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        n._emit_live_move(move, 4096, 600, 1000)
+    events = [
+        json.loads(line.split(" ", 1)[1])
+        for line in output.getvalue().splitlines()
+        if line.startswith("@@LIVE_RANGES ")
+    ]
+    assert [len(event["ranges"]) for event in events] == [256, 256, 88]
 
 
 def test_disabled_live_map_emits_nothing() -> None:

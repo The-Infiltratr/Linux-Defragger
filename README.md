@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-31
+# Linux Defragger 1.8.0-32
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -11,7 +11,7 @@ The user-visible operations are deliberately separate:
 
 ## EXT4 Compact boundary
 
-EXT4 Compact is an iterative filesystem-wide operation. It first runs an offline `e2fsck -D` pass to optimise directory indexes, shrinks the filesystem to its minimum valid size, and restores the exact original filesystem size. That shrink forces ordinary files, directory blocks, the journal and relocatable metadata out of the physical tail.
+EXT4 Compact is an iterative filesystem-wide operation. It first runs an offline `e2fsck -D` pass to optimise directory indexes, alternates minimum-size shrink rounds with regular-file low-hole packing, and finally leaves the filesystem at its minimum valid size. The partition is not changed. Its remaining physical tail is outside ext4, so no file, directory, journal, inode table, bitmap or other ext4 allocation can remain there. The allocation map shows this tail separately from usable free space.
 
 A minimum-size shrink alone can still leave lower holes inside the temporary minimum image. After each restore, Linux Defragger privately mounts the volume and uses `EXT4_IOC_MOVE_EXT` to exchange higher regular-file extents into those lower holes. It then shrinks and restores again so directory and metadata allocations can be relocated around the denser file layout. The rounds stop when a complete regular-file pass moves nothing, with a fixed safety limit and an additional final shrink after the last productive pass.
 
@@ -54,7 +54,7 @@ The operation refuses to start unless the volume has enough free clusters for bo
 
 ### Native ext4, XFS and Btrfs Compact semantics
 
-EXT4 Compact combines two kernel-supported mechanisms. Offline `resize2fs -M` rounds relocate the complete filesystem below the smallest currently valid boundary. Between those rounds, a private kernel mount reserves the free map in an unlinked collector and uses `EXT4_IOC_MOVE_EXT` to exchange high regular-file extents directly into verified low collector ranges. The collector counts all `f_bfree` blocks, including the privileged reserve, while retaining a 64 MiB transaction-safety floor. Completed exchanges are journalled by EXT4 and are sent to the GUI as live physical source/destination updates.
+EXT4 Compact combines two kernel-supported mechanisms. Offline `resize2fs -M` rounds relocate the complete filesystem below the smallest currently valid boundary. Between those rounds, a private kernel mount reserves the free map in an unlinked collector and uses `EXT4_IOC_MOVE_EXT` to exchange high regular-file extents directly into verified low collector ranges. The final `resize2fs -M` result is deliberately not expanded again: a full-size ext4 filesystem requires block-group metadata throughout its geometry, so leaving the filesystem at minimum size is the only non-reformatting method that guarantees an allocation-free physical tail. The collector counts all `f_bfree` blocks, including the privileged reserve, while retaining a 64 MiB transaction-safety floor.
 
 XFS Compact retains the range-exchange collector design. It requires a kernel providing `XFS_IOC_EXCHANGE_RANGE`, verifies every donor mapping immediately before exchange, repeats collector passes to a fixed point, and reports live physical updates. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsafe extents are left unchanged.
 
