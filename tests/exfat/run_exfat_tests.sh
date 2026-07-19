@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Build, install or test support script.
+
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d)

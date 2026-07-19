@@ -1,4 +1,13 @@
 #!/usr/bin/python3
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
+"""Shared backend ABI, binary readers and map aggregation helpers."""
+
 from __future__ import annotations
 
 import os
@@ -29,6 +38,7 @@ class BackendInfo:
 
 
 class Reader:
+    """Small positional-read wrapper that enforces complete raw-device reads."""
     def __init__(self, path: str):
         self.path = path
         self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
@@ -78,6 +88,7 @@ def u64be(b: bytes, o: int) -> int:
     return struct.unpack_from(">Q", b, o)[0]
 
 
+# Convert per-allocation-unit states into the fixed schema consumed by the GUI.
 def aggregate_states(states: Iterable[int], total_units: int, cell_count: int, unit_size: int,
                      filesystem: str, accuracy: str = "exact", details: dict | None = None) -> dict:
     """Aggregate 0=free, 1=used, 2=unknown/reserved, 3=bad into map cells."""

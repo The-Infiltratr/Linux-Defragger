@@ -1,4 +1,13 @@
 #!/usr/bin/python3
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
+"""Native exFAT relocation, journalling and recovery engine."""
+
 from __future__ import annotations
 import argparse, json, math, os, signal, struct, sys, tempfile
 from dataclasses import dataclass, asdict

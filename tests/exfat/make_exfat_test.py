@@ -1,4 +1,11 @@
 #!/usr/bin/python3
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
 import os,struct,sys,math
 p=sys.argv[1]; size=64*1024*1024; bps=512; spc=8; cs=bps*spc
 fat_off=24; fat_len=128; heap_off=fat_off+fat_len; cc=(size//bps-heap_off)//spc; root=2

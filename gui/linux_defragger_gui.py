@@ -1,5 +1,16 @@
 #!/usr/bin/python3
-"""GTK3 frontend for modular filesystem allocation maps and FAT defragmentation."""
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
+"""GTK3 user interface for Linux Defragger.
+
+The GUI discovers volumes, selects a filesystem backend, renders allocation
+maps and communicates with a single privileged helper for raw-device work.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +43,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -42,6 +53,7 @@ CAP_DEFRAG = 1 << 3
 CAP_RECOVER = 1 << 4
 CAP_LIVE_MAP = 1 << 5
 BACKEND_CAPABILITIES: dict[str, int] = {}
+# Linux filesystem names are normalised to backend identifiers here.
 SUPPORTED_FILESYSTEMS = {
     "vfat": "fat",
     "fat": "fat",
@@ -217,6 +229,7 @@ def discover_volumes() -> list[Volume]:
 
 
 class DiskMap(Gtk.DrawingArea):
+    """Render backend allocation data as a dense, dynamically sized pixel map."""
     """Dense cluster map inspired by classic graphical defragmenters."""
 
     COLORS = {
@@ -355,6 +368,7 @@ class SummaryCard(Gtk.Frame):
 
 
 class MainWindow(Gtk.ApplicationWindow):
+    """Coordinate device discovery, authentication, operations and live map updates."""
     def __init__(self, application: Gtk.Application) -> None:
         super().__init__(application=application, title=f"{APP_NAME} {VERSION}")
         self.set_default_size(1050, 760)

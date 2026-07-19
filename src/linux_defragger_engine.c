@@ -1,3 +1,12 @@
+/*
+ * Linux Defragger engine
+ * Author: Shannon Smith
+ *
+ * Implements FAT12, FAT16 and FAT32 analysis, compaction, defragmentation,
+ * transaction journalling and recovery. The engine is intentionally separate
+ * from the GTK interface so raw-device operations remain testable and safe.
+ */
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -18,11 +27,12 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.5.3"
+#define PROGRAM_VERSION "1.5.4"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
 
+/* FAT entry width and root-directory layout vary by filesystem generation. */
 typedef enum {
     FAT_TYPE_12 = 12,
     FAT_TYPE_16 = 16,
@@ -32,6 +42,7 @@ typedef enum {
 #define JOURNAL_MAGIC "LINUX-DEFRAGGER-JOURNAL-1"
 #define COMPACT_JOURNAL_MAGIC "LINUX-DEFRAGGER-COMPACT-JOURNAL-1"
 
+/* Runtime I/O policy and counters used by the buffered relocation pipeline. */
 typedef struct {
     size_t ram_limit;
     size_t workers;
@@ -43,8 +54,10 @@ typedef struct {
 } IoConfig;
 
 static IoConfig g_io;
+/* Signals request a safe stop after the active journalled transaction. */
 static volatile sig_atomic_t g_stop_requested = 0;
 
+/* Aggregated map cell sent to the GUI for live allocation-map updates. */
 typedef struct {
     uint32_t start;
     uint32_t end;

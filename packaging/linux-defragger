@@ -1,2 +1,6 @@
 #!/bin/sh
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Build, install or test support script.
+
 exec /usr/bin/python3 /usr/lib/linux-defragger/linux_defragger_gui.py "$@"

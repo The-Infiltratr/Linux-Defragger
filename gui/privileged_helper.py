@@ -1,10 +1,19 @@
 #!/usr/bin/python3
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
 """Persistent privileged helper for the Linux Defragger GTK application.
 
 The helper is started once through pkexec and remains attached to the GUI over
-stdin/stdout.  It accepts only a small fixed command set, streams child output
+stdin/stdout. It accepts only a small fixed command set, streams child output
 as JSON messages, and can deliver SIGINT to the active engine process group.
+One authenticated helper is retained for the lifetime of the GUI session.
 """
+
 from __future__ import annotations
 
 import json

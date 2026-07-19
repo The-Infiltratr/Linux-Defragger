@@ -1,3 +1,12 @@
+# Linux Defragger 1.5.4
+
+**Author:** Shannon Smith
+
+This maintenance release adds concise university-level documentation comments
+throughout the C engine, GTK application, privileged helper, filesystem backend
+modules, test utilities and build scripts. No filesystem algorithms or on-disk
+formats were intentionally changed.
+
 # Linux Defragger 1.5.3
 
 - Restores the required `shutil` import removed during the 1.5.2 cleanup.

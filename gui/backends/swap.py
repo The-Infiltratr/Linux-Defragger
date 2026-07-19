@@ -1,3 +1,12 @@
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+#
+# Comments describe design intent and non-obvious behaviour. They are kept
+# concise so that the implementation remains readable and maintainable.
+
+"""Read-only Linux and Solaris swap metadata backend."""
+
 from __future__ import annotations
 from .base import *
 

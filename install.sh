@@ -1,4 +1,8 @@
 #!/bin/sh
+# Linux Defragger
+# Author: Shannon Smith
+# Purpose: Build, install or test support script.
+
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 install -Dm755 "$ROOT/build/linux-defragger-engine" /usr/bin/linux-defragger-engine
