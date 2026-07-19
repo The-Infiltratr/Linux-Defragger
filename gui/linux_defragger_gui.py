@@ -802,10 +802,16 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.files_card.set_value(
                     f"{int(data['regular_files']):,} files · {int(data['directories']):,} dirs"
                 )
-                self.fragmented_card.set_value(
-                    f"{int(data['fragmented_files']):,} files · "
-                    f"{int(data['fragmented_directories']):,} dirs"
-                )
+                if "fragmentation_percent" in data:
+                    self.fragmented_card.set_value(
+                        f"{float(data['fragmentation_percent']):.1f}% · "
+                        f"{int(data['fragmented_files']):,} files"
+                    )
+                else:
+                    self.fragmented_card.set_value(
+                        f"{int(data['fragmented_files']):,} files · "
+                        f"{int(data['fragmented_directories']):,} dirs"
+                    )
             else:
                 self.files_card.set_value(f"{human_bytes(used_bytes)} allocated")
 
@@ -820,9 +826,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 if capabilities & CAP_RECOVER:
                     operations.append("Recover")
                 if operations:
-                    self.fragmented_card.set_value("Map · " + " / ".join(operations))
+                    self.fragmented_card.set_value("Not calculated")
                 else:
-                    self.fragmented_card.set_value("Map only · read-only")
+                    self.fragmented_card.set_value("Not available")
 
             unit_size = int(data.get("unit_size", 512))
             if unit_size == 512:
