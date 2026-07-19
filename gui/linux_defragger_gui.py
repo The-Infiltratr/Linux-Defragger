@@ -250,6 +250,7 @@ class DiskMap(Gtk.DrawingArea):
         "used": (0.13, 0.43, 0.76),
         "fragmented": (0.94, 0.28, 0.22),
         "directory": (0.48, 0.28, 0.72),
+        "unknown": (0.38, 0.40, 0.44),
         "bad": (0.08, 0.08, 0.10),
         "grid": (0.74, 0.77, 0.81),
         "background": (0.98, 0.98, 0.99),
@@ -290,17 +291,22 @@ class DiskMap(Gtk.DrawingArea):
         return tuple(a[i] * (1.0 - ratio) + b[i] * ratio for i in range(3))
 
     def _cell_colour(self, cell: dict[str, int]) -> tuple[float, float, float]:
-        total = max(1, cell["free"] + cell["used"])
+        known_total = max(1, cell["free"] + cell["used"])
         if cell.get("bad", 0):
             return self.COLORS["bad"]
         if cell.get("fragmented", 0):
-            density = cell["fragmented"] / total
+            density = cell["fragmented"] / known_total
             return self._mix(self.COLORS["used"], self.COLORS["fragmented"], 0.55 + 0.45 * density)
         if cell.get("directory", 0):
-            density = cell["directory"] / total
+            density = cell["directory"] / known_total
             return self._mix(self.COLORS["used"], self.COLORS["directory"], 0.45 + 0.45 * density)
-        used_ratio = cell["used"] / total
-        return self._mix(self.COLORS["free"], self.COLORS["used"], used_ratio)
+        used_ratio = cell["used"] / known_total
+        known_colour = self._mix(self.COLORS["free"], self.COLORS["used"], used_ratio)
+        unknown = cell.get("unknown", 0)
+        total = cell["free"] + cell["used"] + unknown
+        if unknown and total:
+            return self._mix(known_colour, self.COLORS["unknown"], unknown / total)
+        return known_colour
 
     def _draw(self, widget: Gtk.Widget, cr: Any) -> bool:
         allocation = widget.get_allocation()
@@ -354,8 +360,8 @@ class DiskMap(Gtk.DrawingArea):
         cell = self.cells[index]
         tooltip.set_text(
             f"{self.unit_label.capitalize()} {cell['start']:,}–{cell['end']:,}\n"
-            f"Used {cell['used']:,} · Free {cell['free']:,}\n"
-            f"Fragmented {cell['fragmented']:,} · Directory {cell['directory']:,}"
+            f"Used {cell['used']:,} · Free {cell['free']:,} · Unknown {cell.get('unknown', 0):,}\n"
+            f"Fragmented {cell['fragmented']:,} · Directory {cell['directory']:,} · Bad {cell.get('bad', 0):,}"
         )
         return True
 
@@ -375,6 +381,9 @@ class SummaryCard(Gtk.Frame):
         box.pack_start(self.title, False, False, 0)
         box.pack_start(self.value, False, False, 0)
         self.add(box)
+
+    def set_title(self, title: str) -> None:
+        self.title.set_text(title)
 
     def set_value(self, value: str) -> None:
         self.value.set_text(value)
@@ -514,6 +523,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Used", DiskMap.COLORS["used"]),
             ("Fragmented", DiskMap.COLORS["fragmented"]),
             ("Directory", DiskMap.COLORS["directory"]),
+            ("Unknown", DiskMap.COLORS["unknown"]),
             ("Bad/reserved", DiskMap.COLORS["bad"]),
         ):
             item = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
@@ -746,6 +756,10 @@ class MainWindow(Gtk.ApplicationWindow):
         return str(state_dir() / f"{safe_journal_name(self.current_volume.path)}.journal")
 
     def _reset_summary(self) -> None:
+        self.capacity_card.set_title("Capacity")
+        self.free_card.set_title("Free space")
+        self.files_card.set_title("Files")
+        self.fragmented_card.set_title("Fragmentation")
         for card in (self.capacity_card, self.free_card, self.files_card, self.fragmented_card):
             card.set_value("—")
         self.map_caption.set_text("Pixel map · every available drawable pixel increases map detail.")
@@ -794,11 +808,18 @@ class MainWindow(Gtk.ApplicationWindow):
             self.free_card.set_value(
                 f"{human_bytes(free_bytes)} ({free_bytes * 100.0 / max(1, total_bytes):.1f}%)"
             )
+            details = data.get("details") if isinstance(data.get("details"), dict) else {}
+            is_swap = filesystem == "SWAP"
             has_fragmentation_summary = all(
                 key in data
                 for key in ("regular_files", "directories", "fragmented_files", "fragmented_directories")
             )
-            if has_fragmentation_summary:
+            if is_swap:
+                self.files_card.set_title("Usage")
+                used_pages = int(details.get("used_pages", 0))
+                self.files_card.set_value(f"{human_bytes(used_bytes)} used · {used_pages:,} pages")
+                self.fragmented_card.set_value("Not applicable")
+            elif has_fragmentation_summary:
                 self.files_card.set_value(
                     f"{int(data['regular_files']):,} files · {int(data['directories']):,} dirs"
                 )
@@ -839,11 +860,26 @@ class MainWindow(Gtk.ApplicationWindow):
                 unit_name = f"{human_bytes(unit_size)} units"
             self.disk_map.set_unit_label(unit_name)
             per_cell = total_units / max(1, cell_count)
-            self.map_caption.set_text(
-                f"Pixel map: {cell_count:,} cells · approximately {per_cell:,.1f} {unit_name} per cell"
-            )
-            unknown = f" · {human_bytes(unknown_bytes)} unknown" if unknown_bytes else ""
-            if has_fragmentation_summary:
+            if is_swap and bool(details.get("active")):
+                self.map_caption.set_text(
+                    "Physical occupied swap-slot locations are not exposed by the Linux kernel"
+                )
+            elif is_swap:
+                self.map_caption.set_text(
+                    f"Inactive swap area · approximately {per_cell:,.1f} {unit_name} per cell"
+                )
+            else:
+                self.map_caption.set_text(
+                    f"Pixel map: {cell_count:,} cells · approximately {per_cell:,.1f} {unit_name} per cell"
+                )
+            unknown = f" · {human_bytes(unknown_bytes)} location unknown" if unknown_bytes else ""
+            if is_swap:
+                state = "active" if bool(details.get("active")) else "inactive"
+                self.status_label.set_text(
+                    f"SWAP {state} · {human_bytes(used_bytes)} used · "
+                    f"{human_bytes(free_bytes)} free · physical slot locations unavailable"
+                )
+            elif has_fragmentation_summary:
                 self.status_label.set_text(
                     f"{filesystem} · {int(data['fragmented_files'])} fragmented files · "
                     f"{int(data['fragmented_directories'])} fragmented directories"

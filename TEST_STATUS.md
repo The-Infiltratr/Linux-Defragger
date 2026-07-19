@@ -2,6 +2,8 @@
 
 The exact source build passed:
 
+- Synthetic Linux swap headers with inactive accounting, active `/proc/swaps` accounting, reserved header pages, bad-page handling and unknown physical-slot maps.
+- GUI unknown-state rendering and swap-specific usage/fragmentation summaries.
 - Synthetic ext4 extent-tree and ext2 indirect-block images, including fragmented files, fragmented directories, file counts, percentage calculation and map overlays.
 - The complete pre-existing FAT regression suite (`all tests passed`).
 - HFS+ three-extent data-fork relocation with byte-for-byte payload verification.
