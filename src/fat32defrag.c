@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "fat32defrag"
-#define PROGRAM_VERSION "1.5.0"
+#define PROGRAM_VERSION "1.5.1"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)

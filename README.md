@@ -1,6 +1,6 @@
-# Liux Defragger 1.5.0
+# Linux Defragger 1.5.1
 
-Liux Defragger is a self-contained GTK allocation-map and FAT-family defragmentation application.
+Linux Defragger is a self-contained GTK allocation-map and FAT-family defragmentation application.
 
 ## Administrator session
 

@@ -1,7 +1,7 @@
-# 1.5.0
+# 1.5.1
 
-- Renamed the application to **Liux Defragger**.
-- Added `/usr/bin/liux-defragger` and a new application-menu entry.
+- Renamed the application to **Linux Defragger**.
+- Added `/usr/bin/linux-defragger` and a new application-menu entry.
 - Administrator authentication is requested at GUI launch rather than on the first privileged operation.
 - The authenticated helper is retained and reused until the GUI closes.
 - Kept `fat32defrag-gui` as a compatibility launcher for upgrades and existing shortcuts.

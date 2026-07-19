@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 /usr/lib/fat32defrag/fat32defrag_gui.py "$@"

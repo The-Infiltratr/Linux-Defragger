@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/bin/liux-defragger "$@"
+exec /usr/bin/linux-defragger "$@"

@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Liux Defragger
+Name=Linux Defragger
 Comment=Analyse allocation maps and defragment FAT-family filesystems
-Exec=liux-defragger
-Icon=io.github.liuxdefragger
+Exec=linux-defragger
+Icon=io.github.linuxdefragger
 Terminal=false
 Categories=System;Utility;Filesystem;
 Keywords=defrag;filesystem;disk;fat;exfat;allocation;

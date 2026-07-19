@@ -23,16 +23,16 @@ try:
     from gi.repository import Gdk, GLib, Gtk
 except (ImportError, ValueError) as exc:
     print(
-        "Liux Defragger requires GTK 3 Python bindings.\n"
+        "Linux Defragger requires GTK 3 Python bindings.\n"
         "Install them on Linux Mint with:\n"
         "  sudo apt install python3-gi python3-cairo gir1.2-gtk-3.0",
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
 
-APP_ID = "io.github.liuxdefragger"
-APP_NAME = "Liux Defragger"
-VERSION = "1.5.0"
+APP_ID = "io.github.linuxdefragger"
+APP_NAME = "Linux Defragger"
+VERSION = "1.5.1"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -153,7 +153,7 @@ def find_privileged_helper() -> str:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     raise FileNotFoundError(
-        "Could not locate the Liux Defragger privileged helper. Reinstall the application."
+        "Could not locate the Linux Defragger privileged helper. Reinstall the application."
     )
 
 
@@ -466,7 +466,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         title = Gtk.Label()
-        title.set_markup("<span size='x-large' weight='bold'>Liux Defragger</span>")
+        title.set_markup("<span size='x-large' weight='bold'>Linux Defragger</span>")
         title.set_xalign(0)
         subtitle = Gtk.Label(label="Modular maps for modern, Solaris, Amiga, Atari and swap volumes; FAT12/16/32 include compaction and defragmentation")
         subtitle.set_xalign(0)
@@ -1424,7 +1424,7 @@ class Fat32DefragApplication(Gtk.Application):
                     modal=True,
                     message_type=Gtk.MessageType.ERROR,
                     buttons=Gtk.ButtonsType.CLOSE,
-                    text="Unable to start Liux Defragger",
+                    text="Unable to start Linux Defragger",
                 )
                 dialog.format_secondary_text(str(exc))
                 dialog.run()

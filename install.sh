@@ -8,9 +8,10 @@ install -Dm755 "$ROOT/gui/privileged_helper.py" /usr/lib/fat32defrag/privileged_
 install -Dm755 "$ROOT/gui/exfat_engine.py" /usr/lib/fat32defrag/exfat_engine.py
 mkdir -p /usr/lib/fat32defrag/backends
 install -m644 "$ROOT"/gui/backends/*.py /usr/lib/fat32defrag/backends/
+install -Dm755 "$ROOT/packaging/linux-defragger" /usr/bin/linux-defragger
 install -Dm755 "$ROOT/packaging/liux-defragger" /usr/bin/liux-defragger
 install -Dm755 "$ROOT/packaging/fat32defrag-gui" /usr/bin/fat32defrag-gui
-install -Dm644 "$ROOT/packaging/io.github.liuxdefragger.desktop" /usr/share/applications/io.github.liuxdefragger.desktop
-install -Dm644 "$ROOT/packaging/io.github.liuxdefragger.svg" /usr/share/icons/hicolor/scalable/apps/io.github.liuxdefragger.svg
-echo "Installed Liux Defragger 1.5.0."
-echo "Launch it from the application menu or run: liux-defragger"
+install -Dm644 "$ROOT/packaging/io.github.linuxdefragger.desktop" /usr/share/applications/io.github.linuxdefragger.desktop
+install -Dm644 "$ROOT/packaging/io.github.linuxdefragger.svg" /usr/share/icons/hicolor/scalable/apps/io.github.linuxdefragger.svg
+echo "Installed Linux Defragger 1.5.1."
+echo "Launch it from the application menu or run: linux-defragger"
