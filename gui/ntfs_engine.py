@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-26"
+ENGINE_VERSION = "1.8.0-27"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272

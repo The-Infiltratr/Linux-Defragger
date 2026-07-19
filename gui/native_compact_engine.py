@@ -1155,6 +1155,25 @@ def compact_btrfs(device: str) -> int:
             _active_btrfs_fd = None
             os.close(fd)
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="linux-defragger-native-compact",
+        description="Kernel-journalled free-space compaction for ext4, XFS and Btrfs.",
+    )
+    parser.add_argument("operation", choices=("compact",))
+    parser.add_argument("device")
+    parser.add_argument("--filesystem", required=True, choices=("ext4", "xfs", "btrfs"))
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--confirm")
+    # Kept for command-line ABI compatibility with the other native engines.
+    # ext4/XFS/Btrfs use kernel journals rather than a userspace journal file.
+    parser.add_argument("--journal")
+    parser.add_argument("--ram-buffer")
+    parser.add_argument("--workers")
+    parser.add_argument("--live-map-cells", type=int, default=0)
+    return parser.parse_args(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if not args.write or args.confirm != args.device:

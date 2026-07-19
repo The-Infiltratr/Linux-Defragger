@@ -523,23 +523,49 @@ class _KernelTreeSearch:
         self.items_returned = 0
         self.payload_bytes = 0
 
-    def items(self, tree_id: int, item_type: int,
-              min_objectid: int = 0, max_objectid: int = _U64_MAX) -> Iterator[_TreeItem]:
-        min_offset = 0
-        current_objectid = min_objectid
-        while current_objectid <= max_objectid:
+    @staticmethod
+    def _next_key(key: _Key) -> _Key | None:
+        # Btrfs keys are ordered as objectid, type, offset.  TREE_SEARCH_V2
+        # returns a key range, not three independent filters, so advancing only
+        # objectid/offset can repeat or skip items whenever another key type is
+        # encountered between two requested items.
+        if key.offset < _U64_MAX:
+            return _Key(key.objectid, key.type, key.offset + 1)
+        if key.type < 255:
+            return _Key(key.objectid, key.type + 1, 0)
+        if key.objectid < _U64_MAX:
+            return _Key(key.objectid + 1, 0, 0)
+        return None
+
+    def items_of_types(self, tree_id: int, item_types: Iterable[int],
+                       min_objectid: int = 0,
+                       max_objectid: int = _U64_MAX) -> Iterator[_TreeItem]:
+        wanted = {int(value) for value in item_types}
+        if not wanted:
+            return
+        if any(value < 0 or value > 255 for value in wanted):
+            raise BackendError("invalid Btrfs item type")
+
+        min_wanted_type = min(wanted)
+        max_wanted_type = max(wanted)
+        current = _Key(min_objectid, min_wanted_type, 0)
+        maximum = _Key(max_objectid, max_wanted_type, _U64_MAX)
+
+        while (current.objectid, current.type, current.offset) <= (
+            maximum.objectid, maximum.type, maximum.offset
+        ):
             request = bytearray(_SEARCH_ARGS_V2_SIZE + self.buffer_size)
             struct.pack_into(
                 "=QQQQQQQIIIIQQQQ", request, 0,
                 tree_id,
-                current_objectid,
-                max_objectid,
-                min_offset,
-                _U64_MAX,
+                current.objectid,
+                maximum.objectid,
+                current.offset,
+                maximum.offset,
                 0,
                 _U64_MAX,
-                item_type,
-                item_type,
+                current.type,
+                maximum.type,
                 4096,
                 0,
                 0, 0, 0, 0,
@@ -554,7 +580,9 @@ class _KernelTreeSearch:
                         raise BackendError("invalid Btrfs tree-search buffer requirement") from exc
                     self.buffer_size = int(needed)
                     continue
-                raise BackendError(f"Btrfs kernel tree search failed: {os.strerror(exc.errno)}") from exc
+                raise BackendError(
+                    f"Btrfs kernel tree search failed: {os.strerror(exc.errno)}"
+                ) from exc
 
             self.calls += 1
             nr_items = u32le(request, 64)
@@ -572,26 +600,34 @@ class _KernelTreeSearch:
                 end = position + length
                 if end > len(request):
                     raise BackendError("truncated Btrfs tree-search payload")
-                if returned_type != item_type:
-                    raise BackendError("Btrfs tree search returned an unexpected item type")
+                if returned_type > 255:
+                    raise BackendError("Btrfs tree search returned an invalid item type")
                 item_key = _Key(objectid, returned_type, offset)
+                if (item_key.objectid, item_key.type, item_key.offset) < (
+                    current.objectid, current.type, current.offset
+                ):
+                    raise BackendError("Btrfs tree search returned keys out of order")
                 payload = bytes(request[position:end])
                 position = end
                 last_key = item_key
                 self.items_returned += 1
                 self.payload_bytes += length
-                yield _TreeItem(item_key, payload)
+                if returned_type in wanted:
+                    yield _TreeItem(item_key, payload)
 
             if last_key is None:
                 break
-            if last_key.offset < _U64_MAX:
-                current_objectid = last_key.objectid
-                min_offset = last_key.offset + 1
-            elif last_key.objectid < max_objectid:
-                current_objectid = last_key.objectid + 1
-                min_offset = 0
-            else:
+            next_key = self._next_key(last_key)
+            if next_key is None:
                 break
+            current = next_key
+
+    def items(self, tree_id: int, item_type: int,
+              min_objectid: int = 0,
+              max_objectid: int = _U64_MAX) -> Iterator[_TreeItem]:
+        yield from self.items_of_types(
+            tree_id, (item_type,), min_objectid=min_objectid, max_objectid=max_objectid
+        )
 
 
 def kernel_chunk_layout(fd: int, total_bytes: int, devid: int) -> tuple[_Mapper, list[tuple[int, int]], dict]:
@@ -705,10 +741,11 @@ def _kernel_scan_filesystem_trees(search: _KernelTreeSearch,
         inode_modes: dict[int, int] = {}
         file_runs: dict[int, list[_FileRun]] = {}
         try:
-            for item in search.items(objectid, _INODE_ITEM):
-                if len(item.data) >= 56:
-                    inode_modes[item.key.objectid] = stat.S_IFMT(u32le(item.data, 52))
-            for item in search.items(objectid, _EXTENT_DATA):
+            for item in search.items_of_types(objectid, (_INODE_ITEM, _EXTENT_DATA)):
+                if item.key.type == _INODE_ITEM:
+                    if len(item.data) >= 56:
+                        inode_modes[item.key.objectid] = stat.S_IFMT(u32le(item.data, 52))
+                    continue
                 if len(item.data) < 21:
                     continue
                 extent_type = item.data[20]
@@ -788,11 +825,12 @@ def _kernel_map(path: str, cells: int) -> dict:
             roots = _root_records(root_items)
 
             used_bytes_ranges: list[tuple[int, int]] = []
-            for item_type in (_EXTENT_ITEM, _METADATA_ITEM):
-                for item in search.items(_EXTENT_TREE_OBJECTID, item_type):
-                    length = item.key.offset if item_type == _EXTENT_ITEM else nodesize
-                    if item.key.objectid and length:
-                        used_bytes_ranges.extend(mapper.physical_ranges(item.key.objectid, length))
+            for item in search.items_of_types(
+                _EXTENT_TREE_OBJECTID, (_EXTENT_ITEM, _METADATA_ITEM)
+            ):
+                length = item.key.offset if item.key.type == _EXTENT_ITEM else nodesize
+                if item.key.objectid and length:
+                    used_bytes_ranges.extend(mapper.physical_ranges(item.key.objectid, length))
 
             for mirror in (64 * 1024, 64 * 1024 * 1024, 256 * 1024**3):
                 if mirror + _SUPER_SIZE <= total_bytes:

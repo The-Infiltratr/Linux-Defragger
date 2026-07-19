@@ -202,8 +202,44 @@ def test_kernel_tree_search_parser() -> None:
     assert search.calls == 2
 
 
+
+def test_kernel_tree_search_filters_intermediate_item_types_and_advances_full_key() -> None:
+    calls = 0
+    wanted_payload = chunk_item(DATA_LENGTH, 3, 1, [(1, DATA_PHYS)])
+    other_payload = b'other'
+    original = btrfs.fcntl.ioctl
+
+    def fake_ioctl(fd, request_code, request, mutate=True):
+        nonlocal calls
+        assert request_code == btrfs.BTRFS_IOC_TREE_SEARCH_V2
+        if calls == 0:
+            struct.pack_into('=I', request, 64, 2)
+            pos = 112
+            struct.pack_into('=QQQII', request, pos, 1, 100, 5, 12, len(other_payload))
+            pos += 32
+            request[pos:pos + len(other_payload)] = other_payload
+            pos += len(other_payload)
+            struct.pack_into('=QQQII', request, pos, 1, 256, DATA_LOGICAL, 228, len(wanted_payload))
+            pos += 32
+            request[pos:pos + len(wanted_payload)] = wanted_payload
+        else:
+            struct.pack_into('=I', request, 64, 0)
+        calls += 1
+        return 0
+
+    try:
+        btrfs.fcntl.ioctl = fake_ioctl
+        search = btrfs._KernelTreeSearch(9, 64 * 1024)
+        items = list(search.items(3, 228))
+    finally:
+        btrfs.fcntl.ioctl = original
+    assert [item.key.type for item in items] == [228]
+    assert items[0].key.objectid == 256
+    assert search.calls == 2
+
 def main() -> int:
     test_kernel_tree_search_parser()
+    test_kernel_tree_search_filters_intermediate_item_types_and_advances_full_key()
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "btrfs.img"
         make_image(path)

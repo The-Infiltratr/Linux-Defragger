@@ -1,15 +1,28 @@
-# Test status for 1.8.0-26
+# Linux Defragger 1.8.0-27 test status
+
+Passed focused tests:
+
+- Native Compact parser accepts the exact GUI ABI for EXT4/XFS/Btrfs.
+- Native Compact module compilation and command-line parsing.
+- Btrfs TREE_SEARCH_V2 parser with mixed intermediate key types.
+- Btrfs full-key pagination and wanted-type filtering.
+- Single-pass Btrfs inode/file-extent and extent/metadata tree scans.
+- Existing Btrfs synthetic allocation and fragmentation analysis.
+- Existing EXT4/XFS collector, donor-offset, live-map and fixed-point planner tests.
+
+Physical EXT4 and Btrfs write-path validation remains dependent on the removable-media test volumes.
+
+# Test status for 1.8.0-27
 
 Validated in this build environment:
 
-- Native Compact ioctl numbers and binary request layouts against the installed Linux UAPI headers for FIEMAP, ext4 move-extent and Btrfs resize.
-- Btrfs resize request packing, conservative temporary-boundary calculations and original-size restoration paths.
-- Btrfs `TREE_SEARCH_V2` response parsing and pagination using synthetic kernel responses.
+- Native Compact ioctl numbers and binary request layouts for FIEMAP, ext4 move-extent, XFS range exchange and Btrfs resize.
+- Btrfs resize request packing, live chunk-tree parsing and shrink-target planning.
 - Lowest-gap/highest-source planning, partial suffix selection, physical-range merging, capability advertising, GUI dispatch and privileged-helper allowlisting.
 - Python syntax checks for the native compact engine, GUI and privileged helper.
 - Existing synthetic Btrfs and XFS analyser tests, including corrected Btrfs leaf offsets and multi-level XFS trees.
 - Existing focused FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper, Growth Defrag and GUI tests remain present.
-- Unified version reporting and package metadata identify revision `1.8.0-26`.
+- Unified version reporting and package metadata identify revision `1.8.0-27`.
 
 
 Revision-24 regression coverage additionally validates:
@@ -38,9 +51,9 @@ Safety boundaries retained in the untested physical paths:
 - If the allocator does not place the donor in the exact requested low hole, no exchange occurs and the pass stops.
 - Unsupported inode flags and FIEMAP extent states are skipped. Filesystem metadata is never rewritten directly.
 - XFS kernels without `XFS_IOC_EXCHANGE_RANGE` fail before a mapping exchange.
-- Btrfs is limited to single-device non-striped layouts and re-reads the physical chunk layout through the mounted kernel after each resize.
-- SIGINT requests an interruptible Btrfs resize stop; cleanup restores the original filesystem size. ext4/XFS stop between completed exchange transactions.
+- Btrfs is limited to single-device non-striped layouts and re-reads the physical chunk layout after each shrink-and-restore cycle.
+- SIGINT stops Btrfs before the next resize cycle or stops ext4/XFS between completed exchange transactions.
 
 ## Long-suite status
 
-Focused revision-26 tests pass. The complete historical regression suite is substantially longer and was not used as a substitute for the missing real-device mutation tests.
+Focused revision-25 tests pass. The complete historical regression suite is substantially longer and was not used as a substitute for the missing real-device mutation tests.

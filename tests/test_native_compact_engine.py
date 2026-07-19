@@ -45,6 +45,20 @@ def test_ioctl_layouts():
     }
 
 
+
+def test_native_compact_argument_parser_is_present_and_accepts_gui_abi():
+    args = n.parse_args([
+        'compact', '/dev/test', '--write', '--confirm', '/dev/test',
+        '--journal', '/run/test.journal', '--filesystem', 'ext4',
+        '--ram-buffer', 'auto', '--workers', 'auto', '--live-map-cells', '262080',
+    ])
+    assert args.operation == 'compact'
+    assert args.device == '/dev/test'
+    assert args.filesystem == 'ext4'
+    assert args.write is True
+    assert args.confirm == '/dev/test'
+    assert args.live_map_cells == 262080
+
 def test_tail_source_selection_and_partial_suffix():
     heap = []
     low = n.SourceExtent('/low', 0, 100, 50, 0, 0)

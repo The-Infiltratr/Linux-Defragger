@@ -1,20 +1,12 @@
-# Linux Defragger 1.8.0-26
+# Linux Defragger 1.8.0-27
 
-- Replaces the unreliable Btrfs balance compactor. Balance source-range filters did not control destination placement and could move chunks higher, increasing internal gaps.
-- Btrfs Compact now uses a temporary online shrink followed by restoration to the exact original filesystem size. The kernel relocates chunks above the temporary boundary into lower available chunk ranges without invoking file defragmentation.
-- Reads the chunk layout through `BTRFS_IOC_TREE_SEARCH_V2` before and after every resize, eliminating the stale raw chunk-root snapshot that caused `tree-block bytenr mismatch` after a balance transaction.
-- Adds restoration cleanup for normal completion, errors and Stop requests so a successful temporary shrink is always followed by an attempt to restore the original size.
-- Accelerates physical Btrfs Analyse by using the mounted kernel tree-search interface for chunk, root, extent, inode and file-extent items. Regular-file image tests retain the raw walker.
-- Adds a unique-block cache to the raw Btrfs tree reader, preventing repeated reads of shared tree blocks during image and fallback analysis.
-- Adds regression coverage for kernel tree-search parsing, resize ioctl packing, conservative shrink-target planning and the absence of the old balance path.
-
-- Adds real-time EXT4 and XFS Compact allocation-map updates. Every completed kernel mapping exchange reports the low destination and released high source range to the GUI, which redraws the cached map without rescanning the device.
-- Keeps the live display honest: physical used/free movement is updated during Compact, while exact fragmentation colours are recalculated by the normal final analysis.
-- Makes EXT4/XFS Compact automatically repeat complete collector passes until a fresh pass moves no more regular-file data. A second click is no longer required merely because releasing the first pass collector exposed additional compaction opportunities.
-- Uses monotonic multi-pass progress reporting and retains safe stopping between completed kernel-journalled transactions and between collector passes.
-- Corrects EXT allocation reporting so reserved low-numbered system inodes such as the journal and resize inode are not counted as ordinary files or fragmented user data.
-- Marks known EXT superblock/descriptor, block-bitmap, inode-bitmap, inode-table and reserved-system-inode allocations as **Bad/reserved** on the map. This distinguishes fixed filesystem structures from movable blue file data.
-- Reports the online compaction boundary explicitly: remaining islands in the free tail can be directories, journals, allocation metadata or other mappings that the regular-file extent-exchange interface cannot relocate.
+- Restores the native Compact command-line parser that was accidentally omitted from revision 26. EXT4, XFS and Btrfs Compact can again accept the GUI command ABI instead of failing immediately with `NameError: parse_args is not defined`.
+- Adds a regression test that executes the exact argument sequence sent by the GUI, so the native Compact engine cannot be packaged without its parser again.
+- Corrects Btrfs `TREE_SEARCH_V2` handling. Btrfs search bounds describe one lexicographic key interval; they are not independent object/type filters, so valid intermediate item types can be returned. Revision 26 incorrectly treated those items as corruption.
+- Advances Btrfs searches using the complete `(objectid, type, offset)` key and filters wanted item types after parsing. This fixes `Btrfs tree search returned an unexpected item type` on genuine volumes.
+- Scans each Btrfs filesystem tree once for inode and file-extent items, and scans the extent tree once for data and metadata extent items. This avoids duplicate whole-tree searches and substantially reduces Analyse latency.
+- Keeps Btrfs Compact on the shrink-and-restore path introduced in revision 26; the corrected live chunk-tree reader is now shared by Analyse and Compact.
+- Clarifies EXT4 Compact reporting: an unmounted filesystem still contains permanently allocated block-group descriptors, bitmaps, inode tables, journals and directory blocks. The current kernel extent-exchange path packs movable regular-file extents but cannot erase those structural allocations from an unchanged EXT4 geometry.
 
 # Revision 24
 
