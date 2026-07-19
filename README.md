@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-16
+# Linux Defragger 1.8.0-18
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -21,6 +21,12 @@ Growth Defrag works in two durable phases:
 2. Preserve the current physical object order, rebuild each file or directory as one contiguous chain, and insert the requested free gap after each regular file.
 
 Objects are placed from the end of the plan backwards. When a destination overlaps the object's current allocation, the complete object is first moved into the reusable terminal workspace and then placed at its final location. Every move uses the normal external mapped-cluster journal, so Recover can finish an interrupted transaction.
+
+Growth Defrag uses RAM-backed multi-object batches. Several complete files and directories are read into the relocation cache, written sequentially, and committed through one journal and one grouped metadata update. On systems with substantial free memory, automatic mode preserves 8 GiB for Linux and can use up to 16 GiB as the cache budget; an individual Growth Defrag transaction is capped at 4 GiB to keep journal size and safe-stop latency bounded. SD/eMMC targets use two ordered read workers automatically, while rotational media use one.
+
+Before either phase begins, Growth Defrag performs an idempotence preflight. If every allocated FAT object is already contiguous and every regular file already has at least the requested free reserve immediately after it, the engine reports **Not needed** and performs no compaction, relocation, FAT update or filesystem write. Extra free space after a file is accepted; it is not destroyed merely to reproduce an exact percentage.
+
+Normal GUI output reports batch summaries rather than every filename. Direct command-line users can request object-level detail with `--verbose` or write it to a file with `--diagnostic-log PATH`. FAT long-file-name records are decoded from UTF-16 to UTF-8 for these reports.
 
 The operation refuses to start unless the volume has enough free clusters for both the requested growth gaps and a workspace at least as large as the largest allocated FAT object. It never silently reduces the requested percentage.
 

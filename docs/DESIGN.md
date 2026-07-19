@@ -113,10 +113,9 @@ contiguous file A | proportional free gap | contiguous file B | proportional fre
 ```
 
 The requested percentage is converted to whole clusters with ceiling rounding
-for each non-empty regular file. Directories receive no deliberate gap. Before
-any mutation, the planner verifies that free space can hold the complete reserve
-plus a terminal workspace at least as large as the largest allocated file or
-directory chain.
+for each non-empty regular file. Directories receive no deliberate gap. Before any mutation, the planner first performs an idempotence preflight. It verifies whether every allocated object is already contiguous and whether every regular file is followed immediately by at least the requested number of free usable clusters. An already-correct layout returns without running Compact or rewriting any object. Extra post-file free space is accepted because reducing it would provide no benefit.
+
+If work is required, the planner verifies that free space can hold the complete reserve plus a terminal workspace at least as large as the largest allocated file or directory chain.
 
 Phase one runs the normal FAT compactor. Phase two rescans the filesystem, orders
 the FAT32 root (where applicable), directories and regular files by their current

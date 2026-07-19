@@ -1,11 +1,10 @@
-# Test status for 1.8.0-16
+# Test status for 1.8.0-18
 
-- Both C engines compile cleanly with the normal warning set.
+- Both C engines compile cleanly with the normal strict warning set.
 - Python syntax compilation passes for the GTK GUI, privileged helper, backend modules, native filesystem engines and test scripts.
-- Normal FAT12, FAT16 and FAT32 Growth Defrag tests pass, including exact payload preservation, contiguous final chains and the requested post-file expansion gaps.
-- A destructive interrupted-preparation test confirms the engine exits with status `130`, removes the active journal, leaves the filesystem readable and reports **Stopped safely during preparation**.
-- The interrupted-preparation output no longer says `phase 1 complete`, no longer claims a zero-percent reserve was applied, and explicitly reports that the layout was not started and no expansion gaps were applied.
-- The GTK wiring test confirms status `130` is handled as **Stopped safely**, not as success or failure, and that the safe-stop status is restored after the allocation-map refresh.
-- Mounted-analysis policy, allocation mapper, EXT, NTFS analysis and swap backend focused tests pass.
-- The complete long-running regression script reached the 20-minute execution limit during unchanged FAT compaction coverage without reporting a failure before it was stopped. It did not complete in this build environment.
-- Real physical FAT media have not been used for this revision; validation was performed on controlled destructive filesystem images.
+- FAT32 Growth Defrag destructive tests pass with exact payload preservation, contiguous final chains and the requested post-file expansion gaps.
+- A second Growth Defrag pass on the completed FAT32 test layout reports **Not needed**, performs zero buffered reads and writes, and leaves the complete filesystem image byte-for-byte unchanged.
+- The preflight accepts at least the requested reserve, so harmless extra post-file free space does not trigger a destructive rebuild.
+- FAT12 and FAT16 Growth Defrag layout tests continue to pass.
+- RAM-backed multi-object batching, safe Stop, UTF-8 long filenames, mounted-analysis policy, allocation mapper, EXT, NTFS and swap focused tests remain covered.
+- Real physical FAT media have not been used for revision 18; destructive validation was performed on controlled filesystem images.

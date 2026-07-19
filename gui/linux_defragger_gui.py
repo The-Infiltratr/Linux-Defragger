@@ -44,7 +44,7 @@ except (ImportError, ValueError) as exc:
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
 BASE_VERSION = "1.8.0"
-PACKAGE_REVISION = "16"
+PACKAGE_REVISION = "18"
 VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
@@ -427,6 +427,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.pulse_id: int | None = None
         self.determinate_progress = False
         self.post_analysis_status: str | None = None
+        self.post_analysis_progress_text: str | None = None
         self.map_resize_timeout_id: int | None = None
         self.last_map_cell_target = 0
 
@@ -1081,8 +1082,9 @@ class MainWindow(Gtk.ApplicationWindow):
             if self.post_analysis_status is not None:
                 self.status_label.set_text(self.post_analysis_status)
                 self.progress.set_fraction(1.0)
-                self.progress.set_text("Stopped safely")
+                self.progress.set_text(self.post_analysis_progress_text or "Complete")
                 self.post_analysis_status = None
+                self.post_analysis_progress_text = None
 
         self._run_engine_with_permission_retry(args, "analysis", parsed)
 
@@ -1605,6 +1607,7 @@ class MainWindow(Gtk.ApplicationWindow):
             )
             self.status_label.set_text(f"{display_name} stopped safely.")
             self.post_analysis_status = f"{display_name} stopped safely · allocation map refreshed"
+            self.post_analysis_progress_text = "Stopped safely"
             if on_success:
                 on_success(output)
         elif returncode == 0:
@@ -1615,7 +1618,21 @@ class MainWindow(Gtk.ApplicationWindow):
                 "growth-defrag": "Growth Defrag",
                 "recover": "Recovery",
             }.get(purpose, purpose.capitalize())
-            self.status_label.set_text(f"{display_name} completed successfully.")
+            no_growth_changes = (
+                purpose == "growth-defrag"
+                and "Growth Defrag status:          Not needed;" in output
+            )
+            if no_growth_changes:
+                self.progress.set_text("Not needed")
+                self.status_label.set_text(
+                    "Growth Defrag not needed; the existing layout already satisfies the 10% reserve."
+                )
+                self.post_analysis_status = (
+                    "Growth Defrag not needed · existing 10% growth-space layout verified"
+                )
+                self.post_analysis_progress_text = "Not needed"
+            else:
+                self.status_label.set_text(f"{display_name} completed successfully.")
             if on_success:
                 on_success(output)
         else:

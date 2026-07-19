@@ -218,6 +218,17 @@ done
   >"$TMP/growth-defrag.txt"
 grep -q 'Growth Defrag applied reserve: 10% (3 clusters)' "$TMP/growth-defrag.txt"
 "$ROOT/tests/verify_growth_defrag.py" "$TMP/growth-defrag.img" >/dev/null
+sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
+"$BIN" growth-defrag "$TMP/growth-defrag.img" --write \
+  --confirm "$TMP/growth-defrag.img" --growth-percent 10 --batch-clusters 128 \
+  >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
+grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
+  "$TMP/growth-defrag-idempotent.txt"
+grep -q 'No preparation compaction or file relocation is required.' \
+  "$TMP/growth-defrag-idempotent.err"
+grep -q 'Growth Defrag changes:         None' "$TMP/growth-defrag-idempotent.txt"
+sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-after.sha"
+cmp "$TMP/growth-defrag-idempotent-before.sha" "$TMP/growth-defrag-idempotent-after.sha"
 "$BIN" analyze "$TMP/growth-defrag.img" >"$TMP/growth-defrag-after.txt"
 grep -q 'Fragmented files:       0' "$TMP/growth-defrag-after.txt"
 
