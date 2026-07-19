@@ -2,6 +2,7 @@
 
 The exact source build passed:
 
+- Synthetic ext4 extent-tree and ext2 indirect-block images, including fragmented files, fragmented directories, file counts, percentage calculation and map overlays.
 - The complete pre-existing FAT regression suite (`all tests passed`).
 - HFS+ three-extent data-fork relocation with byte-for-byte payload verification.
 - HFS+ pre-switch rollback at copied and destination-ready phases.

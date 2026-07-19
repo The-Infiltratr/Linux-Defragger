@@ -187,6 +187,7 @@ grep -q 'Ordered extent moves:    0 (0 clusters; 0 singletons)' "$TMP/gapped-com
 grep -q 'Fragmented files:       0' "$TMP/gapped-after.txt"
 grep -q 'Free gaps below it:       0 clusters' "$TMP/gapped-compact.txt"
 
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ext_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_backend.py" >/dev/null
 
 echo 'all tests passed'

@@ -1,5 +1,6 @@
 # Linux Defragger 1.8.0
 
+- Added read-only ext2/ext3/ext4 inode and extent-tree scanning so Analyse reports file and directory fragmentation and marks fragmented extents on the allocation map.
 - Analyse and allocation-map operations now work on mounted volumes using read-only access; write operations still require an unmounted volume.
 - Mounted analysis is labelled as a live snapshot because filesystem activity can change the result during a scan.
 - Added journalled Compact, Defragment and Recover support for classic HFS.
