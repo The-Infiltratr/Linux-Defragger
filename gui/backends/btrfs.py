@@ -283,9 +283,16 @@ class _TreeReader:
                 for index in range(nritems):
                     pos = _HEADER_SIZE + index * _ITEM_SIZE
                     item_key = _key(raw, pos)
-                    data_offset = u32le(raw, pos + 17)
+                    # btrfs_item.offset is relative to the end of the 0x65-byte
+                    # tree header, not to byte zero of the tree block.  Treating
+                    # it as an absolute block offset works on a synthetic image
+                    # built with the same mistake, but reads arbitrary bytes from
+                    # genuine Btrfs leaves and corrupts every item parser.
+                    relative_offset = u32le(raw, pos + 17)
                     data_size = u32le(raw, pos + 21)
-                    if data_offset < _HEADER_SIZE + nritems * _ITEM_SIZE:
+                    data_offset = _HEADER_SIZE + relative_offset
+                    item_table_end = _HEADER_SIZE + nritems * _ITEM_SIZE
+                    if data_offset < item_table_end:
                         raise BackendError("Btrfs leaf item overlaps its item table")
                     if data_offset + data_size > self.nodesize:
                         raise BackendError("Btrfs leaf item lies outside the tree block")

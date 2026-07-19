@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-21
+# Linux Defragger 1.8.0-22
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 

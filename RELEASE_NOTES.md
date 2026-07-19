@@ -1,4 +1,10 @@
-# Linux Defragger 1.8.0 package revision 21
+# Linux Defragger 1.8.0-22
+
+- Corrects the native Btrfs leaf-item parser. On disk, each leaf item data offset is relative to the end of the 101-byte tree header; revision 21 incorrectly treated it as an absolute block offset.
+- Updates the Btrfs regression image to use the genuine on-disk offset encoding, so the former parser mistake can no longer pass its own synthetic test.
+- Keeps Btrfs strictly read-only and leaves XFS unchanged.
+
+## Revision 21
 
 - Replaces the Btrfs aggregate-summary placeholder with a genuine native read-only analyser for supported single-device filesystems.
 - Walks the Btrfs system chunk array, chunk tree, root tree, extent tree and live filesystem trees directly, without invoking `btrfs-progs`.

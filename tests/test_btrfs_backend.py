@@ -75,7 +75,7 @@ def leaf(bytenr: int, owner: int, items: list[tuple[bytes, bytes]]) -> bytes:
         block[cursor:cursor + len(payload)] = payload
         pos = 101 + index * 25
         block[pos:pos + 17] = raw_key
-        struct.pack_into("<II", block, pos + 17, cursor, len(payload))
+        struct.pack_into("<II", block, pos + 17, cursor - 101, len(payload))
     return bytes(block)
 
 
