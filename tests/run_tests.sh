@@ -224,8 +224,13 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
   >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
   "$TMP/growth-defrag-idempotent.txt"
+grep -q 'Growth Defrag preflight (1.8.0-19): checking' \
+  "$TMP/growth-defrag-idempotent.err"
+grep -q 'Growth Defrag preflight result: the existing FAT layout already satisfies' \
+  "$TMP/growth-defrag-idempotent.err"
 grep -q 'No preparation compaction or file relocation is required.' \
   "$TMP/growth-defrag-idempotent.err"
+! grep -q 'Growth Defrag phase 1:' "$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag changes:         None' "$TMP/growth-defrag-idempotent.txt"
 sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-after.sha"
 cmp "$TMP/growth-defrag-idempotent-before.sha" "$TMP/growth-defrag-idempotent-after.sha"

@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.8.0-18"
+#define PROGRAM_VERSION "1.8.0-19"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -2438,9 +2438,28 @@ typedef struct {
     bool interrupted;
     bool layout_started;
     bool already_satisfied;
+    bool canonical_layout_verified;
     size_t checked_files;
     size_t checked_directories;
 } GrowthStats;
+
+typedef enum {
+    GROWTH_PREFLIGHT_OK = 0,
+    GROWTH_PREFLIGHT_NO_FILES,
+    GROWTH_PREFLIGHT_ROOT_FRAGMENTED,
+    GROWTH_PREFLIGHT_OBJECT_FRAGMENTED,
+    GROWTH_PREFLIGHT_RESERVE_SHORT,
+} GrowthPreflightIssue;
+
+typedef struct {
+    GrowthPreflightIssue issue;
+    size_t regular_files;
+    size_t directories;
+    size_t reserve_clusters;
+    size_t required_reserve;
+    size_t available_reserve;
+    char *problem_path;
+} GrowthPreflight;
 
 static void growth_object_list_push(GrowthObjectList *list, GrowthObject object) {
     if (list->len == list->cap) {
@@ -2603,26 +2622,21 @@ static bool chain_is_exact_run(const U32Vec *chain, uint32_t start) {
     return true;
 }
 
-/* Growth Defrag is intended to be idempotent.  An existing layout is already
-   satisfactory when every allocated object is contiguous and every regular
-   file is followed immediately by at least the requested number of genuinely
-   free usable clusters.  Extra free space is harmless and does not justify
-   compacting and rebuilding an otherwise correct growth layout. */
-static bool growth_layout_already_satisfies(Fat32 *fs, const FileList *files,
-                                            unsigned percent,
-                                            size_t *regular_files_out,
-                                            size_t *directories_out,
-                                            size_t *reserve_clusters_out) {
-    size_t regular_files = 0;
-    size_t directories = 0;
-    size_t reserve_clusters = 0;
+/* Growth Defrag is intended to be idempotent.  The preflight is deliberately
+   read-only and records the first reason an existing layout cannot be accepted.
+   It is run before any journal is created or any FAT/data write is attempted. */
+static GrowthPreflight growth_layout_preflight(Fat32 *fs, const FileList *files,
+                                                unsigned percent) {
+    GrowthPreflight result = {0};
 
     U32Vec root = filesystem_root_chain(fs);
     if (root.len != 0) {
-        directories++;
+        result.directories++;
         if (!chain_is_exact_run(&root, root.v[0])) {
+            result.issue = GROWTH_PREFLIGHT_ROOT_FRAGMENTED;
+            result.problem_path = xstrdup("<root directory>");
             u32vec_free(&root);
-            return false;
+            return result;
         }
     }
     u32vec_free(&root);
@@ -2630,38 +2644,116 @@ static bool growth_layout_already_satisfies(Fat32 *fs, const FileList *files,
     for (size_t i = 0; i < files->len; i++) {
         const FileRecord *file = &files->v[i];
         if (file->chain.len == 0) continue;
-        if (!chain_is_exact_run(&file->chain, file->chain.v[0])) return false;
+        if (!chain_is_exact_run(&file->chain, file->chain.v[0])) {
+            result.issue = GROWTH_PREFLIGHT_OBJECT_FRAGMENTED;
+            result.problem_path = xstrdup(file->path);
+            return result;
+        }
         if (file->is_dir) {
-            directories++;
+            result.directories++;
             continue;
         }
 
-        regular_files++;
+        result.regular_files++;
         uint64_t scaled = (uint64_t)file->chain.len * percent;
         size_t reserve = (size_t)((scaled + 99) / 100);
-        if (reserve > SIZE_MAX - reserve_clusters) return false;
-        reserve_clusters += reserve;
+        if (reserve > SIZE_MAX - result.reserve_clusters) {
+            result.issue = GROWTH_PREFLIGHT_RESERVE_SHORT;
+            result.problem_path = xstrdup(file->path);
+            result.required_reserve = reserve;
+            return result;
+        }
+        result.reserve_clusters += reserve;
 
         uint64_t cursor64 = (uint64_t)file->chain.v[0] + file->chain.len;
-        size_t remaining = reserve;
-        while (remaining != 0) {
-            if (cursor64 > fs->max_cluster) return false;
+        size_t available = 0;
+        while (available < reserve) {
+            if (cursor64 > fs->max_cluster) break;
             uint32_t cluster = (uint32_t)cursor64;
             uint32_t value = fat_value(fs, cluster);
             if (value == fat_bad_value(fs)) {
                 cursor64++;
                 continue;
             }
-            if (!fat_is_free(fs, cluster)) return false;
-            remaining--;
+            if (!fat_is_free(fs, cluster)) break;
+            available++;
             cursor64++;
+        }
+        if (available < reserve) {
+            result.issue = GROWTH_PREFLIGHT_RESERVE_SHORT;
+            result.problem_path = xstrdup(file->path);
+            result.required_reserve = reserve;
+            result.available_reserve = available;
+            return result;
         }
     }
 
-    *regular_files_out = regular_files;
-    *directories_out = directories;
-    *reserve_clusters_out = reserve_clusters;
-    return regular_files != 0;
+    result.issue = result.regular_files == 0 ? GROWTH_PREFLIGHT_NO_FILES : GROWTH_PREFLIGHT_OK;
+    return result;
+}
+
+static void growth_preflight_free(GrowthPreflight *preflight) {
+    free(preflight->problem_path);
+    preflight->problem_path = NULL;
+}
+
+/* A second, independent idempotence check recognises the exact canonical
+   physical layout produced by Growth Defrag.  It compares every object's live
+   first cluster with a fresh read-only plan generated from the current physical
+   order.  scan_files() has already rejected lost or unreferenced FAT chains, so
+   matching canonical targets also proves that the planned inter-file gaps are
+   genuinely unallocated. */
+static bool growth_layout_matches_canonical(Fat32 *fs, GrowthObjectList *objects,
+                                            unsigned percent,
+                                            size_t *reserve_clusters_out) {
+    if (fs->max_cluster == UINT32_MAX) return false;
+    uint32_t limit_exclusive = fs->max_cluster + 1;
+    size_t reserve_total = 0;
+    uint32_t layout_end = 0;
+    if (!plan_growth_layout(fs, objects, percent, limit_exclusive,
+                            &reserve_total, &layout_end)) {
+        return false;
+    }
+    (void)layout_end;
+    for (size_t i = 0; i < objects->len; i++) {
+        if (objects->v[i].target != objects->v[i].physical_first) return false;
+    }
+    *reserve_clusters_out = reserve_total;
+    return objects->len != 0;
+}
+
+static void print_growth_preflight_failure(const GrowthPreflight *preflight,
+                                           unsigned percent) {
+    switch (preflight->issue) {
+        case GROWTH_PREFLIGHT_NO_FILES:
+            fprintf(stderr,
+                    "Growth Defrag preflight result: no allocated regular files were found.\n");
+            break;
+        case GROWTH_PREFLIGHT_ROOT_FRAGMENTED:
+            fprintf(stderr,
+                    "Growth Defrag preflight result: the FAT root directory is fragmented.\n");
+            break;
+        case GROWTH_PREFLIGHT_OBJECT_FRAGMENTED:
+            fprintf(stderr,
+                    "Growth Defrag preflight result: %s is fragmented.\n",
+                    preflight->problem_path == NULL ? "an allocated object" : preflight->problem_path);
+            break;
+        case GROWTH_PREFLIGHT_RESERVE_SHORT:
+            fprintf(stderr,
+                    "Growth Defrag preflight result: %s has %zu usable free cluster%s immediately "
+                    "after it; %zu %s required for a %u%% reserve.\n",
+                    preflight->problem_path == NULL ? "a regular file" : preflight->problem_path,
+                    preflight->available_reserve,
+                    preflight->available_reserve == 1 ? "" : "s",
+                    preflight->required_reserve,
+                    preflight->required_reserve == 1 ? "is" : "are",
+                    percent);
+            break;
+        case GROWTH_PREFLIGHT_OK:
+            break;
+    }
+    fprintf(stderr,
+            "Growth Defrag preflight completed read-only; no filesystem writes have occurred yet.\n");
 }
 
 static bool cluster_range_is_free(const Fat32 *fs, uint32_t start, size_t length) {
@@ -2759,30 +2851,48 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
         &regular_files, &directories);
     uint64_t free_before = count_free_clusters(fs);
 
-    size_t checked_files = 0;
-    size_t checked_directories = 0;
-    size_t existing_reserve = 0;
-    if (growth_layout_already_satisfies(fs, &initial_files, requested_percent,
-                                        &checked_files, &checked_directories,
-                                        &existing_reserve)) {
+    fprintf(stderr,
+            "Growth Defrag preflight (%s): checking %zu regular file%s and %zu director%s "
+            "for contiguity and a %u%% post-file reserve.\n",
+            PROGRAM_VERSION,
+            regular_files, regular_files == 1 ? "" : "s",
+            directories, directories == 1 ? "y" : "ies",
+            requested_percent);
+    GrowthPreflight preflight = growth_layout_preflight(
+        fs, &initial_files, requested_percent);
+    size_t existing_reserve = preflight.reserve_clusters;
+    bool canonical_verified = false;
+    if (regular_files != 0 &&
+        preflight.issue != GROWTH_PREFLIGHT_OK &&
+        preflight.issue != GROWTH_PREFLIGHT_OBJECT_FRAGMENTED &&
+        preflight.issue != GROWTH_PREFLIGHT_ROOT_FRAGMENTED) {
+        canonical_verified = growth_layout_matches_canonical(
+            fs, &initial_objects, requested_percent, &existing_reserve);
+    }
+    if (preflight.issue == GROWTH_PREFLIGHT_OK || canonical_verified) {
         stats.already_satisfied = true;
+        stats.canonical_layout_verified = canonical_verified;
         stats.applied_percent = requested_percent;
         stats.reserve_clusters = existing_reserve;
-        stats.checked_files = checked_files;
-        stats.checked_directories = checked_directories;
+        stats.checked_files = regular_files;
+        stats.checked_directories = directories;
         fprintf(stderr,
-                "Growth Defrag preflight: the existing FAT layout already satisfies "
-                "%u%% growth reserve for %zu regular file%s; %zu director%s %s contiguous.\n",
-                requested_percent, checked_files, checked_files == 1 ? "" : "s",
-                checked_directories, checked_directories == 1 ? "y" : "ies",
-                checked_directories == 1 ? "is" : "are");
+                "Growth Defrag preflight result: the existing FAT layout already satisfies "
+                "%u%% growth reserve for %zu regular file%s; %zu director%s %s contiguous%s.\n",
+                requested_percent, regular_files, regular_files == 1 ? "" : "s",
+                directories, directories == 1 ? "y" : "ies",
+                directories == 1 ? "is" : "are",
+                canonical_verified ? " (canonical layout verification)" : "");
         fprintf(stderr,
                 "No preparation compaction or file relocation is required.\n");
+        growth_preflight_free(&preflight);
         growth_object_list_free(&initial_objects);
         filelist_free(&initial_files);
         dirreflist_free(&initial_refs);
         return stats;
     }
+    print_growth_preflight_failure(&preflight, requested_percent);
+    growth_preflight_free(&preflight);
 
     if (initial_objects.len == 0 || regular_files == 0) {
         growth_object_list_free(&initial_objects);

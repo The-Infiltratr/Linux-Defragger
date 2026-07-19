@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-18
+# Linux Defragger 1.8.0-19
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -24,7 +24,7 @@ Objects are placed from the end of the plan backwards. When a destination overla
 
 Growth Defrag uses RAM-backed multi-object batches. Several complete files and directories are read into the relocation cache, written sequentially, and committed through one journal and one grouped metadata update. On systems with substantial free memory, automatic mode preserves 8 GiB for Linux and can use up to 16 GiB as the cache budget; an individual Growth Defrag transaction is capped at 4 GiB to keep journal size and safe-stop latency bounded. SD/eMMC targets use two ordered read workers automatically, while rotational media use one.
 
-Before either phase begins, Growth Defrag performs an idempotence preflight. If every allocated FAT object is already contiguous and every regular file already has at least the requested free reserve immediately after it, the engine reports **Not needed** and performs no compaction, relocation, FAT update or filesystem write. Extra free space after a file is accepted; it is not destroyed merely to reproduce an exact percentage.
+Before either phase begins, Growth Defrag performs an explicitly logged, read-only idempotence preflight. It reports the engine revision, the number of files and directories checked, and either confirms the existing layout or names the first fragmented object or file with insufficient post-file reserve. A second canonical-layout verifier independently recognises the exact physical pattern produced by an earlier Growth Defrag pass. If the layout is already satisfactory, the engine reports **Not needed** and performs no compaction, relocation, FAT update, journal creation or filesystem write. Extra free space after a file is accepted; it is not destroyed merely to reproduce an exact percentage.
 
 Normal GUI output reports batch summaries rather than every filename. Direct command-line users can request object-level detail with `--verbose` or write it to a file with `--diagnostic-log PATH`. FAT long-file-name records are decoded from UTF-16 to UTF-8 for these reports.
 
