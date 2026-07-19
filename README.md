@@ -15,3 +15,8 @@ FAT12, FAT16, FAT32 and exFAT provide analyse, map, compact, defragment and reco
 ## Amiga OFS/FFS
 
 Version 1.6.0 adds exact allocation analysis and journalled Compact, Defragment and Recover operations for Amiga DOS\0 through DOS\7 volumes. The bundled amitools filesystem library supplies validated OFS/FFS structure parsing; Linux Defragger supplies the relocation planner and external recovery journal.
+
+
+## Apple filesystems
+
+Version 1.7.0 adds read-only Apple HFS, HFS+/HFSX and APFS backends. HFS and HFS+ allocation maps are exact. APFS currently provides a conservative container summary and marks undecoded physical allocation as unknown.

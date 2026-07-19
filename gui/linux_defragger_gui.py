@@ -43,7 +43,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -69,6 +69,11 @@ SUPPORTED_FILESYSTEMS = {
     "ext4": "ext4",
     "btrfs": "btrfs",
     "xfs": "xfs",
+    "hfs": "hfs",
+    "hfsplus": "hfsplus",
+    "hfs+": "hfsplus",
+    "hfsx": "hfsplus",
+    "apfs": "apfs",
 }
 
 

@@ -12,7 +12,7 @@ import importlib
 from dataclasses import asdict
 from .base import *
 
-MODULES = ("fat12", "fat16", "fat32", "exfat", "ntfs", "ext4", "btrfs", "xfs", "swap", "ufs", "zfs", "affs", "minix")
+MODULES = ("fat12", "fat16", "fat32", "exfat", "ntfs", "ext4", "btrfs", "xfs", "swap", "ufs", "zfs", "affs", "minix", "hfs", "hfsplus", "apfs")
 
 class Registry:
     def __init__(self):

@@ -1,14 +1,21 @@
-# Linux Defragger 1.6.0
+# Linux Defragger 1.7.0
 
-## Amiga OFS/FFS support
+Author: Shannon Smith
 
-- Replaces the signature-only Amiga backend with exact bitmap and directory-tree analysis.
-- Reports file, directory, fragmented-file and fragmented-directory counts for DOS\0 through DOS\7.
-- Adds offline Compact, Defragment and Recover operations for ADF/HDF images and raw AFFS partitions.
-- Supports OFS, FFS, international, directory-cache and long-name variants.
-- Relocates file headers, extension blocks and data blocks into contiguous runs.
-- Relocates subdirectory headers and directory-cache chains while repairing child parent references.
-- Uses an external phase journal with rollback before the parent-link switch and forward recovery after it.
-- Bundles the GPL-2.0-or-later amitools filesystem library; no separate package is required.
+## Apple filesystem backends
 
-The Amiga root block and bitmap metadata remain fixed. Gzip-compressed images are read-only.
+- Added native read-only Apple HFS allocation-bitmap mapping.
+- Added native read-only HFS+ and HFSX allocation-bitmap mapping.
+- HFS+ reads the catalog and extents-overflow B-trees when their special files
+  are represented by the volume-header extents, providing file, directory and
+  fragmentation counts plus fragmented/directory map overlays.
+- Added conservative APFS container detection and geometry mapping. APFS blocks
+  are marked unknown except for the container superblock until the checkpoint
+  and spaceman trees are implemented.
+- HFS, HFS+, HFSX and APFS advertise Analyse and Map only. No Apple filesystem
+  write operation is enabled in this release.
+
+## Safety
+
+All Apple backends open volumes read-only and contain no mutation entry point.
+Existing FAT, exFAT and Amiga write engines are unchanged.
