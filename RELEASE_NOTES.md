@@ -1,4 +1,11 @@
-# Linux Defragger 1.8.0-28
+# Linux Defragger 1.8.0-29
+
+- Fixes the urgent FAT12/16/32 Growth Defrag failure `growth-defrag target range is occupied after staging`. A fragmented chain can place clusters belonging to an earlier object inside a later object's planned target, so moving only the later object to the terminal workspace does not necessarily clear that target.
+- After staging an object, Growth Defrag now identifies every remaining occupied cluster in its final target and evacuates those blockers into the staged object's released source clusters outside the target. It then places the staged object normally.
+- The blocker evacuation is journalled with the same durable mapped-cluster transaction engine as every other FAT move. It requires no larger workspace than the existing largest-object terminal workspace and preserves the live chains and directory references of the displaced objects.
+- Adds a deterministic interleaved FAT32 regression image that reproduced the exact failure after phase 1 reported zero preparation moves. The test verifies both blocker evacuations, final file payloads, contiguous chains and all 10 percent growth gaps.
+
+## Revision 28
 
 - Fixes EXT4 Compact leaving the filesystem's root-reserved free blocks as white holes. The privileged collector now uses `f_bfree` (all free blocks) instead of `f_bavail` (only blocks available to an unprivileged process), while retaining the 64 MiB transaction-safety floor.
 - Reports how much privileged reserve was included in each collector pass, so the operation log shows when those formerly unreachable gaps are being used.

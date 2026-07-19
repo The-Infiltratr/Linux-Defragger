@@ -1,7 +1,9 @@
-# Linux Defragger 1.8.0-28 test status
+# Linux Defragger 1.8.0-29 test status
 
 Passed focused tests:
 
+- FAT Growth Defrag blocker evacuation on a fully packed, interleaved FAT32 allocation where staging the selected file alone leaves its target occupied by another fragmented chain.
+- Blocker relocation into the staged object's released source slots, followed by canonical placement, payload verification and 10 percent reserve-gap verification.
 - Native Compact parser accepts the exact GUI ABI for EXT4/XFS/Btrfs.
 - Native Compact module compilation and command-line parsing.
 - Btrfs TREE_SEARCH_V2 parser with mixed intermediate key types.
@@ -14,7 +16,7 @@ Passed focused tests:
 
 Physical EXT4 and Btrfs write-path validation remains dependent on the removable-media test volumes.
 
-# Test status for 1.8.0-28
+# Test status for 1.8.0-29
 
 Validated in this build environment:
 
@@ -24,7 +26,7 @@ Validated in this build environment:
 - Python syntax checks for the native compact engine, GUI and privileged helper.
 - Existing synthetic Btrfs and XFS analyser tests, including corrected Btrfs leaf offsets and multi-level XFS trees.
 - Existing focused FAT12/16/32, exFAT, NTFS, EXT, swap, allocation-mapper, Growth Defrag and GUI tests remain present.
-- Unified version reporting and package metadata identify revision `1.8.0-28`.
+- Unified version reporting and package metadata identify revision `1.8.0-29`.
 
 
 Revision-24 regression coverage additionally validates:

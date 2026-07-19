@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-28
+# Linux Defragger 1.8.0-29
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -27,7 +27,7 @@ Growth Defrag works in two durable phases:
 1. Compact the FAT allocation so the terminal free area can be used as an overlap-safe workspace.
 2. Preserve the current physical object order, rebuild each file or directory as one contiguous chain, and insert the requested free gap after each regular file.
 
-Objects are placed from the end of the plan backwards. When a destination overlaps the object's current allocation, the complete object is first moved into the reusable terminal workspace and then placed at its final location. Every move uses the normal external mapped-cluster journal, so Recover can finish an interrupted transaction.
+Objects are placed from the end of the plan backwards. When a destination overlaps the object's current allocation, the complete object is first moved into the reusable terminal workspace. If clusters from another fragmented chain still occupy the target, they are evacuated into the staged object's released source clusters outside that target; the staged object is then placed at its final location. This resolves interleaved-chain dependencies without increasing the required workspace beyond the largest allocated object. Every move uses the normal external mapped-cluster journal, so Recover can finish an interrupted transaction.
 
 Growth Defrag uses RAM-backed multi-object batches. Several complete files and directories are read into the relocation cache, written sequentially, and committed through one journal and one grouped metadata update. On systems with substantial free memory, automatic mode preserves 8 GiB for Linux and can use up to 16 GiB as the cache budget; an individual Growth Defrag transaction is capped at 4 GiB to keep journal size and safe-stop latency bounded. SD/eMMC targets use two ordered read workers automatically, while rotational media use one.
 

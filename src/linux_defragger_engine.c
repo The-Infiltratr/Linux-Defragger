@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.8.0-28"
+#define PROGRAM_VERSION "1.8.0-29"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -3215,8 +3215,11 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
             continue;
         }
 
-        /* The next target is not currently free.  Use the reusable terminal
-           workspace for this one object, then resume multi-object direct batches. */
+        /* The next target is not currently free.  Stage this object in the
+           reusable terminal workspace.  A fragmented chain can leave another
+           object's clusters inside the target even after this object's own
+           source has been freed.  Evacuate those blockers into the staged
+           object's now-free source clusters, then place the staged object. */
         GrowthObject *object = &objects.v[reverse - 1];
         const FileRecord *current_file = NULL;
         const U32Vec *chain = find_growth_object_chain(
@@ -3229,7 +3232,10 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
             growth_object_list_free(&objects);
             die_msg("growth-defrag object changed size during offline operation");
         }
+        U32Vec original_chain = {0};
+        for (size_t i = 0; i < chain->len; i++) u32vec_push(&original_chain, chain->v[i]);
         if (!cluster_range_is_free(fs, workspace_start, object->clusters)) {
+            u32vec_free(&original_chain);
             u32vec_free(&root_chain);
             filelist_free(&current_files);
             dirreflist_free(&current_refs);
@@ -3254,19 +3260,112 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
         chain = find_growth_object_chain(
             fs, object, &current_files, &root_chain, &current_file);
         if (!chain_is_exact_run(chain, workspace_start)) {
+            u32vec_free(&original_chain);
             u32vec_free(&root_chain);
             filelist_free(&current_files);
             dirreflist_free(&current_refs);
             growth_object_list_free(&objects);
             die_msg("growth-defrag staged object did not reopen at the workspace");
         }
+
+        bool target_blockers_evacuated = false;
         if (!cluster_range_is_free(fs, object->target, object->clusters)) {
+            uint64_t target_end64 = (uint64_t)object->target + object->clusters - 1;
+            if (target_end64 > fs->max_cluster) {
+                u32vec_free(&original_chain);
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag target range exceeds the filesystem");
+            }
+            uint32_t target_end = (uint32_t)target_end64;
+            U32Vec blocker_destinations = {0};
+            for (size_t i = 0; i < original_chain.len; i++) {
+                uint32_t candidate = original_chain.v[i];
+                if (candidate >= object->target && candidate <= target_end) continue;
+                if (!fat_is_free(fs, candidate)) {
+                    u32vec_free(&blocker_destinations);
+                    u32vec_free(&original_chain);
+                    u32vec_free(&root_chain);
+                    filelist_free(&current_files);
+                    dirreflist_free(&current_refs);
+                    growth_object_list_free(&objects);
+                    die_msg("growth-defrag staged source cluster was unexpectedly reused");
+                }
+                u32vec_push(&blocker_destinations, candidate);
+            }
+
+            size_t blocker_count = 0;
+            for (uint32_t cluster = object->target; cluster <= target_end; cluster++) {
+                if (!fat_is_free(fs, cluster)) blocker_count++;
+                if (cluster == UINT32_MAX) break;
+            }
+            if (blocker_count == 0 || blocker_count > blocker_destinations.len) {
+                u32vec_free(&blocker_destinations);
+                u32vec_free(&original_chain);
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag could not allocate safe source slots for target blockers");
+            }
+
+            CompactMove *blocker_moves = xmalloc(blocker_count * sizeof(*blocker_moves));
+            size_t blocker_index = 0;
+            for (uint32_t cluster = object->target; cluster <= target_end; cluster++) {
+                if (!fat_is_free(fs, cluster)) {
+                    blocker_moves[blocker_index] = (CompactMove){
+                        .source = cluster,
+                        .destination = blocker_destinations.v[blocker_index],
+                    };
+                    blocker_index++;
+                }
+                if (cluster == UINT32_MAX) break;
+            }
+            detail_log(
+                "growth-unblock: moved %zu blocking cluster%s out of target %" PRIu32
+                "-%" PRIu32 " using the staged object's released source slots\n",
+                blocker_count, blocker_count == 1 ? "" : "s",
+                object->target, target_end);
+            compact_execute_moves(fs, &current_refs, journal_path,
+                                  blocker_moves, blocker_count);
+            target_blockers_evacuated = true;
+            stats.transactions++;
+            stats.clusters_copied += blocker_count;
+            fprintf(stderr,
+                    "Growth layout cleared %zu blocking cluster%s from %s's target range.\n",
+                    blocker_count, blocker_count == 1 ? "" : "s", object->path);
+            free(blocker_moves);
+            u32vec_free(&blocker_destinations);
+
             u32vec_free(&root_chain);
             filelist_free(&current_files);
             dirreflist_free(&current_refs);
-            growth_object_list_free(&objects);
-            die_msg("growth-defrag target range is occupied after staging; layout planning stopped safely");
+            current_refs = (DirRefList){0};
+            current_files = scan_files(fs, &current_refs);
+            root_chain = (U32Vec){0};
+            current_file = NULL;
+            chain = find_growth_object_chain(
+                fs, object, &current_files, &root_chain, &current_file);
+            if (!chain_is_exact_run(chain, workspace_start)) {
+                u32vec_free(&original_chain);
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag staged object changed while clearing its target");
+            }
+            if (!cluster_range_is_free(fs, object->target, object->clusters)) {
+                u32vec_free(&original_chain);
+                u32vec_free(&root_chain);
+                filelist_free(&current_files);
+                dirreflist_free(&current_refs);
+                growth_object_list_free(&objects);
+                die_msg("growth-defrag target range remained occupied after blocker evacuation");
+            }
         }
+
         detail_log(
             "growth-place: %s %s -> cluster %" PRIu32
             " with %zu reserved cluster%s after it\n",
@@ -3282,9 +3381,11 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
         else stats.files_moved++;
         reverse--;
         fprintf(stderr,
-                "Growth layout staged one %s in two journal transactions; %zu object%s remain.\n",
+                "Growth layout staged one %s in %u journal transactions; %zu object%s remain.\n",
                 object->is_dir ? "directory" : "file",
+                target_blockers_evacuated ? 3U : 2U,
                 reverse, reverse == 1 ? "" : "s");
+        u32vec_free(&original_chain);
         u32vec_free(&root_chain);
         filelist_free(&current_files);
         dirreflist_free(&current_refs);

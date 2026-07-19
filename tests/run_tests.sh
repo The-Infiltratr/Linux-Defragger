@@ -224,7 +224,7 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
   >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
   "$TMP/growth-defrag-idempotent.txt"
-grep -q 'Growth Defrag preflight (1.8.0-28): checking' \
+grep -q 'Growth Defrag preflight (1.8.0-29): checking' \
   "$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag preflight result: the existing FAT layout already satisfies' \
   "$TMP/growth-defrag-idempotent.err"
@@ -236,6 +236,17 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-after.sha"
 cmp "$TMP/growth-defrag-idempotent-before.sha" "$TMP/growth-defrag-idempotent-after.sha"
 "$BIN" analyze "$TMP/growth-defrag.img" >"$TMP/growth-defrag-after.txt"
 grep -q 'Fragmented files:       0' "$TMP/growth-defrag-after.txt"
+
+"$ROOT/tests/make_growth_blocker_image.py" "$TMP/growth-blocker.img" >/dev/null
+"$BIN" growth-defrag "$TMP/growth-blocker.img" --write \
+  --confirm "$TMP/growth-blocker.img" --growth-percent 10 --batch-clusters 128 \
+  >"$TMP/growth-blocker.txt" 2>"$TMP/growth-blocker.err"
+grep -q 'Growth layout cleared 1 blocking cluster from CHARLIE.BIN' \
+  "$TMP/growth-blocker.err"
+grep -q 'Growth layout cleared 1 blocking cluster from BRAVO.BIN' \
+  "$TMP/growth-blocker.err"
+! grep -q 'target range is occupied after staging' "$TMP/growth-blocker.err"
+"$ROOT/tests/verify_growth_blocker.py" "$TMP/growth-blocker.img" >/dev/null
 
 "$ROOT/tests/make_gapped_contiguous_image.py" "$TMP/gapped-contiguous.img" >/dev/null
 "$BIN" analyze "$TMP/gapped-contiguous.img" >"$TMP/gapped-before.txt"
