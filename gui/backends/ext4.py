@@ -234,11 +234,12 @@ def _filesystem_name(compat: int, incompat: int) -> str:
 
 def _scan_fragmentation(reader: Reader, descriptors: list[dict], block_size: int,
                         total_blocks: int, total_inodes: int, inodes_per_group: int,
-                        inode_size: int) -> dict:
+                        inode_size: int, first_normal_inode: int) -> dict:
     regular_files = directories = fragmented_files = fragmented_directories = 0
     inodes_scanned = malformed_inodes = 0
     fragmented_ranges: list[tuple[int, int]] = []
     directory_ranges: list[tuple[int, int]] = []
+    reserved_inode_ranges: list[tuple[int, int]] = []
 
     chunk_inodes = max(8, _INODE_READ_CHUNK // inode_size)
     chunk_inodes -= chunk_inodes % 8
@@ -274,17 +275,27 @@ def _scan_fragmentation(reader: Reader, descriptors: list[dict], block_size: int
                 if mode not in (_EXT4_S_IFREG, _EXT4_S_IFDIR):
                     continue
                 inodes_scanned += 1
+                inode_number = first_inode + bit + 1
                 is_directory = mode == _EXT4_S_IFDIR
-                if is_directory:
-                    directories += 1
-                else:
-                    regular_files += 1
                 try:
                     extents = _inode_extents(reader, inode, block_size, total_blocks)
                 except (BackendError, struct.error):
                     malformed_inodes += 1
                     continue
                 ranges = [(physical, physical + length) for _logical, physical, length in extents]
+
+                # ext reserves the low-numbered inodes for structures such as
+                # the resize inode and journal.  They are real allocations, but
+                # they are not user files and the online regular-file mover must
+                # not present them as ordinary blue/red file data.
+                if inode_number < first_normal_inode and inode_number != 2:
+                    reserved_inode_ranges.extend(ranges)
+                    continue
+
+                if is_directory:
+                    directories += 1
+                else:
+                    regular_files += 1
                 fragmented = len(extents) > 1
                 if is_directory:
                     directory_ranges.extend(ranges)
@@ -305,6 +316,7 @@ def _scan_fragmentation(reader: Reader, descriptors: list[dict], block_size: int
         "malformed_inodes": malformed_inodes,
         "fragmented_ranges": _merge_ranges(fragmented_ranges),
         "directory_ranges": _merge_ranges(directory_ranges),
+        "reserved_inode_ranges": _merge_ranges(reserved_inode_ranges),
     }
 
 
@@ -334,6 +346,7 @@ class ExtBackend:
             first_data = u32le(superblock, 20)
             blocks_per_group = u32le(superblock, 32)
             inodes_per_group = u32le(superblock, 40)
+            first_normal_inode = u32le(superblock, 84) or 11
             inode_size = u16le(superblock, 88) or 128
             desc_size = u16le(superblock, 0xFE) if has_64bit else 32
             desc_size = max(32, desc_size)
@@ -351,6 +364,12 @@ class ExtBackend:
             descriptors: list[dict] = []
             block_bitmaps: list[bytes | None] = []
             group_lengths: list[int] = []
+            reserved_ranges: list[tuple[int, int]] = []
+            inode_table_blocks = (
+                inodes_per_group * inode_size + block_size - 1
+            ) // block_size
+            descriptor_blocks = (groups * desc_size + block_size - 1) // block_size
+            reserved_ranges.append((0, min(total_blocks, desc_table_block + descriptor_blocks)))
             for group in range(groups):
                 descriptor = reader.read(desc_table_off + group * desc_size, desc_size)
                 block_bitmap = u32le(descriptor, 0)
@@ -370,6 +389,15 @@ class ExtBackend:
                     "inode_table": inode_table,
                     "flags": flags,
                 })
+                if 0 < block_bitmap < total_blocks:
+                    reserved_ranges.append((block_bitmap, min(total_blocks, block_bitmap + 1)))
+                if 0 < inode_bitmap < total_blocks:
+                    reserved_ranges.append((inode_bitmap, min(total_blocks, inode_bitmap + 1)))
+                if 0 < inode_table < total_blocks:
+                    reserved_ranges.append((
+                        inode_table,
+                        min(total_blocks, inode_table + inode_table_blocks),
+                    ))
                 block_bitmaps.append(
                     reader.read(block_bitmap * block_size, block_size)
                     if 0 < block_bitmap < total_blocks else None
@@ -452,6 +480,7 @@ class ExtBackend:
                     total_inodes,
                     inodes_per_group,
                     inode_size,
+                    first_normal_inode,
                 )
             except BackendError as exc:
                 details["fragmentation_available"] = False
@@ -463,6 +492,10 @@ class ExtBackend:
             )
             directory_blocks = _overlay_ranges(
                 result["cells"], summary["directory_ranges"], "directory"
+            )
+            reserved_ranges.extend(summary["reserved_inode_ranges"])
+            reserved_blocks = _overlay_ranges(
+                result["cells"], reserved_ranges, "bad"
             )
             result.update({
                 "regular_files": summary["regular_files"],
@@ -478,6 +511,8 @@ class ExtBackend:
                 "malformed_inodes": summary["malformed_inodes"],
                 "fragmented_blocks_mapped": fragmented_blocks,
                 "directory_blocks_mapped": directory_blocks,
+                "reserved_blocks_mapped": reserved_blocks,
+                "reserved_inode_extents": len(summary["reserved_inode_ranges"]),
             })
             return result
 

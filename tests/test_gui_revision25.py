@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Static regression checks for revision 24 GUI behaviour."""
+"""Static regression checks for revision 25 GUI behaviour."""
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 gui=(ROOT/'gui/linux_defragger_gui.py').read_text()
 version=(ROOT/'gui/version.py').read_text()
 exfat=(ROOT/'gui/backends/exfat.py').read_text()
 helper=(ROOT/'gui/privileged_helper.py').read_text()
-assert 'VERSION = "1.8.0-24"' in version
+assert 'VERSION = "1.8.0-25"' in version
 assert 'PACKAGE_REVISION' not in gui
 assert '[self.engine, "--version"]' in gui
 assert 'GLib.idle_add(self._auto_analyse_selected' in gui
@@ -18,4 +18,6 @@ assert 'new_window_item' in gui and 'def new_window(self)' in gui
 assert 'Create fragmented test data…' in gui
 assert 'CAP_GROWTH_DEFRAG' in exfat
 assert '"growth-defrag"' in helper
-print('revision 24 GUI regression checks passed')
+assert 'range_prefix = "@@LIVE_RANGE "' in gui
+assert 'Live allocation update · Compact pass' in gui
+print('revision 25 GUI regression checks passed')

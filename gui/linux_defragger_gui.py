@@ -1438,6 +1438,68 @@ class MainWindow(Gtk.ApplicationWindow):
             self._command_finished(127, str(exc), purpose, on_success, raw_completion)
 
     def _handle_engine_stream_line(self, line: str) -> bool:
+        range_prefix = "@@LIVE_RANGE "
+        if line.startswith(range_prefix):
+            try:
+                delta = json.loads(line[len(range_prefix):])
+                if not self.map_data or not isinstance(self.map_data.get("cells"), list):
+                    return True
+                cells = self.map_data["cells"]
+                unit_size = int(
+                    self.map_data.get("unit_size")
+                    or self.map_data.get("cluster_size")
+                    or 0
+                )
+                if unit_size <= 0:
+                    return True
+
+                def apply_range(start_byte: int, length_byte: int, make_used: bool) -> None:
+                    if length_byte <= 0:
+                        return
+                    start_unit = start_byte // unit_size
+                    end_unit = (start_byte + length_byte + unit_size - 1) // unit_size
+                    for cell in cells:
+                        cell_start = int(cell["start"])
+                        cell_end = int(cell["end"]) + 1
+                        overlap = max(0, min(end_unit, cell_end) - max(start_unit, cell_start))
+                        if overlap <= 0:
+                            continue
+                        if make_used:
+                            moved = min(overlap, int(cell.get("free", 0)))
+                            cell["free"] = max(0, int(cell.get("free", 0)) - moved)
+                            cell["used"] = int(cell.get("used", 0)) + moved
+                        else:
+                            old_used = max(1, int(cell.get("used", 0)))
+                            moved = min(overlap, int(cell.get("used", 0)))
+                            # The live view shows physical allocation movement.  Exact
+                            # fragmentation colours are rebuilt by the final analysis.
+                            frag = int(round(moved * int(cell.get("fragmented", 0)) / old_used))
+                            directory = int(round(moved * int(cell.get("directory", 0)) / old_used))
+                            cell["used"] = max(0, int(cell.get("used", 0)) - moved)
+                            cell["free"] = int(cell.get("free", 0)) + moved
+                            cell["fragmented"] = max(
+                                0, min(int(cell.get("fragmented", 0)) - frag, cell["used"])
+                            )
+                            cell["directory"] = max(
+                                0, min(int(cell.get("directory", 0)) - directory, cell["used"])
+                            )
+
+                source = int(delta["source_start_byte"])
+                destination = int(delta["destination_start_byte"])
+                length = int(delta["length_bytes"])
+                apply_range(source, length, False)
+                apply_range(destination, length, True)
+                self.disk_map.set_cells(cells)
+                moved_total = int(delta.get("moved_total_bytes", 0))
+                pass_number = int(delta.get("pass", 1))
+                self.status_label.set_text(
+                    f"Live allocation update · Compact pass {pass_number} · "
+                    f"{human_bytes(moved_total)} moved · fragmentation recalculated at completion"
+                )
+            except Exception as exc:
+                self.append_log(f"Live allocation update could not be applied: {exc}")
+            return True
+
         prefix = "@@LIVE_MAP "
         if not line.startswith(prefix):
             return False
@@ -1458,24 +1520,31 @@ class MainWindow(Gtk.ApplicationWindow):
                         "directory": int(changed["directory"]),
                         "bad": int(changed["bad"]),
                     }
-            self.map_data["fragmented_files"] = int(delta.get("fragmented_files", 0))
-            self.map_data["fragmented_directories"] = int(delta.get("fragmented_directories", 0))
-            self.map_data["free_clusters"] = int(delta.get("free_clusters", self.map_data.get("free_clusters", 0)))
-            self.map_data["free_gaps_below_highest"] = int(delta.get("free_gaps_below_highest", self.map_data.get("free_gaps_below_highest", 0)))
+            if "fragmented_files" in delta:
+                self.map_data["fragmented_files"] = int(delta["fragmented_files"])
+            if "fragmented_directories" in delta:
+                self.map_data["fragmented_directories"] = int(delta["fragmented_directories"])
+            if "free_clusters" in delta:
+                self.map_data["free_clusters"] = int(delta["free_clusters"])
+            if "free_gaps_below_highest" in delta:
+                self.map_data["free_gaps_below_highest"] = int(delta["free_gaps_below_highest"])
             self.disk_map.set_cells(cells)
-            self.fragmented_card.set_value(
-                f"{self.map_data['fragmented_files']:,} files · "
-                f"{self.map_data['fragmented_directories']:,} dirs"
-            )
-            cluster_size = int(self.map_data.get("cluster_size", 0))
-            free_bytes = int(self.map_data["free_clusters"]) * cluster_size
-            capacity = int(self.map_data.get("data_clusters", 0)) * cluster_size
-            percent = (100.0 * free_bytes / capacity) if capacity else 0.0
-            self.free_card.set_value(f"{human_bytes(free_bytes)} ({percent:.1f}%)")
-            self.status_label.set_text(
-                f"Live update · {self.map_data['fragmented_files']} fragmented files · "
-                f"{self.map_data['free_gaps_below_highest']:,} free clusters below the high-water mark"
-            )
+            if "fragmented_files" in self.map_data and "fragmented_directories" in self.map_data:
+                self.fragmented_card.set_value(
+                    f"{self.map_data['fragmented_files']:,} files · "
+                    f"{self.map_data['fragmented_directories']:,} dirs"
+                )
+            if "free_clusters" in self.map_data:
+                cluster_size = int(
+                    self.map_data.get("cluster_size") or self.map_data.get("unit_size") or 0
+                )
+                free_bytes = int(self.map_data["free_clusters"]) * cluster_size
+                capacity = int(
+                    self.map_data.get("data_clusters") or self.map_data.get("total_units") or 0
+                ) * cluster_size
+                percent = (100.0 * free_bytes / capacity) if capacity else 0.0
+                self.free_card.set_value(f"{human_bytes(free_bytes)} ({percent:.1f}%)")
+            self.status_label.set_text("Live allocation map updated")
         except Exception as exc:
             self.append_log(f"Live map update could not be applied: {exc}")
         return True

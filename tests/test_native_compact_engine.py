@@ -1,10 +1,13 @@
 #!/usr/bin/python3
 from __future__ import annotations
 import heapq
+import io
+import json
 import os
 import struct
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -176,6 +179,33 @@ def test_extent_compactor_does_not_allocate_second_donor_file():
     assert 'punch_physical' not in source
     assert 'collector.verify_slice' in source
     assert '_copy_range(source_fd, source_offset, gap.fd, move, donor_logical)' in source
+
+
+def test_live_range_event_contains_physical_move():
+    output = io.StringIO()
+    with redirect_stdout(output):
+        n._emit_live_range(8192, 4096, 4096, 16384, 2, 1000)
+    line = output.getvalue().strip()
+    assert line.startswith('@@LIVE_RANGE ')
+    data = json.loads(line.split(' ', 1)[1])
+    assert data == {
+        'source_start_byte': 8192,
+        'destination_start_byte': 4096,
+        'length_bytes': 4096,
+        'moved_total_bytes': 16384,
+        'pass': 2,
+    }
+
+
+def test_extent_compactor_repeats_until_fixed_point_and_gui_applies_live_ranges():
+    engine = (ROOT / 'gui' / 'native_compact_engine.py').read_text()
+    gui = (ROOT / 'gui' / 'linux_defragger_gui.py').read_text()
+    assert 'MAX_EXTENT_COMPACT_PASSES = 32' in engine
+    assert 'for pass_number in range(1, MAX_EXTENT_COMPACT_PASSES + 1)' in engine
+    assert 'if result.moved_bytes <= 0:' in engine
+    assert '@@LIVE_RANGE ' in engine
+    assert 'range_prefix = "@@LIVE_RANGE "' in gui
+    assert 'fragmentation recalculated at completion' in gui
 
 
 if __name__ == '__main__':

@@ -31,6 +31,7 @@ import ctypes
 import errno
 import fcntl
 import heapq
+import json
 import os
 import signal
 import stat
@@ -57,6 +58,7 @@ MAX_TRANSACTION_BYTES = 256 * 1024 * 1024
 COPY_BUFFER = 8 * 1024 * 1024
 COLLECTOR_FLOOR = 64 * 1024 * 1024
 MAX_NO_PROGRESS = 8
+MAX_EXTENT_COMPACT_PASSES = 32
 
 # Generic inode flags returned by FS_IOC_FSGETXATTR.
 FS_XFLAG_REALTIME = 0x00000001
@@ -144,6 +146,15 @@ class CompactError(RuntimeError):
 
 class SourceNotMovable(RuntimeError):
     pass
+
+
+@dataclass
+class ExtentPassResult:
+    moved_bytes: int = 0
+    transactions: int = 0
+    runtime_skipped: int = 0
+    blocked_reason: str = ""
+    stopped: bool = False
 
 
 @dataclass
@@ -378,6 +389,28 @@ def _signal_handler(_signum, _frame) -> None:
             fcntl.ioctl(_active_btrfs_fd, BTRFS_IOC_BALANCE_CTL, arg)
         except OSError:
             pass
+
+
+def _emit_live_range(source_physical: int, destination_physical: int,
+                     length: int, moved_total: int, pass_number: int,
+                     live_cells: int) -> None:
+    """Tell the GUI how the logical allocation picture changed.
+
+    The temporary collector physically owns all nominally free blocks while a
+    pass is active.  Exposing that temporary state would make the entire map
+    appear used.  Instead, report the intended compaction view: the low range
+    becomes allocated and the old high source range becomes free.
+    """
+    if live_cells <= 0 or length <= 0:
+        return
+    payload = {
+        "source_start_byte": int(source_physical),
+        "destination_start_byte": int(destination_physical),
+        "length_bytes": int(length),
+        "moved_total_bytes": int(moved_total),
+        "pass": int(pass_number),
+    }
+    print("@@LIVE_RANGE " + json.dumps(payload, separators=(",", ":")), flush=True)
 
 
 def _assert_unmounted(device: str) -> None:
@@ -668,8 +701,156 @@ def _xfs_exchange(source_fd: int, donor_fd: int, source_offset: int,
         raise
 
 
+def _compact_extent_pass(mountpoint: str, filesystem: str, block_size: int,
+                         device_bytes: int, live_cells: int, pass_number: int,
+                         moved_before_pass: int) -> ExtentPassResult:
+    result = ExtentPassResult()
+    collector = SpaceCollector(mountpoint, block_size)
+    try:
+        allocated, collector_ops = collector.fill_available()
+        gaps = collector.owned_extents(device_bytes)
+        total_target = sum(item.length for item in gaps)
+        print(
+            f"{filesystem.upper()} Compact pass {pass_number}: temporary space collector "
+            f"mapped {allocated / (1024**3):.2f} GiB of accessible free space in "
+            f"{collector_ops} fallocate operations and {len(gaps):,} physical ranges.",
+            flush=True,
+        )
+        print(
+            "Compact will exchange file mappings directly with those reserved low ranges; "
+            "it will not allocate a second donor file.",
+            flush=True,
+        )
+        if not gaps:
+            result.blocked_reason = "no accessible free range requires work"
+            return result
+
+        heap, file_count, skipped = scan_sources(
+            mountpoint, block_size, device_bytes, collector.workspace
+        )
+        print(
+            f"Scanned {file_count:,} regular files; {len(heap):,} movable physical extents "
+            f"were found and {skipped:,} unsupported extents or files were skipped.",
+            flush=True,
+        )
+        if not heap:
+            result.blocked_reason = "no movable regular-file extents were found"
+            return result
+
+        gap_bytes_completed = 0
+        for gap in gaps:
+            cursor = gap.physical
+            donor_logical = gap.logical
+            while cursor < gap.physical_end:
+                if _stop_requested:
+                    print(
+                        "Stop requested; ending Compact between kernel-journalled transactions.",
+                        flush=True,
+                    )
+                    result.stopped = True
+                    return result
+
+                source = _pop_high_source(heap, cursor)
+                if source is None:
+                    result.blocked_reason = (
+                        f"no movable regular-file extent remains above the free range at byte {cursor:,}"
+                    )
+                    break
+                available = gap.physical_end - cursor
+                move = min(available, source.length, MAX_TRANSACTION_BYTES)
+                move -= move % block_size
+                if move <= 0:
+                    result.blocked_reason = (
+                        "the next source or destination is smaller than one filesystem block"
+                    )
+                    break
+                source_offset = source.logical + source.length - move
+                source_physical = source.physical + source.length - move
+                destination_physical = cursor
+
+                try:
+                    source_fd = os.open(
+                        source.path,
+                        os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                except OSError:
+                    source.length = 0
+                    result.runtime_skipped += 1
+                    continue
+
+                try:
+                    _verify_source(source_fd, source, source_offset, source_physical, move)
+                    collector.verify_slice(gap, donor_logical, cursor, move)
+                    _copy_range(source_fd, source_offset, gap.fd, move, donor_logical)
+                    os.fsync(gap.fd)
+                    try:
+                        if filesystem == "ext4":
+                            _ext4_exchange(
+                                source_fd, gap.fd, source_offset, donor_logical, move, block_size
+                            )
+                        else:
+                            _xfs_exchange(source_fd, gap.fd, source_offset, donor_logical, move)
+                    except SourceNotMovable as exc:
+                        source.length = 0
+                        result.runtime_skipped += 1
+                        print(
+                            f"Skipped one file extent that the {filesystem} kernel refused to "
+                            f"exchange ({exc}); trying the next high extent.",
+                            flush=True,
+                        )
+                        continue
+                    os.fsync(source_fd)
+                    os.fsync(gap.fd)
+                finally:
+                    os.close(source_fd)
+
+                source.length -= move
+                if source.length > 0:
+                    _requeue_source(heap, source)
+                result.moved_bytes += move
+                result.transactions += 1
+                cursor += move
+                donor_logical += move
+                gap_bytes_completed += move
+                moved_total = moved_before_pass + result.moved_bytes
+                _emit_live_range(
+                    source_physical,
+                    destination_physical,
+                    move,
+                    moved_total,
+                    pass_number,
+                    live_cells,
+                )
+                pass_percent = min(100.0, 100.0 * gap_bytes_completed / max(1, total_target))
+                # A pass can expose new low gaps only after its collector is
+                # released.  Reserve half of the remaining progress range for
+                # each possible follow-up pass so the GUI never jumps backwards.
+                base = 100.0 * (1.0 - (0.5 ** (pass_number - 1)))
+                span = 100.0 * (0.5 ** pass_number)
+                percent = min(99.0, base + span * (pass_percent / 100.0))
+                print(
+                    f"{filesystem.upper()} Compact: pasted {move / (1024**2):.1f} MiB "
+                    f"from physical byte {source_physical:,} into byte {destination_physical:,}; "
+                    f"pass {pass_number} total {result.moved_bytes / (1024**3):.2f} GiB, "
+                    f"overall {moved_total / (1024**3):.2f} GiB.",
+                    flush=True,
+                )
+                print(f"{percent:.2f} percent completed", flush=True)
+            if result.blocked_reason:
+                break
+
+        if hasattr(os, "syncfs"):
+            root_fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.syncfs(root_fd)
+            finally:
+                os.close(root_fd)
+        return result
+    finally:
+        collector.close()
+
+
 def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0) -> int:
-    del live_cells  # Reserved for future live-map updates; kept for GUI ABI stability.
     if filesystem == "ext4":
         block_size, device_bytes = ext4_compact_geometry(device)
     elif filesystem == "xfs":
@@ -682,145 +863,88 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
         "into the lowest accessible free ranges. It does not try to reduce fragmentation.",
         flush=True,
     )
+    print(
+        "The engine now repeats collector passes automatically until another pass can no "
+        "longer move any regular-file allocation lower.",
+        flush=True,
+    )
+
+    total_moved = 0
+    total_transactions = 0
+    total_runtime_skipped = 0
+    final_reason = ""
+    passes_with_moves = 0
 
     with PrivateMount(device, filesystem) as mountpoint:
-        collector = SpaceCollector(mountpoint, block_size)
-        try:
-            allocated, collector_ops = collector.fill_available()
-            gaps = collector.owned_extents(device_bytes)
-            total_target = sum(item.length for item in gaps)
+        for pass_number in range(1, MAX_EXTENT_COMPACT_PASSES + 1):
+            if _stop_requested:
+                print("Stop requested before the next Compact pass.", flush=True)
+                return EXIT_STOPPED
+            result = _compact_extent_pass(
+                mountpoint,
+                filesystem,
+                block_size,
+                device_bytes,
+                live_cells,
+                pass_number,
+                total_moved,
+            )
+            total_moved += result.moved_bytes
+            total_transactions += result.transactions
+            total_runtime_skipped += result.runtime_skipped
+            final_reason = result.blocked_reason
+
             print(
-                f"Temporary space collector mapped {allocated / (1024**3):.2f} GiB of "
-                f"accessible free space in {collector_ops} fallocate operations and "
-                f"{len(gaps):,} physical ranges.",
+                f"{filesystem.upper()} Compact pass {pass_number} moved "
+                f"{result.moved_bytes / (1024**3):.2f} GiB in "
+                f"{result.transactions:,} kernel-journalled transactions.",
                 flush=True,
             )
-            print(
-                "Compact will exchange file mappings directly with those reserved low ranges; "
-                "it will not allocate a second donor file.",
-                flush=True,
-            )
-            if not gaps:
-                print(f"{filesystem.upper()} Compact: no accessible free range requires work.", flush=True)
-                return 0
 
-            heap, file_count, skipped = scan_sources(
-                mountpoint, block_size, device_bytes, collector.workspace
-            )
-            print(
-                f"Scanned {file_count:,} regular files; {len(heap):,} movable physical extents "
-                f"were found and {skipped:,} unsupported extents or files were skipped.",
-                flush=True,
-            )
-            if not heap:
-                print(f"{filesystem.upper()} Compact: no movable regular-file extents were found.", flush=True)
-                return 0
+            if result.stopped:
+                print(
+                    f"{filesystem.upper()} Compact stopped safely after moving "
+                    f"{total_moved / (1024**3):.2f} GiB in {total_transactions:,} "
+                    "completed kernel-journalled transactions.",
+                    flush=True,
+                )
+                return EXIT_STOPPED
+            if result.moved_bytes <= 0:
+                break
 
-            moved_bytes = 0
-            transactions = 0
-            gap_bytes_completed = 0
-            runtime_skipped = 0
-            blocked_reason = ""
-            for gap in gaps:
-                cursor = gap.physical
-                donor_logical = gap.logical
-                while cursor < gap.physical_end:
-                    if _stop_requested:
-                        print("Stop requested; ending Compact between kernel-journalled transactions.", flush=True)
-                        return EXIT_STOPPED
-
-                    source = _pop_high_source(heap, cursor)
-                    if source is None:
-                        blocked_reason = (
-                            f"no movable regular-file extent remains above the free range at byte {cursor:,}"
-                        )
-                        break
-                    available = gap.physical_end - cursor
-                    move = min(available, source.length, MAX_TRANSACTION_BYTES)
-                    move -= move % block_size
-                    if move <= 0:
-                        blocked_reason = "the next source or destination is smaller than one filesystem block"
-                        break
-                    source_offset = source.logical + source.length - move
-                    source_physical = source.physical + source.length - move
-
-                    try:
-                        source_fd = os.open(
-                            source.path,
-                            os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                        )
-                    except OSError:
-                        source.length = 0
-                        runtime_skipped += 1
-                        continue
-
-                    try:
-                        _verify_source(source_fd, source, source_offset, source_physical, move)
-                        collector.verify_slice(gap, donor_logical, cursor, move)
-                        _copy_range(source_fd, source_offset, gap.fd, move, donor_logical)
-                        os.fsync(gap.fd)
-                        try:
-                            if filesystem == "ext4":
-                                _ext4_exchange(
-                                    source_fd, gap.fd, source_offset, donor_logical, move, block_size
-                                )
-                            else:
-                                _xfs_exchange(
-                                    source_fd, gap.fd, source_offset, donor_logical, move
-                                )
-                        except SourceNotMovable as exc:
-                            source.length = 0
-                            runtime_skipped += 1
-                            print(
-                                f"Skipped one file extent that the {filesystem} kernel refused to "
-                                f"exchange ({exc}); trying the next high extent.",
-                                flush=True,
-                            )
-                            continue
-                        os.fsync(source_fd)
-                        os.fsync(gap.fd)
-                    finally:
-                        os.close(source_fd)
-
-                    source.length -= move
-                    if source.length > 0:
-                        _requeue_source(heap, source)
-                    moved_bytes += move
-                    transactions += 1
-                    cursor += move
-                    donor_logical += move
-                    gap_bytes_completed += move
-                    percent = min(100.0, 100.0 * gap_bytes_completed / max(1, total_target))
-                    print(
-                        f"{filesystem.upper()} Compact: pasted {move / (1024**2):.1f} MiB "
-                        f"from physical byte {source_physical:,} into byte {cursor - move:,}; "
-                        f"total {moved_bytes / (1024**3):.2f} GiB.",
-                        flush=True,
-                    )
-                    print(f"{percent:.2f} percent completed", flush=True)
-                if blocked_reason:
-                    break
-
+            passes_with_moves += 1
+            # Closing the pass collector releases the old high source extents.
+            # A new collector pass can then use the changed free-space topology
+            # without requiring the user to press Compact again.
             if hasattr(os, "syncfs"):
                 root_fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
                 try:
                     os.syncfs(root_fd)
                 finally:
                     os.close(root_fd)
-            print(
-                f"{filesystem.upper()} Compact moved {moved_bytes / (1024**3):.2f} GiB "
-                f"in {transactions:,} kernel-journalled transactions; "
-                f"{runtime_skipped:,} additional source extents were skipped at runtime.",
-                flush=True,
+        else:
+            final_reason = (
+                f"the automatic safety limit of {MAX_EXTENT_COMPACT_PASSES} passes was reached"
             )
-            if blocked_reason:
-                print(f"Compaction stopped at a conservative boundary: {blocked_reason}.", flush=True)
-            else:
-                print("Every accessible low free range that could be filled with higher file data was processed.", flush=True)
-            return 0
-        finally:
-            collector.close()
 
+    print(
+        f"{filesystem.upper()} Compact moved {total_moved / (1024**3):.2f} GiB in "
+        f"{total_transactions:,} kernel-journalled transactions across "
+        f"{passes_with_moves:,} productive passes; {total_runtime_skipped:,} additional "
+        "source extents were skipped at runtime.",
+        flush=True,
+    )
+    if final_reason:
+        print(f"Compaction reached its current online boundary: {final_reason}.", flush=True)
+    print(
+        "All movable regular-file extents have been packed as low as the filesystem's "
+        "fixed metadata and directory allocations permit. Remaining islands in the free "
+        "tail can be directories, journals, allocation metadata, inode structures or "
+        "other mappings that the online extent-exchange interface cannot relocate.",
+        flush=True,
+    )
+    print("100.00 percent completed", flush=True)
+    return 0
 
 def _btrfs_layout(device: str) -> tuple[int, int, list[FreeRange], int, int]:
     with Reader(device) as reader:

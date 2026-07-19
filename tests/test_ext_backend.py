@@ -106,11 +106,12 @@ def make_ext4(path: Path) -> None:
     image = _base_image(ext4=True)
     image[50 * BLOCK_SIZE:51 * BLOCK_SIZE] = _extent_node([(0, 200, 2), (2, 300, 2)])
     _put_inode(image, 2, _inode(0x41ED, extents=[(0, 100, 1)]))
+    _put_inode(image, 8, _inode(0x81A4, extents=[(0, 650, 2)]))
     _put_inode(image, 12, _inode(0x81A4, extent_index=(0, 50)))
     _put_inode(image, 13, _inode(0x81A4, extents=[(0, 400, 4)]))
     _put_inode(image, 14, _inode(0x41ED, extents=[(0, 500, 1), (1, 600, 1)]))
     _put_inode(image, 15, _inode(0x81A4, extents=[]))
-    _mark_blocks(image, [50, 100, 200, 201, 300, 301, 400, 401, 402, 403, 500, 600])
+    _mark_blocks(image, [50, 100, 200, 201, 300, 301, 400, 401, 402, 403, 500, 600, 650, 651])
     path.write_bytes(image)
 
 
@@ -139,6 +140,7 @@ def verify(path: Path, filesystem: str, files: int, directories: int,
     assert result["details"]["malformed_inodes"] == 0, result
     assert sum(cell["fragmented"] for cell in result["cells"]) > 0, result
     assert sum(cell["directory"] for cell in result["cells"]) > 0, result
+    assert result["details"]["reserved_blocks_mapped"] > 0, result
 
 
 def main() -> None:

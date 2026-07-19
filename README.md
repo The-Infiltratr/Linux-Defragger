@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-24
+# Linux Defragger 1.8.0-25
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -47,7 +47,11 @@ The operation refuses to start unless the volume has enough free clusters for bo
 
 The ext4 and XFS compactors use the mounted kernel filesystem driver rather than editing live metadata structures themselves. The GUI still requires the volume to be unmounted; the privileged engine mounts it privately and reserves accessible free extents in unlinked collector files. Each lowest collector extent is then used directly as the donor for an exchange with a high regular-file extent. The operation does not punch that range free and does not request a second allocation after the collector has reserved the free-space map. This avoids a self-inflicted `ENOSPC` failure and keeps the exact physical destination under verification before every exchange. The operation is deliberately allowed to split files and increase fragmentation. Immutable, append-only, DAX, realtime, shared, unwritten, encoded and otherwise unsupported extents are left in place. Filesystem metadata is not moved.
 
-Each ext4 move uses `EXT4_IOC_MOVE_EXT`; each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. The collector files are unlinked and held only by open descriptors. After an exchange they own the old high blocks; closing them at the end releases those blocks together at the physical tail. A safe Stop exits between completed kernel-journalled exchanges.
+Each ext4 move uses `EXT4_IOC_MOVE_EXT`; each supported XFS move uses the atomic `XFS_IOC_EXCHANGE_RANGE` interface. The collector files are unlinked and held only by open descriptors. After an exchange they own the old high blocks; closing them at the end releases those blocks together at the physical tail. The engine then creates a fresh collector and repeats automatically until a complete pass moves no more regular-file data, so newly exposed opportunities do not require another click. A safe Stop exits between completed kernel-journalled exchanges or between complete collector passes.
+
+During ext4/XFS Compact, each completed exchange sends a physical source/destination range to the GUI. The cached allocation samples are updated and redrawn immediately without rereading the raw device. This live view shows used/free movement; the exact fragmentation overlay is deliberately rebuilt by the final read-only analysis because a compact move may split a file.
+
+EXT filesystems contain fixed structures distributed through block groups. The analyser marks known superblock/descriptor areas, block and inode bitmaps, inode tables, and low-numbered system-inode allocations as **Bad/reserved**, while directory extents remain purple. These allocations can remain as islands inside the free tail because the online regular-file extent-exchange interface cannot relocate them. Compact therefore packs all movable regular-file data as low as those fixed structures permit rather than claiming that every allocated block can be made contiguous.
 
 Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses filtered native balance transactions to relocate high physical chunks into lower unallocated device gaps. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each balance transaction and stops if the allocator no longer moves the boundary.
 

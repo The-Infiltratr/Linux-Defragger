@@ -1,4 +1,14 @@
-# Linux Defragger 1.8.0-24
+# Linux Defragger 1.8.0-25
+
+- Adds real-time EXT4 and XFS Compact allocation-map updates. Every completed kernel mapping exchange reports the low destination and released high source range to the GUI, which redraws the cached map without rescanning the device.
+- Keeps the live display honest: physical used/free movement is updated during Compact, while exact fragmentation colours are recalculated by the normal final analysis.
+- Makes EXT4/XFS Compact automatically repeat complete collector passes until a fresh pass moves no more regular-file data. A second click is no longer required merely because releasing the first pass collector exposed additional compaction opportunities.
+- Uses monotonic multi-pass progress reporting and retains safe stopping between completed kernel-journalled transactions and between collector passes.
+- Corrects EXT allocation reporting so reserved low-numbered system inodes such as the journal and resize inode are not counted as ordinary files or fragmented user data.
+- Marks known EXT superblock/descriptor, block-bitmap, inode-bitmap, inode-table and reserved-system-inode allocations as **Bad/reserved** on the map. This distinguishes fixed filesystem structures from movable blue file data.
+- Reports the online compaction boundary explicitly: remaining islands in the free tail can be directories, journals, allocation metadata or other mappings that the regular-file extent-exchange interface cannot relocate.
+
+# Revision 24
 
 - Fixes the first physical EXT4 Compact failure, where the space collector reserved the free-space map and then attempted to allocate a second donor file, causing `ENOSPC` despite abundant free space.
 - Uses the collector's already allocated low extents directly as exchange donors for both ext4 and XFS. No hole punch or second `fallocate` is performed after the collector pass.
