@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(linux_defragger VERSION 1.5.4 LANGUAGES C)
+project(linux_defragger VERSION 1.5.5 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
