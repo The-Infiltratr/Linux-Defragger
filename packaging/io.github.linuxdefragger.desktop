@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=Linux Defragger
-Comment=Analyse allocation maps and defragment FAT-family filesystems
+Comment=Analyse, compact and defragment supported filesystems
 Exec=linux-defragger
 Icon=io.github.linuxdefragger
 Terminal=false
 Categories=System;Utility;Filesystem;
-Keywords=defrag;filesystem;disk;fat;exfat;allocation;
+Keywords=defrag;defragment;compact;filesystem;disk;fat;exfat;ntfs;allocation;
 StartupNotify=true

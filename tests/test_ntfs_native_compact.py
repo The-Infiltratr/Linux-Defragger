@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Verify native NTFS cluster relocation, bitmap updates and recovery.
+# Purpose: Verify native NTFS compact, defragment, bitmap updates and recovery.
 
 from __future__ import annotations
 
@@ -108,7 +108,8 @@ def record(number: int, attrs: list[bytes]) -> bytes:
 
 
 def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False,
-               split_destinations: bool = False) -> bytes:
+               split_destinations: bool = False,
+               fragmented_data: bool = False) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -134,8 +135,11 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         records[1] = record(1, [nonresident(0x80, [(mirror_lcn, MIRROR_CLUSTERS)], 4 * RECORD_SIZE)])
     records[3] = record(3, [resident(0x70, bytes(volume_info))])
     records[6] = record(6, [nonresident(0x80, [(BITMAP_LCN, 1)], (TOTAL_CLUSTERS + 7) // 8)])
+    data_runs = ([(DATA_LCN, DATA_CLUSTERS // 2),
+                  (DATA_LCN + 32, DATA_CLUSTERS // 2)]
+                 if fragmented_data else [(DATA_LCN, DATA_CLUSTERS)])
     records[24] = record(24, [nonresident(
-        0x80, [(DATA_LCN, DATA_CLUSTERS)], DATA_CLUSTERS * CLUSTER_SIZE,
+        0x80, data_runs, DATA_CLUSTERS * CLUSTER_SIZE,
         mapping_slack=0,
     )])
     mft_offset = MFT_LCN * CLUSTER_SIZE
@@ -146,9 +150,12 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         image[mirror_offset + number * RECORD_SIZE:mirror_offset + (number + 1) * RECORD_SIZE] = records[number]
 
     bitmap = bytearray((TOTAL_CLUSTERS + 7) // 8)
-    used = set(range(MFT_LCN, MFT_LCN + MFT_CLUSTERS))
+    # Reserve the boot area independently so Compact does not encounter an
+    # artificial three-cluster hole before the synthetic MFT.
+    used = set(range(0, MFT_LCN + MFT_CLUSTERS))
     used.add(BITMAP_LCN)
-    used.update(range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
+    for lcn, length in data_runs:
+        used.update(range(lcn, lcn + length))
     if split_destinations:
         holes = set(range(200, 204)) | set(range(500, 505)) | set(range(1000, 1007))
         used.update(cluster for cluster in range(DATA_LCN) if cluster not in holes)
@@ -159,7 +166,11 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
     image[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE] = bitmap
 
     payload = bytes((index * 37 + 11) & 0xFF for index in range(DATA_CLUSTERS * CLUSTER_SIZE))
-    image[DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE] = payload
+    offset = 0
+    for lcn, length in data_runs:
+        count = length * CLUSTER_SIZE
+        image[lcn * CLUSTER_SIZE:(lcn + length) * CLUSTER_SIZE] = payload[offset:offset + count]
+        offset += count
     path.write_bytes(image)
     return payload
 
@@ -230,9 +241,8 @@ def main() -> None:
         )
         assert all(not (bitmap[c >> 3] & (1 << (c & 7))) for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
 
-        # No single lower hole is large enough for the file.  The high-water
-        # extent must be split across three lower extents while preserving the
-        # logical payload and freeing every original high cluster.
+        # Compact must not split a file extent across several holes. That would
+        # alter fragmentation and belongs to Defragment, not Compact.
         payload = make_image(image, split_destinations=True)
         expected = hashlib.sha256(payload).hexdigest()
         ntfs_engine._stop_requested = False
@@ -240,20 +250,39 @@ def main() -> None:
         with contextlib.redirect_stdout(captured):
             assert ntfs_engine.compact(str(image), journal) == 0
         runs = current_data_runs(image)
-        assert len(runs) == 3
-        assert sum(run.length for run in runs) == DATA_CLUSTERS
-        assert all(run.lcn is not None and run.lcn < DATA_LCN for run in runs)
+        assert runs == (ntfs_engine.Run(DATA_LCN, DATA_CLUSTERS),)
         volume = ntfs_engine._open_volume(str(image), False)
         try:
             actual = ntfs_engine._read_stream(volume, runs, 0, len(payload))
         finally:
             ntfs_engine._close_volume(volume)
         assert hashlib.sha256(actual).hexdigest() == expected
-        raw = image.read_bytes()
-        bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
-        assert all(not (bitmap[c >> 3] & (1 << (c & 7)))
-                   for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
-        assert "1 transactions and moved 16 clusters" in captured.getvalue()
+        assert "without changing file fragmentation" in captured.getvalue()
+
+        # Compact may move a complete fragment into a lower hole, but the file
+        # must retain the same number of physical fragments.
+        payload = make_image(image, fragmented_data=True)
+        expected = hashlib.sha256(payload).hexdigest()
+        before_runs = current_data_runs(image)
+        assert ntfs_engine._physical_fragment_count(before_runs) == 2
+        ntfs_engine._stop_requested = False
+        assert ntfs_engine.compact(str(image), journal) == 0
+        after_runs = current_data_runs(image)
+        assert after_runs != before_runs
+        assert ntfs_engine._physical_fragment_count(after_runs) == 2
+        assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
+
+        # Defragment rebuilds that same two-fragment file as one contiguous run
+        # in the trailing free area near the physical end of the volume.
+        payload = make_image(image, fragmented_data=True)
+        expected = hashlib.sha256(payload).hexdigest()
+        ntfs_engine._stop_requested = False
+        assert ntfs_engine.defragment(str(image), journal) == 0
+        defragged_runs = current_data_runs(image)
+        assert ntfs_engine._physical_fragment_count(defragged_runs) == 1
+        assert defragged_runs[0].lcn is not None
+        assert int(defragged_runs[0].lcn) > DATA_LCN + 32
+        assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
 
         # An immovable high object must no longer prevent unrelated movable
         # data from filling lower gaps.  The boundary remains fixed by
@@ -414,7 +443,7 @@ def main() -> None:
         else:
             raise AssertionError("unknown NTFS volume flag was accepted")
 
-    print("Native NTFS compact, recovery and volume-flag tests passed")
+    print("Native NTFS compact/defragment, recovery and volume-flag tests passed")
 
 
 if __name__ == "__main__":

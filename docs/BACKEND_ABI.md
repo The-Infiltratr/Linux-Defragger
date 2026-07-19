@@ -23,9 +23,11 @@ allocation_mapper.py --list-backends
 
 It builds the volume filter and enables controls from that manifest.  Adding a
 read-only filesystem requires a new module and one registry entry; no GUI code
-change is required.  Mutation-capable modules additionally use the native
-engine operation contract.  The three FAT modules share `fat_common.py` and the
-journalled native FAT engine.
+change is required. Mutation-capable modules advertise Compact, Defragment and
+Recover independently; the GUI never infers one operation from another. The
+three FAT modules share `fat_common.py` and the journalled native FAT engine.
+The NTFS module routes Compact and Defragment to separate planners in the native
+NTFS engine, with a shared external recovery-journal contract.
 
 Map results use a common JSON schema.  Each cell reports `free`, `used`,
 `unknown`, `bad`, `fragmented`, and `directory` allocation-unit counts.  A

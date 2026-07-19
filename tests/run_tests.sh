@@ -191,5 +191,10 @@ PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ext_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_native_compact.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_compact_real.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_partial_compact_real.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_defrag_real.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_allocation_mapper.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_mounted_analysis_policy.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_swap_backend.py" >/dev/null
 
 echo 'all tests passed'

@@ -1,16 +1,20 @@
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+# Purpose: Read-only NTFS allocation and fragmentation analysis plus mutation capabilities.
 #
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
 
-"""NTFS allocation/fragmentation analysis with native offline compaction."""
+"""NTFS allocation analysis with native offline compact and defragment."""
 
 from __future__ import annotations
 from .base import *
 
-INFO = BackendInfo("ntfs", "NTFS", ("ntfs", "ntfs3"), CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_RECOVER, "exact")
+INFO = BackendInfo(
+    "ntfs", "NTFS", ("ntfs", "ntfs3"),
+    CAP_ANALYSE | CAP_MAP | CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER,
+    "exact",
+)
 
 _ATTR_DATA = 0x80
 _ATTR_INDEX_ALLOCATION = 0xA0

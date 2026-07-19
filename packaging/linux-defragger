@@ -1,7 +1,7 @@
 #!/bin/sh
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Build, install or test support script.
+# Purpose: Launch the installed GTK application without writing Python bytecode.
 
 export PYTHONDONTWRITEBYTECODE=1
 

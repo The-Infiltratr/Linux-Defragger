@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Validate native high-water extent splitting on a real NTFS image.
+# Purpose: Validate that real NTFS Compact preserves file fragmentation.
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def main() -> None:
         before_high = before.highest_lcn
         assert largest_hole < before.clusters
         assert total_lower_free >= before.clusters
-        before_capacity = before.attribute.length - before.attribute.run_offset
+        before_fragments = ntfs_engine._physical_fragment_count(before.attribute.runs)
 
         ntfs_engine._stop_requested = False
         assert ntfs_engine.compact(str(image), journal) == 0
@@ -114,14 +114,13 @@ def main() -> None:
 
         after, _largest, _total = largest_candidate(image)
         assert after.record_number == before.record_number
-        assert after.highest_lcn < before_high
-        assert len(after.attribute.runs) >= 2
-        assert after.attribute.length - after.attribute.run_offset >= before_capacity
+        assert ntfs_engine._physical_fragment_count(after.attribute.runs) == before_fragments
+        assert after.highest_lcn <= before_high
 
         run([tools["ntfscat"], "-f", str(image), "/payload.bin"], extracted)
         assert digest(extracted) == expected
         run([tools["ntfsresize"], "--check", "--force", "--force", str(image)])
-    print("Real NTFS split-extent relocation, MFT growth, SHA-256 and consistency test passed")
+    print("Real NTFS whole-extent compaction preserved fragmentation and filesystem consistency")
 
 
 if __name__ == "__main__":

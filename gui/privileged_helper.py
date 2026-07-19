@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+# Purpose: PolicyKit-authorised command runner for raw-device operations.
 #
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
@@ -43,7 +43,7 @@ _active_request_id: int | None = None
 _shutdown_requested = False
 _active_has_output = False
 _pending_stop = False
-_NTFS_PROGRESS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+percent completed\s*$", re.IGNORECASE)
+_ENGINE_PROGRESS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+percent completed\s*$", re.IGNORECASE)
 
 
 def emit(message: dict[str, Any]) -> None:
@@ -85,7 +85,7 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
     if program == "ntfs-engine":
         if not NTFS_ENGINE.is_file() or not os.access(NTFS_ENGINE, os.X_OK):
             raise RuntimeError(f"NTFS engine is unavailable: {NTFS_ENGINE}")
-        if not argv or argv[0] not in {"compact", "recover"}:
+        if not argv or argv[0] not in {"compact", "defrag", "recover"}:
             raise RuntimeError("NTFS engine command is not allowed")
         return [str(NTFS_ENGINE), *argv]
     if program == "mapper":
@@ -133,7 +133,7 @@ def run_request(request_id: int, program: str, argv: list[str]) -> None:
                     deliver_queued_stop = _pending_stop
                     _pending_stop = False
             clean_line = line.rstrip("\r\n")
-            progress_match = _NTFS_PROGRESS_RE.match(clean_line)
+            progress_match = _ENGINE_PROGRESS_RE.match(clean_line)
             if progress_match is not None:
                 percent = max(0.0, min(100.0, float(progress_match.group(1))))
                 now = time.monotonic()

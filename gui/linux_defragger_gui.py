@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Modular filesystem analysis, compaction and defragmentation support.
+# Purpose: GTK interface for analysis, compaction, defragmentation and recovery.
 #
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
@@ -43,7 +43,10 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.8.0"
+BASE_VERSION = "1.8.0"
+PACKAGE_REVISION = "13"
+VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
+PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -143,7 +146,7 @@ def find_ntfs_engine() -> str:
     return _configured_executable(
         "LINUX_DEFRAGGER_NTFS_ENGINE",
         "/usr/lib/linux-defragger/ntfs_engine.py",
-        "the NTFS compaction engine",
+        "the native NTFS maintenance engine",
     )
 
 
@@ -251,7 +254,6 @@ def discover_volumes() -> list[Volume]:
 
 class DiskMap(Gtk.DrawingArea):
     """Render backend allocation data as a dense, dynamically sized pixel map."""
-    """Dense cluster map inspired by classic graphical defragmenters."""
 
     COLORS = {
         "free": (0.92, 0.94, 0.96),
@@ -470,21 +472,28 @@ class MainWindow(Gtk.ApplicationWindow):
         BACKEND_CAPABILITIES = capabilities
 
     def _build_ui(self) -> None:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+        outer.pack_start(self._build_menu_bar(), False, False, 0)
+
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_border_width(12)
-        self.add(root)
+        outer.pack_start(root, True, True, 0)
 
         title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         title = Gtk.Label()
         title.set_markup("<span size='x-large' weight='bold'>Linux Defragger</span>")
         title.set_xalign(0)
-        subtitle = Gtk.Label(label="Modular maps for modern, Solaris, Amiga, Atari and swap volumes; FAT12/16/32 include compaction and defragmentation")
+        subtitle = Gtk.Label(
+            label="Analyse allocation and fragmentation, compact free space, and defragment supported filesystems"
+        )
         subtitle.set_xalign(0)
+        subtitle.set_line_wrap(True)
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         title_box.pack_start(title, False, False, 0)
         title_box.pack_start(subtitle, False, False, 0)
         title_row.pack_start(title_box, True, True, 0)
-        version = Gtk.Label(label=f"Engine GUI {VERSION}")
+        version = Gtk.Label(label=f"Engine {VERSION} · GUI {VERSION}")
         version.get_style_context().add_class("dim-label")
         title_row.pack_end(version, False, False, 0)
         root.pack_start(title_row, False, False, 0)
@@ -593,6 +602,52 @@ class MainWindow(Gtk.ApplicationWindow):
         self.status_label.get_style_context().add_class("dim-label")
         root.pack_start(self.status_label, False, False, 0)
         self._update_controls()
+
+    def _build_menu_bar(self) -> Gtk.MenuBar:
+        """Create conventional File and About menus for the desktop interface."""
+        menu_bar = Gtk.MenuBar()
+
+        file_item = Gtk.MenuItem.new_with_mnemonic("_File")
+        file_menu = Gtk.Menu()
+        file_item.set_submenu(file_menu)
+
+        open_item = Gtk.MenuItem.new_with_mnemonic("_Open image…")
+        open_item.connect("activate", self._open_image)
+        file_menu.append(open_item)
+
+        refresh_item = Gtk.MenuItem.new_with_mnemonic("_Refresh volumes")
+        refresh_item.connect("activate", lambda _item: self.refresh_devices())
+        file_menu.append(refresh_item)
+
+        file_menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem.new_with_mnemonic("_Quit")
+        quit_item.connect("activate", lambda _item: self.get_application().quit())
+        file_menu.append(quit_item)
+
+        about_item = Gtk.MenuItem.new_with_mnemonic("_About")
+        about_menu = Gtk.Menu()
+        about_item.set_submenu(about_menu)
+        about_dialog_item = Gtk.MenuItem.new_with_label("About Linux Defragger")
+        about_dialog_item.connect("activate", self._show_about)
+        about_menu.append(about_dialog_item)
+
+        menu_bar.append(file_item)
+        menu_bar.append(about_item)
+        return menu_bar
+
+    def _show_about(self, _item: Gtk.MenuItem) -> None:
+        dialog = Gtk.AboutDialog(transient_for=self, modal=True)
+        dialog.set_program_name(APP_NAME)
+        dialog.set_version(VERSION)
+        dialog.set_comments(
+            "Filesystem allocation analysis, free-space compaction, "
+            "defragmentation and journalled recovery."
+        )
+        dialog.set_authors(["Shannon Smith"])
+        dialog.set_website(PROJECT_URL)
+        dialog.set_website_label("Linux Defragger on GitHub")
+        dialog.run()
+        dialog.destroy()
 
     @staticmethod
     def _draw_swatch(_widget: Gtk.Widget, cr: Any, colour: tuple[float, float, float]) -> bool:
@@ -1046,18 +1101,29 @@ class MainWindow(Gtk.ApplicationWindow):
             return
 
         descriptions = {
-            "defrag": "Relocate fragmented directory and file chains into contiguous free runs.",
-            "compact": "Pack allocated data toward the beginning of the volume.",
+            "defrag": "Rebuild fragmented files as contiguous runs without compacting free space.",
+            "compact": "Fill internal free-space gaps without attempting to defragment files.",
             "recover": "Complete or roll back the interrupted journalled transaction.",
         }
         extra_warning = ""
         if volume.normalized_fstype == "ntfs":
-            extra_warning = (
-                "\n\nNTFS Compact uses Linux Defragger's native offline NTFS writer. "
-                "It fills the lowest internal free gaps with supported file extents from "
-                "higher physical locations, repeating until free space is consolidated at "
-                "the end or a specific unsupported NTFS layout prevents further packing."
-            )
+            if operation == "compact":
+                extra_warning = (
+                    "\n\nNTFS Compact moves complete physical extents into lower gaps while "
+                    "preserving each file's existing fragment count. It does not join, split "
+                    "or rebuild fragmented files."
+                )
+            elif operation == "defrag":
+                extra_warning = (
+                    "\n\nNTFS Defragment finds supported fragmented ordinary files, rebuilds "
+                    "each one as a single contiguous extent, and allocates the rebuilt files "
+                    "from the physical end of the volume downward."
+                )
+            else:
+                extra_warning = (
+                    "\n\nNTFS Recover completes or rolls back the one journalled native NTFS "
+                    "file transaction that was interrupted."
+                )
         if not self.confirm(
             f"{operation.capitalize()} {volume.path}?",
             f"{descriptions[operation]}{extra_warning}\n\nThe volume must remain connected and unmounted. "
@@ -1074,8 +1140,12 @@ class MainWindow(Gtk.ApplicationWindow):
         live_cells = len(self.map_data.get("cells", [])) if self.map_data else self._desired_map_cells()
         live_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(live_cells)))
         if operation == "defrag":
-            args += ["--transaction-files", "32", "--ram-buffer", "auto", "--workers", "auto",
-                     "--live-map-cells", str(live_cells)]
+            if volume.normalized_fstype == "ntfs":
+                args += ["--ram-buffer", "auto", "--workers", "auto",
+                         "--live-map-cells", str(live_cells)]
+            else:
+                args += ["--transaction-files", "32", "--ram-buffer", "auto", "--workers", "auto",
+                         "--live-map-cells", str(live_cells)]
         elif operation == "compact":
             args += ["--ram-buffer", "auto", "--workers", "auto",
                      "--live-map-cells", str(live_cells)]
@@ -1274,10 +1344,18 @@ class MainWindow(Gtk.ApplicationWindow):
                 percent = max(0.0, min(100.0, float(message.get("percent", 0.0))))
             except (TypeError, ValueError):
                 percent = 0.0
+            current = getattr(self, "_helper_current", None)
+            purpose = current[0] if current else "operation"
+            display_name = {
+                "analysis": "Analysis",
+                "compact": "Compact",
+                "defrag": "Defragment",
+                "recover": "Recovery",
+            }.get(purpose, purpose.capitalize())
             self.determinate_progress = True
             self.progress.set_fraction(percent / 100.0)
-            self.progress.set_text(f"NTFS compact: {percent:.2f}%")
-            self.status_label.set_text(f"NTFS compaction in progress · {percent:.2f}%")
+            self.progress.set_text(f"{display_name}: {percent:.2f}%")
+            self.status_label.set_text(f"{display_name} in progress · {percent:.2f}%")
             return False
         if message_type == "output" and message.get("id") == self.helper_active_id:
             line = str(message.get("line", ""))
@@ -1532,7 +1610,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.stop_button.set_sensitive(self.busy and not self.stop_requested)
 
 
-class Fat32DefragApplication(Gtk.Application):
+class LinuxDefraggerApplication(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=0)
         self.window: MainWindow | None = None
@@ -1559,7 +1637,7 @@ class Fat32DefragApplication(Gtk.Application):
 
 
 def main(argv: list[str] | None = None) -> int:
-    app = Fat32DefragApplication()
+    app = LinuxDefraggerApplication()
     return app.run(argv or sys.argv)
 
 

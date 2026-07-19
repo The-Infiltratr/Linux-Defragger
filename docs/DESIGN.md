@@ -1,4 +1,19 @@
-# Engine design
+# Engine design and operation contracts
+
+## User-visible operation separation
+
+`Analyse`, `Compact` and `Defragment` are independent controls. Analyse is
+read-only. Compact reorganises allocation to reduce internal free-space gaps.
+Defragment reorganises file allocation to reduce the number of physical extents
+per file. A backend advertises each operation separately through the capability
+manifest.
+
+The native NTFS backend enforces this separation strictly: Compact preserves
+the fragment count of every moved file, while Defragment rebuilds supported
+fragmented files as one contiguous extent in the trailing end-of-volume area.
+The older FAT planner may still reduce fragmentation as a side effect of moving
+a complete chain; that existing FAT behaviour is documented below and is not
+used by the NTFS planner.
 
 ## Filesystem invariants
 
@@ -12,7 +27,7 @@ The directory entry is the commit pointer. A destination chain is copied and lin
 
 ## Buffered extent I/O
 
-Version 0.5 converts a cluster mapping into source and destination extent lists. Consecutive physical source clusters that also occupy consecutive logical buffer positions form one read extent. Source extents are sorted by physical offset and read into an aligned RAM buffer; several workers may claim independent read extents when the target is non-rotational or the user explicitly requests them. Each extent writes into its predetermined buffer offset, so physical read ordering cannot alter file byte order.
+The native FAT engine converts a cluster mapping into source and destination extent lists. Consecutive physical source clusters that also occupy consecutive logical buffer positions form one read extent. Source extents are sorted by physical offset and read into an aligned RAM buffer; several workers may claim independent read extents when the target is non-rotational or the user explicitly requests them. Each extent writes into its predetermined buffer offset, so physical read ordering cannot alter file byte order.
 
 Destination extents are generated from the same logical mapping and written in physical order after all source reads for the RAM chunk complete. Defragmenting a file into a contiguous run therefore normally produces one destination extent. Very large files or transactions are divided into cluster-aligned chunks bounded by `--ram-buffer`; source and destination allocation sets are disjoint, so chunking cannot overwrite unread source data.
 
@@ -56,7 +71,7 @@ Source FAT entries are freed only after destination data, destination FAT entrie
 
 The journal is written through a temporary file, flushed, atomically renamed, and followed by a parent-directory flush. Device `fsync()` calls separate payload copy, metadata switch, and source release.
 
-## Low-fragmentation compaction planner
+## FAT low-fragmentation compaction planner
 
 The 0.4 planner is deliberately different from the 0.2 highest-cluster-to-lowest-hole algorithm.
 
@@ -86,7 +101,7 @@ Stable downward shifting preserves adjacency inside every selected physical exte
 
 `--batch-clusters` limits ordered-extent fallback transactions. A whole object may exceed that soft limit because splitting an otherwise movable complete chain would create avoidable fragmentation. `--max-clusters` remains a hard limit on the total number of physical cluster copies, including temporary staging copies.
 
-## Directory-chain defragmentation
+## FAT directory-chain defragmentation
 
 Directory relocation reuses the mapped-cluster transaction. Destinations may be either below or above sources as long as the source and destination sets are disjoint and every destination is free.
 
@@ -94,6 +109,37 @@ The scanner records every ordinary short directory entry with a nonzero first-cl
 
 Directories are moved one at a time. The filesystem is fully rescanned after each move, and it is rescanned again before regular-file defragmentation. Compaction likewise rescans between mapped transactions. This trades scanning time for auditable correctness: no operation uses a directory-entry byte offset calculated before its containing directory moved.
 
-## Directory-sector patch coalescing (v0.6)
+## Directory-sector patch coalescing
 
 Mapped transactions may contain multiple directory-entry first-cluster patches. The journal still records each patch independently so recovery semantics and compatibility are unchanged. During the switch stage, patches are sorted by physical sector. Each affected sector is read once, all 32-byte entry changes are applied in RAM, and the sector is written once. Conflicting patches to the same entry are rejected. The switch-stage `fsync()` remains in the same position.
+
+## Native NTFS mutation engine
+
+The NTFS writer handles ordinary unnamed, non-resident, uncompressed,
+non-sparse and non-encrypted data streams stored in one base MFT record. It
+updates mapping pairs, `$Bitmap`, `$Volume` and `$MFTMirr` directly and does not
+depend on NTFS-3G at runtime.
+
+### NTFS Compact
+
+The planner finds the lowest internal free run and searches higher supported
+streams for one complete physical extent that fits. The replacement is rejected
+if it would split an extent, join logical neighbours, change the stream's
+physical fragment count or exceed the existing MFT record's mapping-pair
+capacity. One complete extent is copied per journalled transaction.
+
+### NTFS Defragment
+
+The defragmenter scans for supported streams with more than one physical extent.
+It allocates the largest files first from the trailing free run, working from
+the physical end downward. All source extents are copied in logical order to one
+contiguous destination. Source holes are not returned to the destination pool
+during that pass, keeping Defragment separate from Compact.
+
+### NTFS transaction order
+
+Both operations use the same durable order: copy destination data, write the
+external journal, mark the volume dirty, reserve destination bitmap ranges,
+switch the MFT record, release source bitmap ranges, restore the original volume
+flags and remove the journal. Recovery compares the current MFT record with the
+saved before/after images to choose idempotent forward completion or rollback.

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: Build, install or test support script.
+# Purpose: Install a completed local build and its desktop integration.
 
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

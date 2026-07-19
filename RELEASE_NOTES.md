@@ -1,10 +1,13 @@
-# Linux Defragger 1.8.0 package revision 12
+# Linux Defragger 1.8.0 package revision 13
 
-- Retains genuine native NTFS lowest-gap-first hole-filling compaction.
-- Replaces per-cluster Python bitmap work with byte-range updates, avoiding millions of interpreter operations on large moves.
-- Stops materialising one Python integer for every source and destination cluster when journalling or recovering a move.
-- Batches up to 128 lower free extents and up to 262,144 clusters into one crash-safe NTFS transaction, greatly reducing journal and `fsync` overhead on volumes containing many small white gaps.
-- Uses cached MFT scan metadata while selecting source extents and rereads only the finally selected MFT record, rather than rereading thousands of candidates for each gap.
-- Maintains the current high-water boundary incrementally and rescans downward only when a move actually releases the physical end of the allocation.
-- Keeps the same copy-first, bitmap-reserve, MFT-switch, source-release transaction order and the same forward/rollback recovery guarantees.
-- Cluster zero remains protected, unsupported NTFS objects remain immovable, and there is still no NTFS-3G runtime dependency.
+- Adds native offline NTFS file defragmentation and enables the NTFS Defragment button.
+- NTFS Defragment finds supported fragmented ordinary files, rebuilds each as one contiguous extent and allocates rebuilt files from the physical end of the volume downward.
+- Separates NTFS Compact from Defragment. Compact now moves complete physical extents only and rejects any move that would change a file's fragment count.
+- Prevents NTFS Compact from splitting one extent across several holes or accidentally joining logical neighbours.
+- Retains journalled copy, bitmap reservation, MFT switch, source release, dirty-state handling and forward/rollback recovery for both NTFS operations.
+- Adds File and About menus, including Open image, Refresh volumes, Quit and a GTK About dialog.
+- Updates the title bar, build label, native FAT engine version and NTFS engine version to display `1.8.0-13`.
+- Replaces the outdated subtitle with a direct description of Analyse, Compact and Defragment.
+- Renames the old FAT-specific GTK application class to `LinuxDefraggerApplication`.
+- Audits the NTFS comments and documentation so production Compact behaviour is no longer described as high-water splitting or multi-gap defragmenting compaction.
+- Updates the desktop description and backend capability manifest for native NTFS Defragment support.
