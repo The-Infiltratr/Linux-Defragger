@@ -10,7 +10,8 @@ manifest.
 
 The native NTFS backend enforces this separation strictly: Compact preserves
 the fragment count of every moved file, while Defragment rebuilds supported
-fragmented files as one contiguous extent in the trailing end-of-volume area.
+fragmented files as one contiguous extent in the highest suitable free run
+anywhere on the volume.
 The older FAT planner may still reduce fragmentation as a side effect of moving
 a complete chain; that existing FAT behaviour is documented below and is not
 used by the NTFS planner.
@@ -131,10 +132,12 @@ capacity. One complete extent is copied per journalled transaction.
 ### NTFS Defragment
 
 The defragmenter scans for supported streams with more than one physical extent.
-It allocates the largest files first from the trailing free run, working from
-the physical end downward. All source extents are copied in logical order to one
-contiguous destination. Source holes are not returned to the destination pool
-during that pass, keeping Defragment separate from Compact.
+It allocates the largest files first and selects the highest suitable contiguous
+free run from the complete volume map. All source extents are copied in logical
+order to one contiguous destination. Source holes are not returned to the
+destination pool during that pass, keeping Defragment separate from Compact.
+An occupied physical tail therefore does not disable defragmentation when a
+sufficiently large internal free run exists.
 
 ### NTFS transaction order
 

@@ -1,13 +1,10 @@
-# Linux Defragger 1.8.0 package revision 13
+# Linux Defragger 1.8.0 package revision 14
 
-- Adds native offline NTFS file defragmentation and enables the NTFS Defragment button.
-- NTFS Defragment finds supported fragmented ordinary files, rebuilds each as one contiguous extent and allocates rebuilt files from the physical end of the volume downward.
-- Separates NTFS Compact from Defragment. Compact now moves complete physical extents only and rejects any move that would change a file's fragment count.
-- Prevents NTFS Compact from splitting one extent across several holes or accidentally joining logical neighbours.
-- Retains journalled copy, bitmap reservation, MFT switch, source release, dirty-state handling and forward/rollback recovery for both NTFS operations.
-- Adds File and About menus, including Open image, Refresh volumes, Quit and a GTK About dialog.
-- Updates the title bar, build label, native FAT engine version and NTFS engine version to display `1.8.0-13`.
-- Replaces the outdated subtitle with a direct description of Analyse, Compact and Defragment.
-- Renames the old FAT-specific GTK application class to `LinuxDefraggerApplication`.
-- Audits the NTFS comments and documentation so production Compact behaviour is no longer described as high-water splitting or multi-gap defragmenting compaction.
-- Updates the desktop description and backend capability manifest for native NTFS Defragment support.
+- Fixes native NTFS Defragment incorrectly requiring free space beyond the current allocation boundary.
+- NTFS Defragment now searches the complete volume free-space map and chooses the highest suitable contiguous run anywhere on the volume.
+- A fully occupied physical tail no longer prevents defragmentation when sufficiently large internal free runs exist.
+- Defragment still does not reuse source holes released during the same pass, preserving its separation from Compact.
+- Updates NTFS progress and completion messages to describe whole-volume destination selection rather than a trailing-only destination area.
+- Adds a destructive regression test for a fragmented NTFS stream on a volume with an occupied physical tail and usable internal free space.
+- Updates the title bar, build label, native FAT engine version and NTFS engine version to display `1.8.0-14`.
+- Updates README and design documentation to match the corrected NTFS destination planner.

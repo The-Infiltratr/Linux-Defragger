@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
-ENGINE_VERSION = "1.8.0-13"
+ENGINE_VERSION = "1.8.0-14"
 SCHEMA = 3
 JOURNAL_KIND = "linux-defragger-native-ntfs-move"
 BLKGETSIZE64 = 0x80081272
@@ -2143,13 +2143,14 @@ def compact(device: str, journal_path: Path,
 
 def defragment(device: str, journal_path: Path,
                diagnostic_path: Path | None = None) -> int:
-    """Rebuild supported fragmented NTFS files contiguously at the volume end.
+    """Rebuild supported fragmented NTFS files as one contiguous extent.
 
     Only ordinary unnamed, uncompressed, non-sparse and non-encrypted streams
     stored in one base MFT record are currently writable. Source extents are
-    copied in logical order into one contiguous destination selected from the
-    trailing free area. Freed source extents are deliberately not reused during
-    this operation, so Defragment does not turn into another compaction pass.
+    copied in logical order into the highest suitable contiguous free run
+    anywhere on the volume. Freed source extents are deliberately not reused
+    during this operation, so Defragment does not turn into another compaction
+    pass or depend on unused space beyond the current allocation boundary.
     """
     if _is_mounted(device):
         raise NtfsCompactError("NTFS defragmentation requires an unmounted volume")
@@ -2186,14 +2187,21 @@ def defragment(device: str, journal_path: Path,
             if not info.movable and _physical_fragment_count(info.runs) > 1
         ]
         # Largest files are allocated first so a small file cannot consume the
-        # only trailing run capable of holding a much larger fragmented file.
+        # only free run capable of holding a much larger fragmented file.
         supported.sort(key=lambda info: (info.clusters, info.highest_lcn), reverse=True)
         before_high = _highest_used(layout.bitmap, volume.total_clusters)
-        destination_pool = [
-            run for run in _defrag_destination_pool(layout.bitmap, volume.total_clusters)
-            if run.lcn is not None and int(run.lcn) >= before_high
-        ]
-        tail_clusters = sum(run.length for run in destination_pool)
+        destination_pool = _defrag_destination_pool(
+            layout.bitmap, volume.total_clusters
+        )
+        destination_clusters = sum(run.length for run in destination_pool)
+        largest_destination = max(
+            (run.length for run in destination_pool), default=0
+        )
+        highest_destination_end = max(
+            (int(run.lcn) + run.length for run in destination_pool
+             if run.lcn is not None),
+            default=0,
+        )
         total_clusters = sum(info.clusters for info in supported)
 
         print(
@@ -2215,11 +2223,19 @@ def defragment(device: str, journal_path: Path,
                 flush=True,
             )
         print(
-            f"Contiguous trailing destination space: {tail_clusters:,} clusters "
-            f"({_human_bytes(tail_clusters * volume.cluster_size)}), beginning after "
-            f"cluster {max(0, before_high - 1):,}.",
+            f"Contiguous destination space available across the volume: "
+            f"{destination_clusters:,} clusters "
+            f"({_human_bytes(destination_clusters * volume.cluster_size)}); "
+            f"largest single free run: {largest_destination:,} clusters "
+            f"({_human_bytes(largest_destination * volume.cluster_size)}).",
             flush=True,
         )
+        if highest_destination_end <= before_high:
+            print(
+                "No free run exists beyond the current allocation boundary; "
+                "Defragment will use the highest suitable internal free runs instead.",
+                flush=True,
+            )
         print("0.00 percent completed", flush=True)
 
         moved_files = 0
@@ -2263,7 +2279,7 @@ def defragment(device: str, journal_path: Path,
                 print(
                     f"Defragmented {moved_files:,} files "
                     f"({_human_bytes(moved_clusters * volume.cluster_size)} moved) into "
-                    "contiguous extents at the physical end of the volume.",
+                    "the highest suitable contiguous free extents.",
                     flush=True,
                 )
                 last_report_time = now
@@ -2279,7 +2295,7 @@ def defragment(device: str, journal_path: Path,
         if skipped_space:
             print(
                 f"{skipped_space:,} supported fragmented files were not moved because no "
-                "single contiguous run remained in the trailing destination area.",
+                "single contiguous free run anywhere on the volume was large enough.",
                 flush=True,
             )
         if skipped_changed:

@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-13
+# Linux Defragger 1.8.0-14
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation and journalled recovery for supported filesystems.
 
@@ -30,7 +30,7 @@ This separation means a small gap may remain when no complete supported extent f
 
 ### NTFS Defragment
 
-NTFS Defragment finds supported ordinary files that have more than one physical extent. Each file is copied in logical order into one contiguous free run selected from the trailing free area at the physical end of the volume. The original extents are released only after the new MFT mapping is durable.
+NTFS Defragment finds supported ordinary files that have more than one physical extent. Each file is copied in logical order into the highest suitable contiguous free run anywhere on the volume. This means defragmentation still works when the physical tail is occupied but large internal free runs exist. The original extents are released only after the new MFT mapping is durable.
 
 Freed source holes are not reused during the same defragmentation pass. This prevents Defragment from becoming an implicit compaction operation.
 

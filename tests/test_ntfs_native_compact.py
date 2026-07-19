@@ -109,7 +109,8 @@ def record(number: int, attrs: list[bytes]) -> bytes:
 
 def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = False,
                split_destinations: bool = False,
-               fragmented_data: bool = False) -> bytes:
+               fragmented_data: bool = False,
+               occupied_tail: bool = False) -> bytes:
     image = bytearray(TOTAL_CLUSTERS * CLUSTER_SIZE)
     boot = memoryview(image)[:BPS]
     boot[0:3] = b"\xeb\x52\x90"
@@ -161,6 +162,11 @@ def make_image(path: Path, volume_flags: int = 0, high_mftmirr_blocker: bool = F
         used.update(cluster for cluster in range(DATA_LCN) if cluster not in holes)
     if high_mftmirr_blocker:
         used.update(range(mirror_lcn, mirror_lcn + MIRROR_CLUSTERS))
+    if occupied_tail:
+        # Simulate a volume whose physical tail is completely occupied while
+        # large internal free runs still exist. Defragment must use those
+        # internal destinations rather than incorrectly requiring tail space.
+        used.update(range(DATA_LCN + 64, TOTAL_CLUSTERS - 1))
     for cluster in used:
         bitmap[cluster >> 3] |= 1 << (cluster & 7)
     image[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE] = bitmap
@@ -273,7 +279,7 @@ def main() -> None:
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
 
         # Defragment rebuilds that same two-fragment file as one contiguous run
-        # in the trailing free area near the physical end of the volume.
+        # in the highest suitable free area on the volume.
         payload = make_image(image, fragmented_data=True)
         expected = hashlib.sha256(payload).hexdigest()
         ntfs_engine._stop_requested = False
@@ -283,6 +289,27 @@ def main() -> None:
         assert defragged_runs[0].lcn is not None
         assert int(defragged_runs[0].lcn) > DATA_LCN + 32
         assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
+
+        # A full physical tail must not disable Defragment. The engine should
+        # choose the highest suitable internal free run and still rebuild the
+        # stream as one extent without turning the pass into Compact.
+        payload = make_image(image, fragmented_data=True, occupied_tail=True)
+        expected = hashlib.sha256(payload).hexdigest()
+        before_runs = current_data_runs(image)
+        assert ntfs_engine._physical_fragment_count(before_runs) == 2
+        captured = io.StringIO()
+        ntfs_engine._stop_requested = False
+        with contextlib.redirect_stdout(captured):
+            assert ntfs_engine.defragment(str(image), journal) == 0
+        defragged_runs = current_data_runs(image)
+        assert ntfs_engine._physical_fragment_count(defragged_runs) == 1
+        assert defragged_runs[0].lcn is not None
+        assert int(defragged_runs[0].lcn) < TOTAL_CLUSTERS - 1
+        assert defragged_runs != before_runs
+        assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == expected
+        report = captured.getvalue()
+        assert "highest suitable internal free runs" in report
+        assert "rebuilt 1 file streams" in report
 
         # An immovable high object must no longer prevent unrelated movable
         # data from filling lower gaps.  The boundary remains fixed by

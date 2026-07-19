@@ -44,7 +44,7 @@ except (ImportError, ValueError) as exc:
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
 BASE_VERSION = "1.8.0"
-PACKAGE_REVISION = "13"
+PACKAGE_REVISION = "14"
 VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
@@ -1116,8 +1116,8 @@ class MainWindow(Gtk.ApplicationWindow):
             elif operation == "defrag":
                 extra_warning = (
                     "\n\nNTFS Defragment finds supported fragmented ordinary files, rebuilds "
-                    "each one as a single contiguous extent, and allocates the rebuilt files "
-                    "from the physical end of the volume downward."
+                    "each one as a single contiguous extent, and allocates each rebuilt file "
+                    "in the highest suitable free run anywhere on the volume."
                 )
             else:
                 extra_warning = (
