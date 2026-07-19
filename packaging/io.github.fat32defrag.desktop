@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Disk Allocation Map & FAT Defragmenter
+Comment=Map NTFS, exFAT, ext4, Btrfs, XFS and fully defragment FAT
+Exec=fat32defrag-gui
+Icon=io.github.fat32defrag
+Terminal=false
+Categories=System;Filesystem;GTK;
+Keywords=FAT;NTFS;exFAT;ext4;Btrfs;XFS;defrag;defragment;compact;USB;disk;allocation;map;
+StartupNotify=true
