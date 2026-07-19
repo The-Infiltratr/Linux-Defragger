@@ -902,18 +902,17 @@ class MainWindow(Gtk.ApplicationWindow):
         volume = self.current_volume
         if not volume or self.busy:
             return
-        if volume.mounted:
-            self.show_error(
-                "The volume is mounted",
-                "Unmount it before raw allocation analysis so the map cannot change underneath the scanner.",
-            )
-            return
         if not quiet:
             if clear_log:
                 self.clear_log()
             else:
                 self.append_log("\nRefreshing the allocation map…")
             self.append_log(f"Analysing {volume.normalized_fstype.upper()} volume {volume.path}…")
+            if volume.mounted:
+                self.append_log(
+                    "The volume is mounted. Analysis is read-only; this is a live snapshot and "
+                    "the map may change while the filesystem is active."
+                )
 
         map_cells = target_cells if target_cells is not None else self._desired_map_cells()
         map_cells = max(MIN_MAP_CELLS, min(MAX_MAP_CELLS, int(map_cells)))
@@ -939,6 +938,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 )
                 return
             self._apply_map(data)
+            if volume.mounted:
+                self.status_label.set_text(self.status_label.get_text() + " · live mounted snapshot")
             if not quiet:
                 if volume.is_fat32:
                     self.append_log(
@@ -1466,7 +1467,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.refresh_button.set_sensitive(not self.busy)
         self.image_button.set_sensitive(not self.busy)
         self.device_combo.set_sensitive(not self.busy)
-        self.analyze_button.set_sensitive(enabled and not mounted and bool(caps & CAP_ANALYSE))
+        self.analyze_button.set_sensitive(enabled and bool(caps & CAP_ANALYSE))
         self.unmount_button.set_sensitive(enabled and mounted and not bool(volume and volume.image))
         can_write = enabled and mutation_backend and not mounted and not bool(volume and volume.readonly)
         self.compact_button.set_sensitive(can_write and bool(caps & CAP_COMPACT) and not journal_exists)

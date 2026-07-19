@@ -45,7 +45,12 @@ expect_fail 'allocated but unreferenced cluster' "$BIN" analyze "$TMP/orphan.img
 
 make_img "$TMP/dirty.img"
 "$ROOT/tests/mutate_image.py" "$TMP/dirty.img" dirty
-expect_fail 'clean-shutdown bit is clear' "$BIN" analyze "$TMP/dirty.img"
+# Read-only analysis is allowed for an active/dirty FAT snapshot, but every
+# mutation still requires a cleanly unmounted filesystem.
+"$BIN" analyze "$TMP/dirty.img" --list >/dev/null
+"$BIN" map "$TMP/dirty.img" --cells 64 >/dev/null
+expect_fail 'clean-shutdown bit is clear' "$BIN" defrag "$TMP/dirty.img" \
+  --write --confirm "$TMP/dirty.img" --max-files 1
 
 make_img "$TMP/active.img"
 "$ROOT/tests/mutate_image.py" "$TMP/active.img" active-fat1

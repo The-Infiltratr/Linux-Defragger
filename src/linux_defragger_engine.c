@@ -432,13 +432,15 @@ static Device device_open(const char *path, bool writable) {
     if (!is_block && !S_ISREG(st.st_mode)) {
         die_msg("target must be a block device or a regular filesystem image");
     }
-    if (is_block && block_device_is_mounted(st.st_rdev)) {
-        die_msg("refusing to open a mounted block device; unmount it first");
+    if (is_block && writable && block_device_is_mounted(st.st_rdev)) {
+        die_msg("refusing to open a mounted block device for writing; unmount it first");
     }
 
     int flags = writable ? O_RDWR : O_RDONLY;
     flags |= O_CLOEXEC;
-    if (is_block) flags |= O_EXCL;
+    /* Read-only analysis may inspect a mounted block device.  Exclusive open is
+       retained for mutations so a mount racing the initial check still fails. */
+    if (is_block && writable) flags |= O_EXCL;
     int fd = open(path, flags);
     if (fd < 0) die_errno("open target");
 
@@ -806,16 +808,21 @@ static void fat32_load(Fat32 *fs, Device dev, bool allow_mirror_mismatch) {
     for (uint32_t i = 0; i < fs->fat_entry_count; i++)
         fs->fat[i] = decode_fat_entry(fs, raw, fat_bytes, i);
 
-    if (fs->fat_type == FAT_TYPE_32) {
-        if ((fs->fat[1] & UINT32_C(0x08000000)) == 0)
-            die_msg("FAT32 clean-shutdown bit is clear; repair or cleanly unmount the volume first");
-        if ((fs->fat[1] & UINT32_C(0x04000000)) == 0)
-            die_msg("FAT32 hard-error bit is clear; repair the volume before defragmenting");
-    } else if (fs->fat_type == FAT_TYPE_16) {
-        if ((fs->fat[1] & UINT32_C(0x8000)) == 0)
-            die_msg("FAT16 clean-shutdown bit is clear; repair or cleanly unmount the volume first");
-        if ((fs->fat[1] & UINT32_C(0x4000)) == 0)
-            die_msg("FAT16 hard-error bit is clear; repair the volume before defragmenting");
+    /* Mounted FAT volumes normally advertise an unclean state while active.
+       That must block mutations, but it is not a reason to block a read-only
+       allocation scan. */
+    if (fs->dev.writable) {
+        if (fs->fat_type == FAT_TYPE_32) {
+            if ((fs->fat[1] & UINT32_C(0x08000000)) == 0)
+                die_msg("FAT32 clean-shutdown bit is clear; repair or cleanly unmount the volume first");
+            if ((fs->fat[1] & UINT32_C(0x04000000)) == 0)
+                die_msg("FAT32 hard-error bit is clear; repair the volume before defragmenting");
+        } else if (fs->fat_type == FAT_TYPE_16) {
+            if ((fs->fat[1] & UINT32_C(0x8000)) == 0)
+                die_msg("FAT16 clean-shutdown bit is clear; repair or cleanly unmount the volume first");
+            if ((fs->fat[1] & UINT32_C(0x4000)) == 0)
+                die_msg("FAT16 hard-error bit is clear; repair the volume before defragmenting");
+        }
     }
 
     if (fs->fat_mirroring) {
@@ -827,9 +834,10 @@ static void fat32_load(Fat32 *fs, Device dev, bool allow_mirror_mismatch) {
                 die_errno("read mirrored FAT");
             for (uint32_t i = 0; i <= fs->max_cluster; i++) {
                 if (decode_fat_entry(fs, other, fat_bytes, i) != fat_value(fs, i)) {
-                    if (!allow_mirror_mismatch)
+                    if (!allow_mirror_mismatch && fs->dev.writable)
                         die_msg("mirrored FAT copies disagree; repair the filesystem before defragmenting");
-                    fprintf(stderr, "%s: warning: mirrored FAT copies disagree; recovery will rewrite journalled entries\n", PROGRAM_NAME);
+                    if (fs->dev.writable)
+                        fprintf(stderr, "%s: warning: mirrored FAT copies disagree; recovery will rewrite journalled entries\n", PROGRAM_NAME);
                     copy = fs->fat_count;
                     break;
                 }

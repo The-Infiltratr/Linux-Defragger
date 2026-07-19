@@ -13,8 +13,13 @@ from pathlib import Path
 
 from .base import *
 
-_VENDOR = Path(__file__).resolve().parent.parent / "vendor"
-if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
+_HERE = Path(__file__).resolve()
+_VENDOR_CANDIDATES = (
+    _HERE.parents[1] / "vendor",  # Installed layout: .../linux-defragger/backends/affs.py
+    _HERE.parents[2] / "vendor",  # Source layout: .../gui/backends/affs.py
+)
+_VENDOR = next((candidate for candidate in _VENDOR_CANDIDATES if candidate.is_dir()), None)
+if _VENDOR is not None and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
 from amitools.fs.ADFSVolume import ADFSVolume

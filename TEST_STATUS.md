@@ -15,3 +15,9 @@ The exact source build passed:
 - The exact unpacked Debian package repeated HFS and HFS+ mutation tests.
 
 No physical Apple-formatted media was available. The first physical run should use backed-up, replaceable media.
+## Mounted-volume analysis policy
+
+- GUI Analyse control is enabled for mounted supported volumes.
+- Native FAT read-only commands no longer request an exclusive block-device open and do not reject the active-volume dirty bit.
+- Compact, Defragment and Recover retain mounted-volume rejection and exclusive writable opens.
+

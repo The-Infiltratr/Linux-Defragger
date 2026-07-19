@@ -1,5 +1,7 @@
 # Linux Defragger 1.8.0
 
+- Analyse and allocation-map operations now work on mounted volumes using read-only access; write operations still require an unmounted volume.
+- Mounted analysis is labelled as a live snapshot because filesystem activity can change the result during a scan.
 - Added journalled Compact, Defragment and Recover support for classic HFS.
 - Added journalled Compact, Defragment and Recover support for HFS+ and HFSX ordinary data and resource forks.
 - Added exact classic-HFS file and fragmentation counts through the bundled HFS scanner.

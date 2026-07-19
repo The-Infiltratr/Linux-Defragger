@@ -18,7 +18,7 @@ Classic HFS uses the bundled GPLv2 libhfs source from hfsutils 3.2.6, statically
 
 HFS+ and HFSX use a native Python engine. It relocates complete ordinary data and resource forks, updates allocation-file bits, inline and overflow extent descriptors, primary and alternate volume-header free counts, and uses an external recovery journal. The allocation, catalogue, extents-overflow and other special filesystem files remain fixed.
 
-All mutation commands refuse mounted volumes. The source allocation remains allocated until the catalogue metadata durably points to the destination.
+Analyse and allocation-map operations may run against mounted volumes using read-only raw access. Because the filesystem remains active, the result is a live snapshot and may change while files are being created, removed or extended. All mutation commands refuse mounted volumes. The source allocation remains allocated until the catalogue metadata durably points to the destination.
 
 ## Build
 

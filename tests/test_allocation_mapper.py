@@ -17,7 +17,7 @@ assert manifest.returncode==0, manifest.stderr
 items=json.loads(manifest.stdout)['backends']
 by_id={x['id']:x for x in items}
 assert by_id['ntfs']['capabilities']==3
-assert by_id['exfat']['capabilities']==3
+assert by_id['exfat']['capabilities'] & 31 == 31
 assert by_id['fat32']['capabilities'] & 28 == 28
 bad=subprocess.run([str(MAPPER),'/dev/null','--fstype','ntfs'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
 assert bad.returncode!=0
