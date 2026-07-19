@@ -68,7 +68,7 @@ with a.image.open('r+b') as f:
             set_dirent_first(root_off, 7)
             stage = 3
         a.journal.write_text(
-            'FAT32DEFRAG-JOURNAL-1\n'
+            'LINUX-DEFRAGGER-JOURNAL-1\n'
             f'device={a.device_path}\n'
             f'volume_id={volume_id:08x}\n'
             f'stage={stage}\n'

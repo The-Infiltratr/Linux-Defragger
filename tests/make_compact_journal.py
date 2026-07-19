@@ -60,7 +60,7 @@ with a.image.open("r+b") as f:
         stage = 3
 
 lines = [
-    "FAT32DEFRAG-COMPACT-JOURNAL-1",
+    "LINUX-DEFRAGGER-COMPACT-JOURNAL-1",
     f"device={a.image}",
     f"volume_id={volume_id:08x}",
     f"stage={stage}",

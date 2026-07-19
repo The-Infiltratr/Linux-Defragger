@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=${1:-$ROOT/build/fat32defrag}
+BIN=${1:-$ROOT/build/linux-defragger-engine}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 

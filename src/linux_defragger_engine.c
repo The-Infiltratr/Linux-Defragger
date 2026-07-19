@@ -17,8 +17,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define PROGRAM_NAME "fat32defrag"
-#define PROGRAM_VERSION "1.5.1"
+#define PROGRAM_NAME "linux-defragger-engine"
+#define PROGRAM_VERSION "1.5.2"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -29,8 +29,8 @@ typedef enum {
     FAT_TYPE_32 = 32
 } FatType;
 #define MAX_RECURSION_DEPTH 128
-#define JOURNAL_MAGIC "FAT32DEFRAG-JOURNAL-1"
-#define COMPACT_JOURNAL_MAGIC "FAT32DEFRAG-COMPACT-JOURNAL-1"
+#define JOURNAL_MAGIC "LINUX-DEFRAGGER-JOURNAL-1"
+#define COMPACT_JOURNAL_MAGIC "LINUX-DEFRAGGER-COMPACT-JOURNAL-1"
 
 typedef struct {
     size_t ram_limit;
@@ -1343,7 +1343,7 @@ static char *default_journal_path(const char *device_path) {
     base = base == NULL ? device_path : base + 1;
     size_t n = strlen(base) + 40;
     char *path = xmalloc(n);
-    snprintf(path, n, ".fat32defrag-%s.journal", base);
+    snprintf(path, n, ".linux-defragger-engine-%s.journal", base);
     return path;
 }
 
@@ -2428,7 +2428,7 @@ static void print_map_json(Fat32 *fs, const FileList *files, size_t requested_ce
     uint64_t terminal = terminal_free_clusters(fs);
 
     fputs("{\n", stdout);
-    fputs("  \"program\": \"fat32defrag\",\n", stdout);
+    fputs("  \"program\": \"linux-defragger-engine\",\n", stdout);
     printf("  \"version\": \"%s\",\n", PROGRAM_VERSION);
     fputs("  \"device\": ", stdout); json_print_string(fs->dev.path); fputs(",\n", stdout);
     printf("  \"filesystem\": \"%s\",\n", fat_type_name(fs));

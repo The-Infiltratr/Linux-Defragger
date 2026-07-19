@@ -7,7 +7,7 @@ expected_cells = int(sys.argv[2])
 with open(path, "r", encoding="utf-8") as handle:
     data = json.load(handle)
 
-assert data["program"] == "fat32defrag"
+assert data["program"] == "linux-defragger-engine"
 assert data["version"] == "1.3.0"
 assert data["filesystem"] == "FAT32"
 assert data["cell_count"] == expected_cells

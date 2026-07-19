@@ -1,8 +1,13 @@
-# 1.5.1
+# Linux Defragger 1.5.2
 
-- Renamed the application to **Linux Defragger**.
-- Added `/usr/bin/linux-defragger` and a new application-menu entry.
-- Administrator authentication is requested at GUI launch rather than on the first privileged operation.
-- The authenticated helper is retained and reused until the GUI closes.
-- Kept `fat32defrag-gui` as a compatibility launcher for upgrades and existing shortcuts.
-- Filesystem engines and on-disk formats are unchanged from 1.4.0.
+This release removes unpublished compatibility baggage and standardises the entire project on the Linux Defragger name.
+
+- One launcher: `/usr/bin/linux-defragger`.
+- One engine: `/usr/bin/linux-defragger-engine`.
+- One private runtime directory: `/usr/lib/linux-defragger`.
+- One state directory: `~/.local/state/linux-defragger`.
+- Removed the `liux-defragger`, `fat32defrag-gui`, and `fat32defrag` command aliases.
+- Removed legacy desktop entries, icons, v0.7/v0.8 binary searches, and old environment-variable names.
+- Renamed the C target, JSON program identifier, journal prefix, GUI module, and internal paths.
+- Fixed the privileged helper's progress parser, which had been left permanently disabled by a stale placeholder assignment.
+- Filesystem algorithms and backend capabilities are otherwise unchanged from 1.5.1.

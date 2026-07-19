@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Persistent privileged helper for the FAT32 Defragmenter GTK application.
+"""Persistent privileged helper for the Linux Defragger GTK application.
 
 The helper is started once through pkexec and remains attached to the GUI over
 stdin/stdout.  It accepts only a small fixed command set, streams child output
@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = 1
-ENGINE = Path("/usr/bin/fat32defrag")
-MAPPER = Path("/usr/lib/fat32defrag/allocation_mapper.py")
-EXFAT_ENGINE = Path("/usr/lib/fat32defrag/exfat_engine.py")
+ENGINE = Path("/usr/bin/linux-defragger-engine")
+MAPPER = Path("/usr/lib/linux-defragger/allocation_mapper.py")
+EXFAT_ENGINE = Path("/usr/lib/linux-defragger/exfat_engine.py")
 UDISKSCTL = Path("/usr/bin/udisksctl")
 
 _emit_lock = threading.Lock()
@@ -103,7 +103,7 @@ def run_request(request_id: int, program: str, argv: list[str]) -> None:
                     deliver_queued_stop = _pending_stop
                     _pending_stop = False
             clean_line = line.rstrip("\r\n")
-            progress_match = None
+            progress_match = _NTFS_PROGRESS_RE.match(clean_line)
             if progress_match is not None:
                 percent = max(0.0, min(100.0, float(progress_match.group(1))))
                 now = time.monotonic()
@@ -187,7 +187,7 @@ def handle_stop(message: dict[str, Any]) -> None:
 
 def main() -> int:
     if os.geteuid() != 0:
-        print("fat32defrag privileged helper must run as root", file=sys.stderr)
+        print("Linux Defragger privileged helper must run as root", file=sys.stderr)
         return 1
     emit({"type": "ready", "protocol": PROTOCOL_VERSION, "pid": os.getpid()})
     for raw in sys.stdin:

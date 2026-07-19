@@ -39,7 +39,7 @@ for fi in range(file_count):
     patches.append((coff(root) + fi * 32, source_chain[0], dest_start))
 
 lines = [
-    "FAT32DEFRAG-COMPACT-JOURNAL-1",
+    "LINUX-DEFRAGGER-COMPACT-JOURNAL-1",
     f"device={image}",
     f"volume_id={volume_id:08x}",
     "stage=0",

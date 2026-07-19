@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -32,7 +31,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -58,7 +57,6 @@ SUPPORTED_FILESYSTEMS = {
     "btrfs": "btrfs",
     "xfs": "xfs",
 }
-READ_ONLY_MAP_FILESYSTEMS = {"exfat", "ntfs", "ext4", "btrfs", "xfs"}
 
 
 def human_bytes(value: int) -> str:
@@ -78,82 +76,48 @@ def safe_journal_name(path: str) -> str:
 
 def state_dir() -> Path:
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    target = root / "fat32defrag"
+    target = root / "linux-defragger"
     target.mkdir(parents=True, exist_ok=True)
     return target
 
 
+def _configured_executable(variable: str, installed_path: str, description: str) -> str:
+    candidate = os.environ.get(variable, installed_path)
+    path = Path(candidate)
+    if path.is_file() and os.access(path, os.X_OK):
+        return str(path)
+    raise FileNotFoundError(f"Could not locate {description}: {path}")
+
+
 def find_engine() -> str:
-    override = os.environ.get("FAT32DEFRAG_ENGINE")
-    if override and Path(override).is_file():
-        return override
-    script_dir = Path(__file__).resolve().parent
-    candidates = (
-        script_dir / "fat32defrag",
-        script_dir / "fat32defrag-linux-x86_64-static-v0.8.0",
-        script_dir / "fat32defrag-linux-x86_64-static-v0.7.0",
-        script_dir.parent / "fat32defrag",
-        Path("/usr/bin/fat32defrag"),
-        Path("/usr/lib/fat32defrag/fat32defrag"),
-    )
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    found = shutil.which("fat32defrag")
-    if found:
-        return found
-    raise FileNotFoundError(
-        "Could not locate the fat32defrag engine. Set FAT32DEFRAG_ENGINE to its path."
+    return _configured_executable(
+        "LINUX_DEFRAGGER_ENGINE",
+        "/usr/bin/linux-defragger-engine",
+        "the Linux Defragger engine",
     )
 
 
 def find_mapper() -> str:
-    override = os.environ.get("FAT32DEFRAG_MAPPER")
-    if override and Path(override).is_file():
-        return override
-    script_dir = Path(__file__).resolve().parent
-    candidates = (
-        script_dir / "allocation_mapper.py",
-        script_dir.parent / "allocation_mapper.py",
-        Path("/usr/lib/fat32defrag/allocation_mapper.py"),
+    return _configured_executable(
+        "LINUX_DEFRAGGER_MAPPER",
+        "/usr/lib/linux-defragger/allocation_mapper.py",
+        "the allocation mapper",
     )
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise FileNotFoundError(
-        "Could not locate allocation_mapper.py. Reinstall the GUI package."
-    )
-
-
 
 
 def find_exfat_engine() -> str:
-    override = os.environ.get("FATDEFRAG_EXFAT_ENGINE")
-    if override and Path(override).is_file():
-        return override
-    candidates = (
-        Path(__file__).resolve().parent / "exfat_engine.py",
-        Path("/usr/lib/fat32defrag/exfat_engine.py"),
+    return _configured_executable(
+        "LINUX_DEFRAGGER_EXFAT_ENGINE",
+        "/usr/lib/linux-defragger/exfat_engine.py",
+        "the native exFAT engine",
     )
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise FileNotFoundError("Could not locate the native exFAT engine.")
+
 
 def find_privileged_helper() -> str:
-    override = os.environ.get("FAT32DEFRAG_HELPER")
-    if override and Path(override).is_file():
-        return override
-    script_dir = Path(__file__).resolve().parent
-    candidates = (
-        script_dir / "privileged_helper.py",
-        Path("/usr/lib/fat32defrag/privileged_helper.py"),
-    )
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise FileNotFoundError(
-        "Could not locate the Linux Defragger privileged helper. Reinstall the application."
+    return _configured_executable(
+        "LINUX_DEFRAGGER_HELPER",
+        "/usr/lib/linux-defragger/privileged_helper.py",
+        "the privileged helper",
     )
 
 
@@ -431,7 +395,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(150, self._authenticate_on_launch)
 
     def _load_backend_registry(self) -> None:
-        global SUPPORTED_FILESYSTEMS, READ_ONLY_MAP_FILESYSTEMS, BACKEND_CAPABILITIES
+        global SUPPORTED_FILESYSTEMS, BACKEND_CAPABILITIES
         result = subprocess.run(
             [self.mapper, "--list-backends"], check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -440,7 +404,6 @@ class MainWindow(Gtk.ApplicationWindow):
         data = json.loads(result.stdout)
         aliases: dict[str, str] = {}
         capabilities: dict[str, int] = {}
-        read_only: set[str] = set()
         for entry in data.get("backends", []):
             backend_id = str(entry["id"]).lower()
             caps = int(entry.get("capabilities", 0))
@@ -448,8 +411,6 @@ class MainWindow(Gtk.ApplicationWindow):
             aliases[backend_id] = backend_id
             for alias in entry.get("aliases", []):
                 aliases[str(alias).lower()] = backend_id
-            if not (caps & (CAP_COMPACT | CAP_DEFRAG | CAP_RECOVER)):
-                read_only.add(backend_id)
         # Linux normally reports all classic FAT variants as vfat. The native
         # engine probes the precise FAT width after opening the volume.
         aliases.setdefault("vfat", "fat32")
@@ -457,7 +418,6 @@ class MainWindow(Gtk.ApplicationWindow):
         aliases.setdefault("msdos", "fat32")
         SUPPORTED_FILESYSTEMS = aliases
         BACKEND_CAPABILITIES = capabilities
-        READ_ONLY_MAP_FILESYSTEMS = read_only
 
     def _build_ui(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
