@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.8.0-19"
+#define PROGRAM_VERSION "1.8.0-20"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -2131,7 +2131,7 @@ static void compact_execute_moves(Fat32 *fs, const DirRefList *dir_refs,
     emit_live_map_update(fs);
 }
 
-static CompactStats compact_volume(Fat32 *fs, const char *journal_path,
+static CompactStats growth_prepare_volume(Fat32 *fs, const char *journal_path,
                                    size_t max_clusters, size_t batch_clusters,
                                    size_t max_transactions) {
     CompactStats stats = {0};
@@ -2399,6 +2399,94 @@ static CompactStats compact_volume(Fat32 *fs, const char *journal_path,
                 terminal_free_clusters(fs));
         free(moves);
         u32vec_free(&root_chain);
+        filelist_free(&files);
+        dirreflist_free(&dir_refs);
+    }
+
+    update_fsinfo_next_free(fs, first_free_cluster_hint(fs));
+    fat32_sync(fs);
+    return stats;
+}
+
+
+static CompactStats compact_volume(Fat32 *fs, const char *journal_path,
+                                   size_t max_clusters, size_t batch_clusters,
+                                   size_t max_transactions) {
+    CompactStats stats = {0};
+    if (batch_clusters == 0) batch_clusters = 4096;
+
+    /* Compact is deliberately not a defragmenter.  Fill the lowest free
+       clusters with movable allocation taken from the physical tail.  The
+       journal rewrites FAT predecessors and directory first-cluster fields, so
+       moving individual clusters is safe even when doing so fragments a file. */
+    for (;;) {
+        if (g_stop_requested) {
+            fprintf(stderr, "interrupt requested; stopping compaction between transactions\n");
+            break;
+        }
+        if (max_transactions != 0 && stats.transactions >= max_transactions) break;
+        size_t remaining = max_clusters == 0 ? SIZE_MAX : max_clusters - stats.clusters_moved;
+        if (remaining == 0) break;
+
+        DirRefList dir_refs = {0};
+        FileList files = scan_files(fs, &dir_refs);
+        uint32_t hole_start = 0;
+        size_t hole_length = 0;
+        uint32_t highest = 1;
+        if (!first_free_run_below_high_water(fs, &hole_start, &hole_length, &highest)) {
+            filelist_free(&files);
+            dirreflist_free(&dir_refs);
+            break;
+        }
+
+        size_t limit = hole_length;
+        if (limit > batch_clusters) limit = batch_clusters;
+        if (limit > remaining) limit = remaining;
+        CompactMove *moves = xmalloc(limit * sizeof(*moves));
+        size_t move_count = 0;
+        uint32_t source = highest;
+
+        for (size_t i = 0; i < limit; i++) {
+            uint32_t destination = hole_start + (uint32_t)i;
+            while (source > destination && !cluster_is_movable_allocation(fs, source)) {
+                source--;
+            }
+            if (source <= destination) break;
+            moves[move_count++] = (CompactMove){
+                .source = source,
+                .destination = destination,
+            };
+            source--;
+        }
+
+        if (move_count == 0) {
+            fprintf(stderr,
+                    "compact: the free run at cluster %" PRIu32
+                    " cannot be filled by any higher movable FAT allocation\n",
+                    hole_start);
+            free(moves);
+            filelist_free(&files);
+            dirreflist_free(&dir_refs);
+            break;
+        }
+
+        detail_log(
+                "compact-tail-fill: pasted %zu cluster%s from the physical tail into "
+                "the free run beginning at cluster %" PRIu32 "\n",
+                move_count, move_count == 1 ? "" : "s", hole_start);
+        compact_execute_moves(fs, &dir_refs, journal_path, moves, move_count);
+        stats.transactions++;
+        stats.clusters_moved += move_count;
+        stats.extent_clusters += move_count;
+        stats.extent_transactions++;
+        if (move_count == 1) stats.singleton_transactions++;
+        fprintf(stderr,
+                "compact: filled %zu free cluster%s from the physical tail (total %zu); "
+                "terminal free run now %" PRIu64 " clusters\n",
+                move_count, move_count == 1 ? "" : "s", stats.clusters_moved,
+                terminal_free_clusters(fs));
+
+        free(moves);
         filelist_free(&files);
         dirreflist_free(&dir_refs);
     }
@@ -2933,7 +3021,7 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
     fprintf(stderr,
             "Growth Defrag preparation batching: up to %zu clusters per journal transaction.\n",
             preparation_batch_clusters);
-    CompactStats compact_stats = compact_volume(
+    CompactStats compact_stats = growth_prepare_volume(
         fs, journal_path, 0, preparation_batch_clusters, 0);
     stats.compact_clusters = compact_stats.clusters_moved;
     stats.compact_transactions = compact_stats.transactions;
@@ -3378,6 +3466,32 @@ static void mark_map_chain(uint8_t *flags, const U32Vec *chain, bool directory,
     for (size_t i = 0; i < chain->len; i++) flags[chain->v[i]] |= value;
 }
 
+static bool growth_layout_satisfied_for_map(Fat32 *fs, const FileList *files,
+                                            unsigned percent) {
+    GrowthPreflight preflight = growth_layout_preflight(fs, files, percent);
+    bool satisfied = preflight.issue == GROWTH_PREFLIGHT_OK;
+    if (!satisfied && preflight.issue != GROWTH_PREFLIGHT_OBJECT_FRAGMENTED &&
+        preflight.issue != GROWTH_PREFLIGHT_ROOT_FRAGMENTED) {
+        size_t largest = 0;
+        uint64_t regular_clusters = 0;
+        size_t regular_files = 0;
+        size_t directories = 0;
+        GrowthObjectList objects = build_growth_objects(
+            fs, files, &largest, &regular_clusters, &regular_files, &directories);
+        size_t reserve_clusters = 0;
+        (void)largest;
+        (void)regular_clusters;
+        (void)directories;
+        if (regular_files != 0) {
+            satisfied = growth_layout_matches_canonical(
+                fs, &objects, percent, &reserve_clusters);
+        }
+        growth_object_list_free(&objects);
+    }
+    growth_preflight_free(&preflight);
+    return satisfied;
+}
+
 static void print_map_json(Fat32 *fs, const FileList *files, size_t requested_cells) {
     size_t cells = requested_cells;
     if (cells == 0) cells = 4096;
@@ -3426,6 +3540,7 @@ static void print_map_json(Fat32 *fs, const FileList *files, size_t requested_ce
     uint32_t highest = 1;
     uint64_t gaps = holes_below_high_water(fs, &highest);
     uint64_t terminal = terminal_free_clusters(fs);
+    bool growth_10_satisfied = growth_layout_satisfied_for_map(fs, files, 10);
 
     fputs("{\n", stdout);
     fputs("  \"program\": \"linux-defragger-engine\",\n", stdout);
@@ -3451,6 +3566,7 @@ static void print_map_json(Fat32 *fs, const FileList *files, size_t requested_ce
     printf("  \"highest_allocated_cluster\": %" PRIu32 ",\n", highest);
     printf("  \"free_gaps_below_highest\": %" PRIu64 ",\n", gaps);
     printf("  \"terminal_free_clusters\": %" PRIu64 ",\n", terminal);
+    printf("  \"growth_10_satisfied\": %s,\n", growth_10_satisfied ? "true" : "false");
     printf("  \"cell_count\": %zu,\n", cells);
     fputs("  \"cells\": [\n", stdout);
 
@@ -3876,13 +3992,12 @@ static void usage(FILE *out) {
         "       [--ram-buffer auto|SIZE] [--workers auto|N]\n\n"
         "DEVICE may be an unmounted block-device partition or a regular FAT12/FAT16/FAT32 image.\n"
         "The defrag command relocates fragmented directory chains and regular files into\n"
-        "genuinely free contiguous cluster runs. Growth Defrag first compacts FAT allocation,\n"
-        "then rebuilds objects in physical order and leaves proportional free growth room\n"
-        "after each regular file. Directory moves update parent entries, `.` and `..`\n"
-        "references, and FAT32 root boot-sector fields. The compact command packs complete\n"
-        "file and directory chains toward the start whenever they fit. For unavoidable small\n"
-        "holes it shifts ordered physical extents downward without reversing or scattering\n"
-        "them, leaving the largest possible terminal free run.\n"
+        "genuinely free contiguous cluster runs. Growth Defrag uses its own complete-object\n"
+        "preparation pass, then rebuilds objects in physical order and leaves proportional\n"
+        "free growth room after each regular file. Directory moves update parent entries,\n"
+        "`.` and `..` references, and FAT32 root boot-sector fields. The normal compact\n"
+        "command is a pure tail-fill compactor: it pastes movable clusters from the physical\n"
+        "end into the lowest free holes and may increase fragmentation while eliminating gaps.\n"
         "SIZE accepts byte suffixes such as 512M, 2G, or 8GiB. On large systems automatic\n"
         "mode preserves 8 GiB for Linux and uses up to 16 GiB as a relocation-cache budget.\n"
         "Growth Defrag uses recoverable multi-object batches and up to 4 GiB per transaction.\n"

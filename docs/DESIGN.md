@@ -5,7 +5,7 @@
 `Analyse`, `Compact`, `Defragment` and `Growth Defrag` are independent controls.
 Analyse is read-only. Compact reorganises allocation to reduce internal free-space
 gaps. Defragment reorganises file allocation to reduce the number of physical
-extents per file. Growth Defrag is a FAT-specific policy layout that deliberately
+extents per file. Growth Defrag is a FAT/exFAT policy layout that deliberately
 creates proportional free gaps after regular files. A backend advertises each
 operation separately through the capability manifest.
 
@@ -13,9 +13,7 @@ The native NTFS backend enforces this separation strictly: Compact preserves
 the fragment count of every moved file, while Defragment rebuilds supported
 fragmented files as one contiguous extent in the highest suitable free run
 anywhere on the volume.
-The older FAT planner may still reduce fragmentation as a side effect of moving
-a complete chain; that existing FAT behaviour is documented below and is not
-used by the NTFS planner.
+The FAT and exFAT Compact planners deliberately move allocation from the physical tail into the lowest holes, even when that increases a file's fragment count. Growth Defrag uses separate complete-object preparation planners before rebuilding every object contiguously.
 
 ## Filesystem invariants
 
@@ -73,35 +71,42 @@ Source FAT entries are freed only after destination data, destination FAT entrie
 
 The journal is written through a temporary file, flushed, atomically renamed, and followed by a parent-directory flush. Device `fsync()` calls separate payload copy, metadata switch, and source release.
 
-## FAT low-fragmentation compaction planner
+## FAT physical tail-fill compaction planner
 
-The 0.4 planner is deliberately different from the 0.2 highest-cluster-to-lowest-hole algorithm.
+Normal FAT Compact is deliberately a pure free-space compactor. It finds the
+lowest free clusters below the allocation high-water mark and pairs them with
+movable allocated clusters taken from the physical tail. Each selected source
+cluster retains its logical predecessor and successor through the mapped FAT
+transaction, so file contents and chain order remain valid even when the file
+becomes more fragmented.
 
-### Whole-chain packing
-
-The planner finds the first free run below the allocation high-water mark. It chooses complete file or directory chains that:
-
-- fit in the remaining free run;
-- lie entirely above their proposed destination;
-- have disjoint source and destination sets.
-
-Candidates nearest to the hole are preferred, preserving approximate physical order. Multiple complete objects can be included in one mapped transaction. A fragmented source chain is mapped in logical chain order to consecutive destinations, so the compaction move also defragments that object.
-
-### Terminal staging
-
-A one-cluster hole immediately before an eight-hundred-cluster contiguous file cannot receive the whole file directly because the destination overlaps the source. Moving one cluster at a time would be slow, while taking clusters from the far end would scatter unrelated chains.
-
-When the object immediately following the hole is physically contiguous, the planner temporarily relocates the complete object into the terminal free run. Its old allocation merges with the low hole. A subsequent whole-chain packing transaction then fills the enlarged hole with complete objects, eventually returning the staged object to the packed region. This provides overlap-safe whole-object movement using the terminal free area as scratch space.
-
-### Ordered-extent fallback
-
-If no whole chain fits and the immediate object cannot be staged, the planner shifts the next contiguous physical allocation extent downward without changing cluster order. The fallback never reverses an extent and never pairs the lowest hole with an unrelated highest cluster.
-
-Stable downward shifting preserves adjacency inside every selected physical extent. It can leave pre-existing logical fragmentation where a fragmented chain crosses extent boundaries, but it avoids the large fragmentation increase caused by arbitrary high-to-low pairing.
+The planner does not prefer complete files, contiguous extents or low-fragmentation
+outcomes. Its only layout goal is to eliminate internal free clusters and move
+the terminal free-space boundary downward. This keeps Compact distinct from
+Defragment.
 
 ### Transaction limits
 
-`--batch-clusters` limits ordered-extent fallback transactions. A whole object may exceed that soft limit because splitting an otherwise movable complete chain would create avoidable fragmentation. `--max-clusters` remains a hard limit on the total number of physical cluster copies, including temporary staging copies.
+`--batch-clusters` limits each tail-fill transaction. `--max-clusters` remains a
+hard limit on the total number of physical cluster copies. Every batch uses the
+generic mapped-cluster journal and may be recovered independently.
+
+Growth Defrag does not call this normal Compact planner. Its preparation phase
+uses a separate whole-object packer because Growth Defrag immediately rebuilds
+all objects contiguously and inserts deliberate post-file gaps in phase two.
+
+## exFAT physical tail-fill compaction planner
+
+Normal exFAT Compact follows the same operation contract. It selects the lowest
+free cluster and replaces one cluster from the highest movable file or
+subdirectory chain. A NoFatChain object is converted to an ordinary FAT chain
+when an individual cluster move makes it non-contiguous. The directory stream
+entry or predecessor FAT link is the commit point, and the schema-2 external
+journal supports both rollback before that point and forward completion after it.
+
+The exFAT root directory, allocation bitmap and other system allocations remain
+fixed barriers. Growth Defrag retains its independent complete-object preparation
+pass and therefore does not call the pure Compact planner.
 
 ## FAT Growth Defrag planner
 
@@ -117,7 +122,9 @@ for each non-empty regular file. Directories receive no deliberate gap. Before a
 
 If work is required, the planner verifies that free space can hold the complete reserve plus a terminal workspace at least as large as the largest allocated file or directory chain.
 
-Phase one runs the normal FAT compactor. Phase two rescans the filesystem, orders
+Phase one runs the separate whole-object preparation packer to create a large
+terminal workspace without needlessly scattering the source chains. Phase two
+rescans the filesystem, orders
 the FAT32 root (where applicable), directories and regular files by their current
 lowest physical cluster, and calculates stable target positions. Bad clusters
 are treated as fixed barriers and are never counted as growth reserve.
@@ -177,3 +184,8 @@ external journal, mark the volume dirty, reserve destination bitmap ranges,
 switch the MFT record, release source bitmap ranges, restore the original volume
 flags and remove the journal. Recovery compares the current MFT record with the
 saved before/after images to choose idempotent forward completion or rollback.
+
+
+## GUI analysis cache and concurrent volumes
+
+Each window owns an independent privileged helper and operation state. Opening another window permits a second volume to be analysed or modified while the first window continues its journalled operation. A volume is analysed automatically when selected. The returned allocation cells are cached by device path and resampled over the current drawing area; window resizing is therefore a memory-only redraw. A manual volume refresh invalidates the cache.

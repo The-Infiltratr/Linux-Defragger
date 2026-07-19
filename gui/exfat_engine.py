@@ -195,21 +195,42 @@ def recover(device,journal):
     try:
         entries={e.path:e for e in v.parse()};e=entries.get(j['path'])
         if e is None:raise Error('journal file entry not found')
-        src=j['src'];dst=j['dst'];phase=j['phase']
-        # The directory entry is the commit point.  Inspect it instead of
-        # trusting that the final journal phase reached stable storage.
-        if e.first == dst[0]:
-            for i,c in enumerate(dst):v.setbit(c,True);v.fatset(c,dst[i+1] if i+1<len(dst) else EOC)
-            update_entry(v,e,dst[0],True)
-            for c in src:v.setbit(c,False);v.fatset(c,0)
-            v.flush_fat_bitmap();v.sync()
-        elif e.first == src[0]:
-            for c in dst:v.setbit(c,False);v.fatset(c,0)
-            v.flush_fat_bitmap();v.sync()
+        if int(j.get('schema',1)) == 2:
+            old_chain=[int(c) for c in j['old_chain']]
+            new_chain=[int(c) for c in j['new_chain']]
+            source=int(j['source']); destination=int(j['destination'])
+            old_nofat=bool(j['old_nofat'])
+            if e.clusters == new_chain and not e.nofat:
+                for index,c in enumerate(new_chain):
+                    v.setbit(c,True)
+                    v.fatset(c,new_chain[index+1] if index+1<len(new_chain) else EOC)
+                v.setbit(source,False);v.fatset(source,0)
+                v.flush_fat_bitmap();v.sync()
+                print('Recovery completed by retaining the tail-fill cluster move.')
+            elif e.clusters == old_chain and e.nofat == old_nofat:
+                for key,value in j['fat_before'].items():v.fatset(int(key),int(value))
+                v.setbit(destination,bool(j['destination_bit_before']))
+                v.setbit(source,bool(j['source_bit_before']))
+                v.flush_fat_bitmap();v.sync()
+                print('Recovery completed by rolling back the tail-fill cluster move.')
+            else:
+                raise Error('tail-fill journal entry points to neither the old nor new exFAT chain')
         else:
-            raise Error('journal entry points to neither source nor destination')
+            src=j['src'];dst=j['dst']
+            # The directory entry is the commit point. Inspect it instead of
+            # trusting that the final journal phase reached stable storage.
+            if e.first == dst[0]:
+                for i,c in enumerate(dst):v.setbit(c,True);v.fatset(c,dst[i+1] if i+1<len(dst) else EOC)
+                update_entry(v,e,dst[0],True)
+                for c in src:v.setbit(c,False);v.fatset(c,0)
+                v.flush_fat_bitmap();v.sync()
+            elif e.first == src[0]:
+                for c in dst:v.setbit(c,False);v.fatset(c,0)
+                v.flush_fat_bitmap();v.sync()
+            else:
+                raise Error('journal entry points to neither source nor destination')
+            print('Recovery completed.')
         os.unlink(journal)
-        print('Recovery completed.')
     finally:v.close()
 
 def move_one(v,e,dst,journal):
@@ -222,6 +243,50 @@ def move_one(v,e,dst,journal):
     obj['phase']='switching';journal_write(journal,obj)
     update_entry(v,e,dst[0],True);v.sync();obj['phase']='switched';journal_write(journal,obj)
     for c in src:v.setbit(c,False);v.fatset(c,0)
+    v.flush_fat_bitmap();v.sync();os.unlink(journal)
+
+def move_tail_cluster(v,e,index,destination,journal):
+    """Replace one physical cluster in an exFAT object without defragmenting it."""
+    old_chain=list(e.clusters)
+    source=old_chain[index]
+    if destination >= source or v.bit(destination):
+        raise Error('invalid exFAT tail-fill destination')
+    new_chain=list(old_chain);new_chain[index]=destination
+    touched=set(old_chain);touched.add(destination)
+    obj={
+        'schema':2,'device':v.path,'serial':v.serial,'path':e.path,
+        'old_chain':old_chain,'new_chain':new_chain,'source':source,
+        'destination':destination,'index':index,'old_nofat':bool(e.nofat),
+        'fat_before':{str(c):v.fatget(c) for c in touched},
+        'destination_bit_before':bool(v.bit(destination)),
+        'source_bit_before':bool(v.bit(source)),'phase':'prepared',
+    }
+    journal_write(journal,obj)
+    v.write(v.coff(destination),v.read(v.coff(source),v.cs));v.sync()
+    obj['phase']='copied';journal_write(journal,obj)
+
+    if e.nofat:
+        # A physically contiguous no-FAT-chain stream becomes an ordinary FAT
+        # chain when any individual cluster is pasted into a lower hole.
+        for position,cluster in enumerate(new_chain):
+            v.setbit(cluster,True)
+            v.fatset(cluster,new_chain[position+1] if position+1<len(new_chain) else EOC)
+    else:
+        v.setbit(destination,True)
+        v.fatset(destination,new_chain[index+1] if index+1<len(new_chain) else EOC)
+    v.flush_fat_bitmap();v.sync();obj['phase']='destination-ready';journal_write(journal,obj)
+
+    obj['phase']='switching';journal_write(journal,obj)
+    if e.nofat or index == 0:
+        update_entry(v,e,new_chain[0],False)
+        v.sync()
+    else:
+        predecessor=new_chain[index-1]
+        v.fatset(predecessor,destination)
+        v.flush_fat_bitmap();v.sync()
+    obj['phase']='switched';journal_write(journal,obj)
+
+    v.setbit(source,False);v.fatset(source,0)
     v.flush_fat_bitmap();v.sync();os.unlink(journal)
 
 def mounted(path):
@@ -244,6 +309,137 @@ def fragments(clusters):
     if not clusters: return 0
     return 1 + sum(1 for a,b in zip(clusters,clusters[1:]) if b != a+1)
 
+def contiguous(clusters):
+    return not clusters or all(b == a + 1 for a,b in zip(clusters,clusters[1:]))
+
+def growth_reserve(clusters,percent):
+    return (len(clusters)*percent + 99)//100 if clusters else 0
+
+def growth_preflight(v,percent):
+    root=v.chain(v.root)
+    if not contiguous(root): return False,'the root directory is fragmented'
+    entries=v.parse()
+    files=dirs=reserve_total=0
+    for e in entries:
+        if not e.clusters: continue
+        if not contiguous(e.clusters): return False,f'{e.path} is fragmented'
+        if e.is_dir:
+            dirs+=1; continue
+        files+=1
+        reserve=growth_reserve(e.clusters,percent);reserve_total+=reserve
+        end=e.clusters[-1]+1;available=0
+        while available<reserve and end < v.cc+2 and not v.bit(end):
+            available+=1;end+=1
+        if available<reserve:
+            return False,(f'{e.path} has {available} free clusters after it; '
+                          f'{reserve} are required for a {percent}% reserve')
+    if files==0:return True,'no allocated regular files require a growth layout'
+    return True,(f'{files} regular files and {dirs+1} directories already satisfy '
+                 f'the {percent}% growth-space layout ({reserve_total} reserved clusters)')
+
+def terminal_free_run(v):
+    count=0
+    for c in range(v.cc+1,1,-1):
+        if v.bit(c):break
+        count+=1
+    return v.cc+2-count,count
+
+def compact_objects(device,journal,max_files=None):
+    moved=0
+    v=Volume(device,True)
+    try:
+        while not STOP:
+            entries=[e for e in v.parse() if e.clusters]
+            selected=selected_dst=None
+            for e in sorted(entries,key=lambda x:(min(x.clusters),x.path)):
+                low=v.free_run(len(e.clusters),True,set(e.clusters))
+                if low is not None and low < min(e.clusters):
+                    selected=e;selected_dst=list(range(low,low+len(e.clusters)));break
+            if selected is None:break
+            move_one(v,selected,selected_dst,journal);moved+=1
+            print(f'exFAT preparation: moved {moved} complete object(s)',flush=True)
+            v.close();v=Volume(device,True)
+            if max_files and moved>=max_files:break
+    finally:v.close()
+    return moved
+
+def find_growth_targets(v,entries,percent):
+    movable=set(c for e in entries for c in e.clusters)
+    barriers={c for c in range(2,v.cc+2) if v.bit(c) and c not in movable}
+    objects=sorted([e for e in entries if e.clusters],key=lambda e:(min(e.clusters),e.path))
+    cursor=2;targets={}
+    for e in objects:
+        reserve=0 if e.is_dir else growth_reserve(e.clusters,percent)
+        need=len(e.clusters)+reserve
+        start=cursor
+        while start+need <= v.cc+2:
+            if all(c not in barriers for c in range(start,start+need)):
+                targets[e.path]=(start,reserve);cursor=start+need;break
+            first_barrier=next(c for c in range(start,start+need) if c in barriers)
+            start=first_barrier+1
+        else:raise Error('exFAT growth layout does not fit below system allocation barriers')
+    return objects,targets
+
+def growth_command(device,journal,percent):
+    if mounted(device):raise Error('refusing to modify a mounted exFAT volume')
+    if os.path.exists(journal):raise Error('unfinished journal exists; run recover')
+    v=Volume(device,False)
+    try:
+        entries=v.parse();ok,reason=growth_preflight(v,percent)
+        print(f'Growth Defrag preflight: {reason}.',flush=True)
+        if ok:
+            print('Growth Defrag status:          Not needed; existing exFAT layout satisfies the requested reserve',flush=True)
+            return 0
+        largest=max((len(e.clusters) for e in entries if e.clusters),default=0)
+        reserve=sum(growth_reserve(e.clusters,percent) for e in entries if e.clusters and not e.is_dir)
+        free=sum(1 for c in range(2,v.cc+2) if not v.bit(c))
+        if free < largest+reserve:raise Error('not enough exFAT free space for the reserve and staging workspace')
+    finally:v.close()
+    print('Growth Defrag phase 1: creating a reusable trailing workspace.',flush=True)
+    compact_objects(device,journal)
+    if STOP:
+        print('Growth Defrag stopped safely during preparation; the layout phase was not started.',flush=True)
+        return 130
+    v=Volume(device,False)
+    try:
+        entries=v.parse();objects,targets=find_growth_targets(v,entries,percent)
+        workspace_start,workspace_len=terminal_free_run(v)
+        largest=max((len(e.clusters) for e in objects),default=0)
+        if workspace_len<largest:raise Error('could not create a large enough trailing exFAT staging workspace')
+    finally:v.close()
+    moved=0
+    for planned in reversed(objects):
+        if STOP:
+            print(f'Growth Defrag stopped safely after {moved} complete exFAT objects.',flush=True)
+            return 130
+        v=Volume(device,True)
+        try:
+            current=next((e for e in v.parse() if e.path==planned.path),None)
+            if current is None:raise Error(f'exFAT object disappeared during layout: {planned.path}')
+            target,reserve=targets[planned.path]
+            dst=list(range(target,target+len(current.clusters)))
+            if current.clusters==dst:continue
+            occupied=set(current.clusters)
+            if any(v.bit(c) and c not in occupied for c in dst):
+                raise Error(f'exFAT growth target is unexpectedly occupied for {planned.path}')
+            if occupied.intersection(dst):
+                stage=list(range(workspace_start,workspace_start+len(current.clusters)))
+                if any(v.bit(c) and c not in occupied for c in stage):
+                    raise Error('exFAT staging workspace is unexpectedly occupied')
+                move_one(v,current,stage,journal)
+                v.close();v=Volume(device,True)
+                current=next(e for e in v.parse() if e.path==planned.path)
+            move_one(v,current,dst,journal);moved+=1
+            print(f'Growth layout: {moved} object(s) placed; {reserve} reserved clusters after {planned.path}',flush=True)
+        finally:v.close()
+    v=Volume(device,False)
+    try:
+        ok,reason=growth_preflight(v,percent)
+        if not ok:raise Error(f'exFAT growth layout verification failed: {reason}')
+    finally:v.close()
+    print(f'Growth Defrag completed: {moved} exFAT objects repositioned with {percent}% file growth space.',flush=True)
+    return 0
+
 def command(device,op,journal,max_files=None):
     if mounted(device): raise Error('refusing to modify a mounted exFAT volume')
     if os.path.exists(journal):raise Error('unfinished journal exists; run recover')
@@ -252,39 +448,48 @@ def command(device,op,journal,max_files=None):
         moved=0
         while not STOP:
             entries=[e for e in v.parse() if e.clusters]
-            selected=None; selected_dst=None
             if op=='defrag':
+                selected=None;selected_dst=None
                 candidates=[e for e in entries if fragments(e.clusters)>1]
                 candidates.sort(key=lambda e:(-fragments(e.clusters),-len(e.clusters),e.path))
                 for e in candidates:
                     low=v.free_run(len(e.clusters),True,set(e.clusters))
                     if low is not None:
                         selected=e;selected_dst=list(range(low,low+len(e.clusters)));break
+                if selected is None:break
+                kind='DIR' if selected.is_dir else 'FILE'
+                print(f'move: {kind} {selected.path} ({len(selected.clusters)} clusters, {fragments(selected.clusters)} fragments) -> cluster {selected_dst[0]}',flush=True)
+                move_one(v,selected,selected_dst,journal);moved+=1
             else:
-                candidates=sorted(entries,key=lambda e:(min(e.clusters),e.path))
-                for e in candidates:
-                    low=v.free_run(len(e.clusters),True,set(e.clusters))
-                    if low is not None and low < min(e.clusters):
-                        selected=e;selected_dst=list(range(low,low+len(e.clusters)));break
-            if selected is None: break
-            kind='DIR' if selected.is_dir else 'FILE'
-            print(f'move: {kind} {selected.path} ({len(selected.clusters)} clusters, {fragments(selected.clusters)} fragments) -> cluster {selected_dst[0]}',flush=True)
-            move_one(v,selected,selected_dst,journal);moved+=1
-            # Refresh in-memory FAT/bitmap and directory locations after each committed move.
+                # Compact is physical tail filling, not whole-file relocation.
+                # The lowest internal hole receives one movable cluster from the
+                # highest regular file or subdirectory allocation above it.
+                owners=[]
+                for entry in entries:
+                    owners.extend((cluster,entry,index) for index,cluster in enumerate(entry.clusters))
+                if not owners:break
+                source,selected,index=max(owners,key=lambda item:item[0])
+                destination=next((cluster for cluster in range(2,source) if not v.bit(cluster)),None)
+                if destination is None:break
+                move_tail_cluster(v,selected,index,destination,journal);moved+=1
+                print(f'exFAT compact: pasted tail cluster {source} into free cluster {destination} (total {moved})',flush=True)
+            # Refresh FAT, bitmap and directory locations after every durable move.
             v.close();v=Volume(device,True)
             if max_files and moved>=max_files:break
-        print(f'Relocated {moved} exFAT objects.',flush=True)
+        if op=='defrag':print(f'Relocated {moved} exFAT objects.',flush=True)
+        else:print(f'Compacted {moved} exFAT clusters by physical tail filling.',flush=True)
     finally:v.close()
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('operation',choices=['defrag','compact','recover']);ap.add_argument('device')
+    ap=argparse.ArgumentParser();ap.add_argument('operation',choices=['defrag','compact','growth-defrag','recover']);ap.add_argument('device')
     ap.add_argument('--write',action='store_true');ap.add_argument('--confirm');ap.add_argument('--journal',required=True);ap.add_argument('--max-files',type=int)
-    ap.add_argument('--ram-buffer');ap.add_argument('--workers');ap.add_argument('--live-map-cells');ap.add_argument('--transaction-files')
+    ap.add_argument('--ram-buffer');ap.add_argument('--workers');ap.add_argument('--live-map-cells');ap.add_argument('--transaction-files');ap.add_argument('--growth-percent',type=int,default=10);ap.add_argument('--batch-clusters')
     a=ap.parse_args()
     if not a.write or a.confirm!=a.device:raise Error('write confirmation required')
-    if a.operation=='recover':recover(a.device,a.journal)
-    else:command(a.device,a.operation,a.journal,a.max_files)
-    return 0
+    if a.operation=='recover':recover(a.device,a.journal);return 0
+    if a.operation=='growth-defrag':return growth_command(a.device,a.journal,a.growth_percent)
+    command(a.device,a.operation,a.journal,a.max_files)
+    return 130 if STOP else 0
 if __name__=='__main__':
     try:raise SystemExit(main())
     except Error as e:print(f'exfat-engine: {e}',file=sys.stderr);raise SystemExit(1)

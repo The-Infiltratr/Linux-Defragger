@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # Linux Defragger
 # Author: Shannon Smith
-# Purpose: GTK interface for analysis, compaction, defragmentation, FAT growth layouts and recovery.
+# Purpose: GTK interface for analysis, compaction, defragmentation, FAT/exFAT growth layouts and recovery.
 #
 # Comments describe design intent and non-obvious behaviour. They are kept
 # concise so that the implementation remains readable and maintainable.
@@ -9,7 +9,7 @@
 """GTK3 user interface for Linux Defragger.
 
 The GUI discovers volumes, selects a filesystem backend, renders allocation
-maps and communicates with a single privileged helper for raw-device work.
+maps and gives each independent window its own privileged helper for raw-device work.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from version import VERSION
+
 try:
     import gi
 
@@ -43,9 +45,6 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-BASE_VERSION = "1.8.0"
-PACKAGE_REVISION = "18"
-VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
@@ -271,7 +270,7 @@ class DiskMap(Gtk.DrawingArea):
         super().__init__()
         self.cells: list[dict[str, int]] = []
         self.unit_label = "clusters"
-        self._layout: tuple[int, float, float, float, int] | None = None
+        self._layout: tuple[int, int, int] | None = None
         self.set_size_request(640, 260)
         self.set_has_tooltip(True)
         self.connect("draw", self._draw)
@@ -338,19 +337,23 @@ class DiskMap(Gtk.DrawingArea):
             cr.show_text(message)
             return False
 
-        # True 2-D pixel map.  Each returned allocation sample is painted as
-        # exactly one drawable pixel.  Rows are never stretched; increasing the
-        # widget height therefore increases vertical map resolution in exactly
-        # the same way that increasing its width increases horizontal detail.
+        # The analysis samples remain cached in memory.  Resample them over the
+        # complete drawable pixel grid so resizing is an immediate redraw and
+        # never causes another raw-device scan.
         columns = max(1, width)
-        rows = max(1, min(height, math.ceil(len(self.cells) / columns)))
-        self._layout = (columns, 0.0, 0.0, 1.0, rows)
-
-        for index, cell in enumerate(self.cells):
-            row, col = divmod(index, columns)
-            if row >= height:
-                break
-            cr.set_source_rgb(*self._cell_colour(cell))
+        rows = max(1, height)
+        total_pixels = columns * rows
+        self._layout = (columns, rows, total_pixels)
+        cell_count = len(self.cells)
+        last_source = -1
+        colour = self.COLORS["background"]
+        for pixel_index in range(total_pixels):
+            source_index = min(cell_count - 1, (pixel_index * cell_count) // total_pixels)
+            if source_index != last_source:
+                colour = self._cell_colour(self.cells[source_index])
+                last_source = source_index
+            row, col = divmod(pixel_index, columns)
+            cr.set_source_rgb(*colour)
             cr.rectangle(float(col), float(row), 1.0, 1.0)
             cr.fill()
         return False
@@ -360,14 +363,13 @@ class DiskMap(Gtk.DrawingArea):
     ) -> bool:
         if not self.cells or self._layout is None:
             return False
-        columns, origin_x, origin_y, pixel_w, rows = self._layout
-        col = int((x - origin_x) // pixel_w) if x >= origin_x else -1
-        row = int(y - origin_y) if y >= origin_y else -1
-        if col < 0 or row < 0 or col >= columns:
+        columns, rows, total_pixels = self._layout
+        col = int(x)
+        row = int(y)
+        if col < 0 or row < 0 or col >= columns or row >= rows:
             return False
-        index = row * columns + col
-        if index >= len(self.cells):
-            return False
+        pixel_index = row * columns + col
+        index = min(len(self.cells) - 1, (pixel_index * len(self.cells)) // total_pixels)
         cell = self.cells[index]
         tooltip.set_text(
             f"{self.unit_label.capitalize()} {cell['start']:,}–{cell['end']:,}\n"
@@ -420,6 +422,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.volumes: list[Volume] = []
         self.current_volume: Volume | None = None
         self.map_data: dict[str, Any] | None = None
+        self.map_cache: dict[str, dict[str, Any]] = {}
         self.process: subprocess.Popen[str] | None = None
         self.process_privileged = False
         self.stop_requested = False
@@ -442,12 +445,26 @@ class MainWindow(Gtk.ApplicationWindow):
         self.helper_stderr_parts: list[str] = []
 
         self.connect("destroy", self._shutdown_helper)
+        self.engine_version = self._query_engine_version()
         self._build_ui()
         self._load_css()
         self.refresh_devices()
         # Authenticate as soon as the GUI has entered the GTK main loop.
         # The persistent helper is then reused for the complete application session.
         GLib.timeout_add(150, self._authenticate_on_launch)
+
+    def _query_engine_version(self) -> str:
+        """Read the installed native-engine version instead of duplicating its label."""
+        try:
+            result = subprocess.run(
+                [self.engine, "--version"], check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            match = re.search(r"(\d+\.\d+\.\d+-\d+)", result.stdout)
+            return match.group(1) if match else VERSION
+        except Exception:
+            return VERSION
 
     def _load_backend_registry(self) -> None:
         global SUPPORTED_FILESYSTEMS, BACKEND_CAPABILITIES
@@ -488,7 +505,7 @@ class MainWindow(Gtk.ApplicationWindow):
         title.set_markup("<span size='x-large' weight='bold'>Linux Defragger</span>")
         title.set_xalign(0)
         subtitle = Gtk.Label(
-            label="Analyse fragmentation, compact free space, defragment files, or create FAT growth-space layouts"
+            label="Analyse fragmentation, compact free space, defragment files, or create FAT/exFAT growth-space layouts"
         )
         subtitle.set_xalign(0)
         subtitle.set_line_wrap(True)
@@ -496,7 +513,7 @@ class MainWindow(Gtk.ApplicationWindow):
         title_box.pack_start(title, False, False, 0)
         title_box.pack_start(subtitle, False, False, 0)
         title_row.pack_start(title_box, True, True, 0)
-        version = Gtk.Label(label=f"Engine {VERSION} · GUI {VERSION}")
+        version = Gtk.Label(label=f"Engine {self.engine_version} · GUI {VERSION}")
         version.get_style_context().add_class("dim-label")
         title_row.pack_end(version, False, False, 0)
         root.pack_start(title_row, False, False, 0)
@@ -509,7 +526,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.device_combo.connect("changed", self._on_device_changed)
         device_box.pack_start(self.device_combo, True, True, 0)
         self.refresh_button = Gtk.Button.new_with_label("Refresh")
-        self.refresh_button.connect("clicked", lambda _b: self.refresh_devices())
+        self.refresh_button.connect("clicked", lambda _b: self.refresh_devices(clear_cache=True))
         device_box.pack_start(self.refresh_button, False, False, 0)
         self.image_button = Gtk.Button.new_with_label("Open image…")
         self.image_button.connect("clicked", self._open_image)
@@ -574,7 +591,7 @@ class MainWindow(Gtk.ApplicationWindow):
         action_row.pack_start(self.defrag_button, False, False, 0)
         self.growth_button = Gtk.Button.new_with_label("Growth Defrag")
         self.growth_button.set_tooltip_text(
-            "FAT only: defragment files and leave 10% free expansion space after each file"
+            "FAT/exFAT: defragment files and leave 10% free expansion space after each file"
         )
         self.growth_button.connect("clicked", lambda _b: self.start_mutation("growth-defrag"))
         action_row.pack_start(self.growth_button, False, False, 0)
@@ -620,12 +637,20 @@ class MainWindow(Gtk.ApplicationWindow):
         file_menu = Gtk.Menu()
         file_item.set_submenu(file_menu)
 
+        new_window_item = Gtk.MenuItem.new_with_mnemonic("_New window")
+        new_window_item.connect("activate", lambda _item: self.get_application().new_window())
+        file_menu.append(new_window_item)
+
         open_item = Gtk.MenuItem.new_with_mnemonic("_Open image…")
         open_item.connect("activate", self._open_image)
         file_menu.append(open_item)
 
+        test_item = Gtk.MenuItem.new_with_label("Create fragmented test data…")
+        test_item.connect("activate", self._create_fragmented_test_data)
+        file_menu.append(test_item)
+
         refresh_item = Gtk.MenuItem.new_with_mnemonic("_Refresh volumes")
-        refresh_item.connect("activate", lambda _item: self.refresh_devices())
+        refresh_item.connect("activate", lambda _item: self.refresh_devices(clear_cache=True))
         file_menu.append(refresh_item)
 
         file_menu.append(Gtk.SeparatorMenuItem())
@@ -644,13 +669,38 @@ class MainWindow(Gtk.ApplicationWindow):
         menu_bar.append(about_item)
         return menu_bar
 
+    def _create_fragmented_test_data(self, _item: Gtk.MenuItem) -> None:
+        chooser = Gtk.FileChooserDialog(
+            title="Choose an empty folder on the test volume", transient_for=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        chooser.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                            "Create test data", Gtk.ResponseType.OK)
+        response = chooser.run()
+        folder = chooser.get_filename() if response == Gtk.ResponseType.OK else None
+        chooser.destroy()
+        if not folder:
+            return
+        if not self.confirm(
+            "Create deliberately fragmented test data?",
+            f"Linux Defragger will create and delete test files inside:\n{folder}\n\n"
+            "Use an empty folder on a disposable test volume. Existing files outside that "
+            "folder are not touched.",
+        ):
+            return
+        tool = "/usr/bin/linux-defragger-testdata"
+        self.clear_log()
+        self.append_log(f"Creating fragmented test data in {folder}…")
+        self._run_command([tool, folder], privileged=False, purpose="test-data")
+
     def _show_about(self, _item: Gtk.MenuItem) -> None:
         dialog = Gtk.AboutDialog(transient_for=self, modal=True)
         dialog.set_program_name(APP_NAME)
         dialog.set_version(VERSION)
         dialog.set_comments(
             "Filesystem allocation analysis, free-space compaction, defragmentation, "
-            "FAT growth-space layouts and journalled recovery."
+            "FAT and exFAT growth-space layouts and journalled recovery.\n"
+            f"Native engine: {self.engine_version}"
         )
         dialog.set_authors(["Shannon Smith"])
         dialog.set_website(PROJECT_URL)
@@ -719,9 +769,11 @@ class MainWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         return response == Gtk.ResponseType.OK
 
-    def refresh_devices(self, preserve_path: str | None = None) -> None:
+    def refresh_devices(self, preserve_path: str | None = None, clear_cache: bool = False) -> None:
         if self.busy:
             return
+        if clear_cache:
+            self.map_cache.clear()
         try:
             discovered = discover_volumes()
         except Exception as exc:
@@ -747,12 +799,29 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_device_changed(self, combo: Gtk.ComboBoxText) -> None:
         index = combo.get_active()
         self.current_volume = self.volumes[index] if 0 <= index < len(self.volumes) else None
-        self.map_data = None
-        self.disk_map.set_cells([])
         self._reset_summary()
-        if self.current_volume:
-            self.status_label.set_text(self.current_volume.display_name)
+        if not self.current_volume:
+            self.map_data = None
+            self.disk_map.set_cells([])
+            self._update_controls()
+            return
+        cached = self.map_cache.get(self.current_volume.path)
+        if cached is not None:
+            self._apply_map(cached)
+            self.status_label.set_text(self.status_label.get_text() + " · cached analysis")
+        else:
+            self.map_data = None
+            self.disk_map.set_cells([])
+            self.status_label.set_text(self.current_volume.display_name + " · analysing…")
+            selected_path = self.current_volume.path
+            GLib.idle_add(self._auto_analyse_selected, selected_path)
         self._update_controls()
+
+    def _auto_analyse_selected(self, selected_path: str) -> bool:
+        if (self.current_volume is not None and self.current_volume.path == selected_path
+                and selected_path not in self.map_cache and not self.busy):
+            self.analyze(clear_log=True)
+        return False
 
     def _detect_image_fstype(self, path: str) -> str:
         result = subprocess.run(
@@ -840,31 +909,21 @@ class MainWindow(Gtk.ApplicationWindow):
     def _desired_map_cells(self) -> int:
         return self.disk_map.desired_cell_count()
 
-    def _on_map_size_allocate(self, _widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
-        if not self.map_data or not self.current_volume:
-            return
-        target = self.disk_map.desired_cell_count(allocation.width, allocation.height)
-        current = int(self.map_data.get("cell_count", 0))
-        # Ignore tiny allocation jitter; meaningful changes are rebinned after resize settles.
-        if current and abs(target - current) / current < 0.03:
-            return
-        self.last_map_cell_target = target
-        if self.map_resize_timeout_id is not None:
-            GLib.source_remove(self.map_resize_timeout_id)
-        self.map_resize_timeout_id = GLib.timeout_add(350, self._refresh_map_after_resize)
+    def _on_map_size_allocate(self, _widget: Gtk.Widget, _allocation: Gdk.Rectangle) -> None:
+        # The analysed allocation samples stay in memory.  DiskMap resamples those
+        # samples to the new drawable size, so resizing never rereads the volume.
+        if self.map_data:
+            self.disk_map.queue_draw()
 
     def _refresh_map_after_resize(self) -> bool:
         self.map_resize_timeout_id = None
-        if self.busy or not self.current_volume or not self.map_data:
-            return False
-        target = self.last_map_cell_target or self._desired_map_cells()
-        current = int(self.map_data.get("cell_count", 0))
-        if target != current:
-            self.analyze(clear_log=False, target_cells=target, quiet=True)
+        self.disk_map.queue_draw()
         return False
 
     def _apply_map(self, data: dict[str, Any]) -> None:
         self.map_data = data
+        if self.current_volume is not None:
+            self.map_cache[self.current_volume.path] = data
         self.disk_map.set_cells(list(data["cells"]))
         self.last_map_cell_target = int(data.get("cell_count", len(data.get("cells", []))))
         filesystem = str(data.get("filesystem") or "fat32").upper()
@@ -1114,6 +1173,18 @@ class MainWindow(Gtk.ApplicationWindow):
                 "Unmount it first. Filesystem mutation engines intentionally refuse mounted volumes.",
             )
             return
+        if (operation == "growth-defrag" and self.map_data is not None
+                and bool(self.map_data.get("growth_10_satisfied"))):
+            self.clear_log()
+            self.append_log(
+                f"Growth Defrag preflight: cached analysis confirms that {volume.path} "
+                "already has contiguous files and at least 10% free growth space after each file."
+            )
+            self.append_log("No filesystem write or second scan is required.")
+            self.progress.set_fraction(1.0)
+            self.progress.set_text("Not needed")
+            self.status_label.set_text("Growth Defrag not needed · cached 10% layout verified")
+            return
         journal = self.journal_path()
         if operation != "recover" and Path(journal).exists():
             self.show_error(
@@ -1129,7 +1200,7 @@ class MainWindow(Gtk.ApplicationWindow):
             "defrag": "Rebuild fragmented files as contiguous runs without compacting free space.",
             "compact": "Fill internal free-space gaps without attempting to defragment files.",
             "growth-defrag": (
-                "FAT only: compact allocation, rebuild files contiguously in physical order, "
+                "FAT/exFAT: compact allocation, rebuild files contiguously in physical order, "
                 "and leave a 10% free expansion gap after each regular file."
             ),
             "recover": "Complete or roll back the interrupted journalled transaction.",
@@ -1191,6 +1262,7 @@ class MainWindow(Gtk.ApplicationWindow):
         else:
             args += ["--ram-buffer", "auto", "--workers", "auto"]
 
+        self.map_cache.pop(volume.path, None)
         self.clear_log()
         self.append_log(f"Starting {operation_names[operation]} on {volume.path}…")
         self._run_command(
@@ -1710,27 +1782,29 @@ class MainWindow(Gtk.ApplicationWindow):
 class LinuxDefraggerApplication(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=0)
-        self.window: MainWindow | None = None
+        self.windows: list[MainWindow] = []
+
+    def new_window(self) -> None:
+        try:
+            window = MainWindow(self)
+        except Exception as exc:
+            dialog = Gtk.MessageDialog(
+                transient_for=None, modal=True, message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE, text="Unable to start Linux Defragger",
+            )
+            dialog.format_secondary_text(str(exc))
+            dialog.run(); dialog.destroy()
+            return
+        self.windows.append(window)
+        window.connect("destroy", lambda w: self.windows.remove(w) if w in self.windows else None)
+        window.show_all()
+        window.present()
 
     def do_activate(self) -> None:
-        if self.window is None:
-            try:
-                self.window = MainWindow(self)
-            except Exception as exc:
-                dialog = Gtk.MessageDialog(
-                    transient_for=None,
-                    modal=True,
-                    message_type=Gtk.MessageType.ERROR,
-                    buttons=Gtk.ButtonsType.CLOSE,
-                    text="Unable to start Linux Defragger",
-                )
-                dialog.format_secondary_text(str(exc))
-                dialog.run()
-                dialog.destroy()
-                self.quit()
-                return
-        self.window.show_all()
-        self.window.present()
+        if not self.windows:
+            self.new_window()
+        else:
+            self.windows[-1].present()
 
 
 def main(argv: list[str] | None = None) -> int:

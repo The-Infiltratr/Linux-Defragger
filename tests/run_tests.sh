@@ -124,7 +124,7 @@ grep -q 'Fragmented directories: 0 (root fragments: 1)' "$TMP/directory-16k-afte
 "$ROOT/tests/make_interleaved_compact_image.py" "$TMP/batched-defrag.img" >/dev/null
 "$BIN" defrag "$TMP/batched-defrag.img" --write \
   --confirm "$TMP/batched-defrag.img" --files-only \
-  --transaction-files 8 --ram-buffer 64M --workers 4 \
+  --transaction-files 8 --ram-buffer 64M --workers 4 --verbose \
   >"$TMP/batched-defrag.txt" 2>"$TMP/batched-defrag.err"
 grep -q 'File transactions:       4 (512 clusters)' "$TMP/batched-defrag.txt"
 grep -q 'Buffered data written:   8.0 MiB in 4 extents' "$TMP/batched-defrag.txt"
@@ -148,11 +148,11 @@ grep -q 'Buffered data written:   0.5 MiB in 1 extent' "$TMP/batched-recover.txt
 grep -q 'Fragmented files:       32' "$TMP/interleaved-before.txt"
 "$BIN" compact "$TMP/interleaved-compact.img" --write \
   --confirm "$TMP/interleaved-compact.img" >"$TMP/interleaved-compact.txt"
-grep -q 'Whole objects packed:    32 (512 clusters)' "$TMP/interleaved-compact.txt"
-grep -q 'Ordered extent moves:    0 (0 clusters; 0 singletons)' "$TMP/interleaved-compact.txt"
-"$ROOT/tests/verify_interleaved_compact.py" "$TMP/interleaved-compact.img" >/dev/null
+grep -q 'Whole objects packed:    0 (0 clusters)' "$TMP/interleaved-compact.txt"
+grep -q 'Ordered extent moves:    1 (512 clusters; 0 singletons)' "$TMP/interleaved-compact.txt"
+"$ROOT/tests/verify_tail_fill_compact.py" "$TMP/interleaved-compact.img" >/dev/null
 "$BIN" analyze "$TMP/interleaved-compact.img" >"$TMP/interleaved-after.txt"
-grep -q 'Fragmented files:       0' "$TMP/interleaved-after.txt"
+grep -q 'Fragmented files:       32' "$TMP/interleaved-after.txt"
 grep -q 'Free gaps below it:       0 clusters' <(cat "$TMP/interleaved-compact.txt")
 
 "$ROOT/tests/make_interleaved_compact_image.py" "$TMP/batched-defrag.img" >/dev/null
@@ -224,7 +224,7 @@ sha256sum "$TMP/growth-defrag.img" >"$TMP/growth-defrag-idempotent-before.sha"
   >"$TMP/growth-defrag-idempotent.txt" 2>"$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag status:          Not needed; layout already satisfies 10% reserve' \
   "$TMP/growth-defrag-idempotent.txt"
-grep -q 'Growth Defrag preflight (1.8.0-19): checking' \
+grep -q 'Growth Defrag preflight (1.8.0-20): checking' \
   "$TMP/growth-defrag-idempotent.err"
 grep -q 'Growth Defrag preflight result: the existing FAT layout already satisfies' \
   "$TMP/growth-defrag-idempotent.err"
@@ -242,12 +242,12 @@ grep -q 'Fragmented files:       0' "$TMP/growth-defrag-after.txt"
 grep -q 'Fragmented files:       0' "$TMP/gapped-before.txt"
 "$BIN" compact "$TMP/gapped-contiguous.img" --write \
   --confirm "$TMP/gapped-contiguous.img" >"$TMP/gapped-compact.txt"
-grep -q 'Whole objects staged:    1 (8 clusters)' "$TMP/gapped-compact.txt"
-grep -q 'Ordered extent moves:    0 (0 clusters; 0 singletons)' "$TMP/gapped-compact.txt"
+grep -q 'Whole objects staged:    0 (0 clusters)' "$TMP/gapped-compact.txt"
+grep -q 'Ordered extent moves:' "$TMP/gapped-compact.txt"
 "$ROOT/tests/verify_gapped_contiguous.py" "$TMP/gapped-contiguous.img" >/dev/null
 "$BIN" analyze "$TMP/gapped-contiguous.img" >"$TMP/gapped-after.txt"
-grep -q 'Fragmented files:       0' "$TMP/gapped-after.txt"
 grep -q 'Free gaps below it:       0 clusters' "$TMP/gapped-compact.txt"
+grep -Eq 'Fragmented files:       [1-9][0-9]*' "$TMP/gapped-after.txt"
 
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ext_backend.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_ntfs_backend.py" >/dev/null
@@ -259,5 +259,7 @@ PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_allocation_mapper.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_growth_defrag_ui.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_mounted_analysis_policy.py" >/dev/null
 PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_swap_backend.py" >/dev/null
+PYTHONPATH="$ROOT/gui" "$ROOT/tests/test_gui_revision20.py" >/dev/null
+"$ROOT/tests/exfat/run_exfat_tests.sh" >/dev/null
 
 echo 'all tests passed'

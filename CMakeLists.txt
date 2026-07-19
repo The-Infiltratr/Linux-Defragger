@@ -41,6 +41,7 @@ install(TARGETS linux-defragger-hfs-engine RUNTIME DESTINATION lib/linux-defragg
 install(PROGRAMS gui/linux_defragger_gui.py gui/allocation_mapper.py gui/privileged_helper.py
                  gui/exfat_engine.py gui/affs_engine.py gui/apple_engine.py gui/ntfs_engine.py
         DESTINATION lib/linux-defragger)
+install(FILES gui/version.py DESTINATION lib/linux-defragger)
 install(FILES
     gui/backends/__init__.py gui/backends/base.py gui/backends/registry.py
     gui/backends/fat_common.py gui/backends/fat12.py gui/backends/fat16.py
@@ -51,6 +52,7 @@ install(FILES
     gui/backends/hfsplus.py gui/backends/apfs.py
     DESTINATION lib/linux-defragger/backends)
 install(PROGRAMS packaging/linux-defragger DESTINATION bin)
+install(PROGRAMS tools/linux-defragger-testdata.py DESTINATION bin RENAME linux-defragger-testdata)
 install(FILES packaging/io.github.linuxdefragger.desktop DESTINATION share/applications)
 install(FILES packaging/io.github.linuxdefragger.svg DESTINATION share/icons/hicolor/scalable/apps)
 

@@ -67,19 +67,19 @@ def allowed_command(program: str, argv: list[str]) -> list[str]:
     if program == "exfat-engine":
         if not EXFAT_ENGINE.is_file() or not os.access(EXFAT_ENGINE, os.X_OK):
             raise RuntimeError(f"exFAT engine is unavailable: {EXFAT_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "recover"}:
+        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
             raise RuntimeError("exFAT engine command is not allowed")
         return [str(EXFAT_ENGINE), *argv]
     if program == "affs-engine":
         if not AFFS_ENGINE.is_file() or not os.access(AFFS_ENGINE, os.X_OK):
             raise RuntimeError(f"Amiga filesystem engine is unavailable: {AFFS_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "recover"}:
+        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
             raise RuntimeError("Amiga filesystem engine command is not allowed")
         return [str(AFFS_ENGINE), *argv]
     if program == "apple-engine":
         if not APPLE_ENGINE.is_file() or not os.access(APPLE_ENGINE, os.X_OK):
             raise RuntimeError(f"Apple filesystem engine is unavailable: {APPLE_ENGINE}")
-        if not argv or argv[0] not in {"defrag", "compact", "recover"}:
+        if not argv or argv[0] not in {"defrag", "compact", "growth-defrag", "recover"}:
             raise RuntimeError("Apple filesystem engine command is not allowed")
         return [str(APPLE_ENGINE), *argv]
     if program == "ntfs-engine":

@@ -13,7 +13,7 @@ import math
 
 from .base import *
 
-INFO = BackendInfo("exfat", "exFAT", ("exfat",), CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_DEFRAG|CAP_RECOVER, "exact")
+INFO = BackendInfo("exfat", "exFAT", ("exfat",), CAP_ANALYSE|CAP_MAP|CAP_COMPACT|CAP_DEFRAG|CAP_RECOVER|CAP_GROWTH_DEFRAG, "exact")
 
 class ExfatBackend:
     info = INFO
@@ -114,6 +114,11 @@ class ExfatBackend:
             if len(bitmap) * 8 < cluster_count:
                 raise BackendError("exFAT allocation bitmap is shorter than the cluster heap")
 
+            def allocated(cluster: int) -> bool:
+                index = cluster - 2
+                return bool((bitmap[index >> 3] >> (index & 7)) & 1)
+
+            growth_10_satisfied = self._fragments(root_clusters) == 1
             regular_files = 0
             directories = 1  # Include the root directory, matching the FAT summary.
             fragmented_files = 0
@@ -126,7 +131,7 @@ class ExfatBackend:
                 fragmented_cluster_indices.update(cluster - 2 for cluster in root_clusters)
 
             def scan_directory(first: int, length: int, no_fat_chain: bool, display_path: str) -> None:
-                nonlocal regular_files, directories, fragmented_files, fragmented_directories
+                nonlocal regular_files, directories, fragmented_files, fragmented_directories, growth_10_satisfied
                 count = math.ceil(length / cluster_size) if length else 1
                 clusters = chain(first, count, contiguous=no_fat_chain)
                 data = bytearray(read_stream(clusters, len(clusters) * cluster_size))
@@ -177,6 +182,17 @@ class ExfatBackend:
                             if extent_count > 1:
                                 fragmented_files += 1
                                 fragmented_cluster_indices.update(cluster - 2 for cluster in child_clusters)
+                                growth_10_satisfied = False
+                            if child_clusters:
+                                reserve = (len(child_clusters) * 10 + 99) // 100
+                                cursor = child_clusters[-1] + 1
+                                available = 0
+                                while (available < reserve and cursor < cluster_count + 2
+                                       and not allocated(cursor)):
+                                    available += 1
+                                    cursor += 1
+                                if available < reserve:
+                                    growth_10_satisfied = False
                     offset += entry_count * 32
 
             scan_directory(root_cluster, len(root_clusters) * cluster_size, False, "")
@@ -210,6 +226,7 @@ class ExfatBackend:
                 "directories": directories,
                 "fragmented_files": fragmented_files,
                 "fragmented_directories": fragmented_directories,
+                "growth_10_satisfied": growth_10_satisfied and regular_files > 0,
             })
             return result
 

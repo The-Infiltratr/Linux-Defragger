@@ -1,17 +1,17 @@
-# Linux Defragger 1.8.0-19
+# Linux Defragger 1.8.0-20
 
-Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT growth-space layouts and journalled recovery for supported filesystems.
+Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
 The user-visible operations are deliberately separate:
 
 - **Analyse** reads filesystem metadata and reports allocation, free space and fragmentation. It is read-only and may run against a mounted volume as a live snapshot.
 - **Compact** fills internal free-space gaps so free space moves toward the physical end of the volume. It is not a file-defragmentation command.
 - **Defragment** rebuilds fragmented files into contiguous allocation runs. It does not attempt to pack every free-space gap.
-- **Growth Defrag** is a FAT12/16/32-only layout operation. It first compacts the FAT allocation, then rebuilds allocated objects in physical order and deliberately leaves free expansion room after each regular file.
+- **Growth Defrag** is a FAT12/16/32 and exFAT layout operation. It verifies the existing layout first, then rebuilds allocated objects in physical order and deliberately leaves free expansion room after each regular file only when work is required.
 
-## FAT Growth Defrag
+## FAT and exFAT Growth Defrag
 
-The GTK **Growth Defrag** button requests a 10 percent reserve after every non-empty regular file. The native FAT engine also accepts `--growth-percent 1..25` for direct command-line use.
+The GTK **Growth Defrag** button requests a 10 percent reserve after every non-empty regular file on FAT and exFAT. The native FAT engine also accepts `--growth-percent 1..25` for direct command-line use.
 
 The reserve is measured in complete FAT clusters. Each file receives `ceil(file_clusters × percentage / 100)` free clusters, so a very small file receives a one-cluster minimum at the default 10 percent. Directories remain contiguous but do not receive a growth gap.
 
@@ -33,12 +33,20 @@ The operation refuses to start unless the volume has enough free clusters for bo
 ## Filesystem support
 
 - FAT12, FAT16 and FAT32: analyse, map, compact, defragment, Growth Defrag and recover.
-- exFAT: analyse, map, compact, defragment and recover.
+- exFAT: analyse, map, compact, defragment, Growth Defrag and recover.
 - Amiga OFS/FFS variants: analyse, map, compact, defragment and recover.
 - Classic Apple HFS: analyse, map, compact, defragment and recover.
 - Apple HFS+ and HFSX: analyse, map, compact, defragment, recover and live map updates.
 - NTFS: analyse, map, native offline compact, native offline defragment and recover.
 - EXT2/3/4, Btrfs, XFS, UFS, ZFS, APFS, Minix and swap: read-only allocation and fragmentation analysis where supported by the backend.
+
+### FAT and exFAT Compact semantics
+
+FAT and exFAT Compact are intentionally pure compactors. They fill the lowest free clusters with movable allocation copied from the physical tail. They do not prefer complete files and do not attempt to reduce fragmentation; a file may become more fragmented as the price of removing internal gaps. FAT Growth Defrag uses a separate whole-object preparation planner because it immediately rebuilds all objects contiguously in its second phase. exFAT uses a separate whole-object preparation path for the same reason.
+
+### Fragmentation test-data generator
+
+`linux-defragger-testdata DIRECTORY` creates deterministic files, alternating allocation holes and an expanded directory inside `LinuxDefragger-TestData`. The same utility is available from **File → Create fragmented test data…**. It uses normal mounted-filesystem calls, so it can exercise any filesystem Linux can mount read/write. The generated manifest records file sizes and SHA-256 hashes for post-operation verification.
 
 ## Native NTFS operations
 
@@ -60,7 +68,7 @@ The current native writer deliberately leaves NTFS system files and directories,
 
 ## Interface
 
-The title bar, engine/GUI build label and About dialog show the complete package revision. The File menu provides image opening, volume refresh and Quit. The About menu provides program, author, version and project information. The Growth Defrag button is enabled only when the selected backend advertises the FAT growth-layout capability.
+The title bar, engine/GUI build label and About dialog read the complete package revision from one version source. Selecting a volume automatically analyses it. Resizing redraws the cached allocation samples in memory and never rescans the device. The File menu provides a new independent window, image opening, fragmented test-data creation, volume refresh and Quit. Separate windows may maintain operations on separate volumes concurrently. The Growth Defrag button is enabled whenever the selected FAT or exFAT backend advertises the growth-layout capability.
 
 ## Safe stopping
 
