@@ -1,4 +1,4 @@
-# Linux Defragger 1.5.2
+# Linux Defragger 1.5.3
 
 Linux Defragger is a self-contained GTK allocation-map and FAT-family defragmentation application.
 

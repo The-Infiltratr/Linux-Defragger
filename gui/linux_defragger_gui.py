@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,7 +32,7 @@ except (ImportError, ValueError) as exc:
 
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 MIN_MAP_CELLS = 256
 MAX_MAP_CELLS = 1048576
 CAP_ANALYSE = 1 << 0
@@ -953,7 +954,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.helper_ready or self.helper_starting:
             return False
         self.status_label.set_text("Waiting for administrator authentication…")
-        self._start_privileged_helper()
+        try:
+            self._start_privileged_helper()
+        except Exception as exc:
+            self._helper_start_failed(f"Administrator authentication could not start: {exc}")
         return False
 
     def _helper_program_and_args(self, args: list[str]) -> tuple[str, list[str]]:

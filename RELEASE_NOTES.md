@@ -1,4 +1,11 @@
-# Linux Defragger 1.5.2
+# Linux Defragger 1.5.3
+
+- Restores the required `shutil` import removed during the 1.5.2 cleanup.
+- Fixes launch-time PolicyKit authentication and privileged FAT analysis.
+- Surfaces startup authentication failures instead of leaving operations stuck at “in progress”.
+- No filesystem engine or on-disk write logic changed.
+
+# Linux Defragger 1.5.3
 
 This release removes unpublished compatibility baggage and standardises the entire project on the Linux Defragger name.
 

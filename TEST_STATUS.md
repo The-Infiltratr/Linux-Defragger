@@ -1,4 +1,4 @@
-# Linux Defragger 1.5.2 test status
+# Linux Defragger 1.5.3 test status
 
 - C engine compiled statically with warnings enabled.
 - Python modules passed bytecode compilation.
