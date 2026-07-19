@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gui"))
+import backends.btrfs as btrfs
 from backends.btrfs import BtrfsBackend
 
 NODE = 4096
@@ -170,7 +171,39 @@ def make_image(path: Path) -> None:
     path.write_bytes(image)
 
 
+def test_kernel_tree_search_parser() -> None:
+    calls = 0
+    payload = chunk_item(DATA_LENGTH, 3, 1, [(1, DATA_PHYS)])
+    original = btrfs.fcntl.ioctl
+
+    def fake_ioctl(fd, request_code, request, mutate=True):
+        nonlocal calls
+        assert fd == 9
+        assert request_code == btrfs.BTRFS_IOC_TREE_SEARCH_V2
+        if calls == 0:
+            struct.pack_into("=I", request, 64, 1)
+            struct.pack_into("=QQQII", request, 112, 7, 256, DATA_LOGICAL, 228, len(payload))
+            request[144:144 + len(payload)] = payload
+        else:
+            struct.pack_into("=I", request, 64, 0)
+        calls += 1
+        return 0
+
+    try:
+        btrfs.fcntl.ioctl = fake_ioctl
+        search = btrfs._KernelTreeSearch(9, 64 * 1024)
+        items = list(search.items(3, 228))
+    finally:
+        btrfs.fcntl.ioctl = original
+    assert len(items) == 1
+    assert items[0].key == btrfs._Key(256, 228, DATA_LOGICAL)
+    parsed = btrfs._parse_chunk(items[0].data, items[0].key.offset)
+    assert parsed.length == DATA_LENGTH
+    assert search.calls == 2
+
+
 def main() -> int:
+    test_kernel_tree_search_parser()
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "btrfs.img"
         make_image(path)

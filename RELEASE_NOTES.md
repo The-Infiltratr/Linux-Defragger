@@ -1,4 +1,12 @@
-# Linux Defragger 1.8.0-25
+# Linux Defragger 1.8.0-26
+
+- Replaces the unreliable Btrfs balance compactor. Balance source-range filters did not control destination placement and could move chunks higher, increasing internal gaps.
+- Btrfs Compact now uses a temporary online shrink followed by restoration to the exact original filesystem size. The kernel relocates chunks above the temporary boundary into lower available chunk ranges without invoking file defragmentation.
+- Reads the chunk layout through `BTRFS_IOC_TREE_SEARCH_V2` before and after every resize, eliminating the stale raw chunk-root snapshot that caused `tree-block bytenr mismatch` after a balance transaction.
+- Adds restoration cleanup for normal completion, errors and Stop requests so a successful temporary shrink is always followed by an attempt to restore the original size.
+- Accelerates physical Btrfs Analyse by using the mounted kernel tree-search interface for chunk, root, extent, inode and file-extent items. Regular-file image tests retain the raw walker.
+- Adds a unique-block cache to the raw Btrfs tree reader, preventing repeated reads of shared tree blocks during image and fallback analysis.
+- Adds regression coverage for kernel tree-search parsing, resize ioctl packing, conservative shrink-target planning and the absence of the old balance path.
 
 - Adds real-time EXT4 and XFS Compact allocation-map updates. Every completed kernel mapping exchange reports the low destination and released high source range to the GUI, which redraws the cached map without rescanning the device.
 - Keeps the live display honest: physical used/free movement is updated during Compact, while exact fragmentation colours are recalculated by the normal final analysis.

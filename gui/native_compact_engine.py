@@ -20,8 +20,9 @@ high extents together, leaving free space at the physical tail.
 
 Btrfs cannot exchange arbitrary physical file extents because every extent is
 copy-on-write and back-referenced.  Its compactor therefore uses the native
-balance ioctl, limited to one high physical chunk per transaction, and repeats
-until chunk allocation no longer moves toward the beginning of the device.
+online resize transaction: temporarily shrinking the filesystem forces chunks
+above the new boundary into lower free chunk ranges, then the original size is
+restored.  This changes physical chunk placement without invoking file defrag.
 """
 
 from __future__ import annotations
@@ -124,17 +125,7 @@ FS_IOC_FIEMAP = _ioc(_IOC_READ | _IOC_WRITE, "f", 11, 32)
 FS_IOC_FSGETXATTR = _ioc(_IOC_READ, "X", 31, 28)
 EXT4_IOC_MOVE_EXT = _ioc(_IOC_READ | _IOC_WRITE, "f", 15, 40)
 XFS_IOC_EXCHANGE_RANGE = _ioc(_IOC_WRITE, "X", 129, 40)
-BTRFS_IOC_BALANCE_V2 = _ioc(_IOC_READ | _IOC_WRITE, 0x94, 32, 1024)
-BTRFS_IOC_BALANCE_CTL = _ioc(_IOC_WRITE, 0x94, 33, 4)
-
-BTRFS_BALANCE_CTL_CANCEL = 2
-BTRFS_BALANCE_DATA = 1 << 0
-BTRFS_BALANCE_SYSTEM = 1 << 1
-BTRFS_BALANCE_METADATA = 1 << 2
-BTRFS_BALANCE_ARGS_USAGE = 1 << 1
-BTRFS_BALANCE_ARGS_DEVID = 1 << 2
-BTRFS_BALANCE_ARGS_DRANGE = 1 << 3
-BTRFS_BALANCE_ARGS_LIMIT = 1 << 5
+BTRFS_IOC_RESIZE = _ioc(_IOC_WRITE, 0x94, 3, 4096)
 
 _stop_requested = False
 _active_btrfs_fd: int | None = None
@@ -382,13 +373,10 @@ class SpaceCollector:
 
 def _signal_handler(_signum, _frame) -> None:
     global _stop_requested
+    # Resize and extent-exchange ioctls are kernel-journalled.  SIGINT asks the
+    # active syscall to return at its next interruptible boundary; cleanup code
+    # then restores the original Btrfs size before the process exits.
     _stop_requested = True
-    if _active_btrfs_fd is not None:
-        try:
-            arg = struct.pack("=i", BTRFS_BALANCE_CTL_CANCEL)
-            fcntl.ioctl(_active_btrfs_fd, BTRFS_IOC_BALANCE_CTL, arg)
-        except OSError:
-            pass
 
 
 def _emit_live_range(source_physical: int, destination_physical: int,
@@ -946,154 +934,226 @@ def compact_extent_filesystem(device: str, filesystem: str, live_cells: int = 0)
     print("100.00 percent completed", flush=True)
     return 0
 
-def _btrfs_layout(device: str) -> tuple[int, int, list[FreeRange], int, int]:
+def _btrfs_super_geometry(device: str) -> tuple[int, int, int]:
     with Reader(device) as reader:
         sb = reader.read(btrfs_backend._SUPER_OFFSET, btrfs_backend._SUPER_SIZE)
         if sb[0x40:0x48] != btrfs_backend._BTRFS_MAGIC:
             raise CompactError("not a Btrfs filesystem")
         total = u64le(sb, 112)
         num_devices = u64le(sb, 136)
-        nodesize = u32le(sb, 148)
-        chunk_root = u64le(sb, 88)
-        chunk_level = sb[199]
         devid = u64le(sb, 201)
         if num_devices != 1:
             raise CompactError("Btrfs Compact currently supports single-device filesystems only")
-        chunks = btrfs_backend._system_chunks(sb)
-        bootstrap = btrfs_backend._Mapper(chunks, devid, total)
-        tree = btrfs_backend._TreeReader(reader, bootstrap, nodesize)
-        items, _blocks = tree.walk(chunk_root, chunk_level)
-        for item in items:
-            if item.key.type == btrfs_backend._CHUNK_ITEM:
-                chunks.append(btrfs_backend._parse_chunk(item.data, item.key.offset))
-        mapper = btrfs_backend._Mapper(chunks, devid, total)
-        ranges: list[tuple[int, int]] = []
-        for chunk in mapper.chunks:
-            for stripe_devid, physical in chunk.stripes:
-                if stripe_devid == devid:
-                    ranges.append((physical, physical + chunk.length))
-        allocated = _merge_ranges(ranges)
-        gaps: list[FreeRange] = []
-        cursor = 1024 * 1024
-        for item in allocated:
-            start = max(cursor, item.start)
-            if start > cursor:
-                gaps.append(FreeRange(cursor, start))
-            cursor = max(cursor, item.end)
-        highwater = max((item.end for item in allocated), default=cursor)
-        return total, devid, gaps, highwater, sum(item.length for item in allocated)
+        if total <= 0:
+            raise CompactError("invalid Btrfs filesystem size")
+        return total, devid, reader.size
 
 
-def _balance_request(devid: int, start: int, end: int) -> bytearray:
-    request = bytearray(1024)
-    top_flags = BTRFS_BALANCE_DATA | BTRFS_BALANCE_METADATA | BTRFS_BALANCE_SYSTEM
-    struct.pack_into("=Q", request, 0, top_flags)
-    section_flags = BTRFS_BALANCE_ARGS_DEVID | BTRFS_BALANCE_ARGS_DRANGE | BTRFS_BALANCE_ARGS_LIMIT
-    for offset in (16, 152, 288):
-        struct.pack_into("=Q", request, offset + 16, devid)
-        struct.pack_into("=Q", request, offset + 24, start)
-        struct.pack_into("=Q", request, offset + 32, end)
-        struct.pack_into("=Q", request, offset + 64, section_flags)
-        struct.pack_into("=Q", request, offset + 72, 1)
-    return request
+def _btrfs_layout(fd: int, total: int, devid: int) -> tuple[list[FreeRange], int, int, int, dict]:
+    try:
+        mapper, physical_ranges, stats = btrfs_backend.kernel_chunk_layout(fd, total, devid)
+    except btrfs_backend.BackendError as exc:
+        raise CompactError(str(exc)) from exc
+    allocated = _merge_ranges(physical_ranges)
+    gaps: list[FreeRange] = []
+    cursor = 1024 * 1024
+    for item in allocated:
+        start = max(cursor, item.start)
+        if start > cursor:
+            gaps.append(FreeRange(cursor, start))
+        cursor = max(cursor, item.end)
+    highwater = max((item.end for item in allocated), default=cursor)
+    allocated_bytes = sum(item.length for item in allocated)
+    largest_chunk = max((chunk.length for chunk in mapper.chunks), default=256 * 1024 * 1024)
+    return gaps, highwater, allocated_bytes, largest_chunk, stats
+
+
+def _btrfs_resize(fd: int, devid: int, size: int) -> None:
+    request = bytearray(4096)
+    amount = f"{devid}:{size}".encode("ascii")
+    if len(amount) >= 255:
+        raise CompactError("Btrfs resize request is too long")
+    request[8:8 + len(amount)] = amount
+    request[8 + len(amount)] = 0
+    fcntl.ioctl(fd, BTRFS_IOC_RESIZE, request, True)
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _candidate_shrink_targets(allocated: int, largest_chunk: int,
+                              highwater: int) -> list[int]:
+    alignment = 256 * 1024 * 1024
+    conservative_reserve = max(2 * 1024**3, largest_chunk * 2, allocated // 10)
+    tighter_reserve = max(1024**3, largest_chunk, allocated // 20)
+    targets: list[int] = []
+    for reserve in (conservative_reserve, tighter_reserve):
+        target = _align_up(1024 * 1024 + allocated + reserve, alignment)
+        target = min(target, highwater - 64 * 1024 * 1024)
+        if target > allocated and target < highwater:
+            targets.append(target)
+    # Keep order while removing duplicates.
+    return list(dict.fromkeys(targets))
 
 
 def compact_btrfs(device: str) -> int:
     global _active_btrfs_fd
-    total, devid, gaps, highwater, allocated = _btrfs_layout(device)
-    if not gaps:
-        print("Btrfs Compact: allocated chunks are already packed from the beginning of the device.", flush=True)
-        return 0
+    original_size, devid, device_size = _btrfs_super_geometry(device)
+    if original_size > device_size > 0:
+        raise CompactError("Btrfs filesystem size exceeds the block device")
+
     print(
-        f"Btrfs Compact: {len(gaps):,} physical gaps exist below the chunk high-water mark "
-        f"at byte {highwater:,}.", flush=True
+        "Btrfs Compact uses an online shrink-and-restore transaction. Shrinking forces "
+        "chunks above a temporary boundary into lower free chunk ranges; restoring the "
+        "original size leaves the released space at the physical tail. File extents are "
+        "not defragmented.",
+        flush=True,
     )
-    print(
-        "Btrfs uses copy-on-write back-referenced extents, so Compact asks the native Btrfs "
-        "balance transaction engine to relocate one high physical chunk at a time. It does "
-        "not invoke file defragmentation.", flush=True
-    )
+
     with PrivateMount(device, "btrfs") as mountpoint:
         fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         _active_btrfs_fd = fd
+        total_reduction = 0
+        cycles = 0
+        restored = True
         try:
+            gaps, highwater, allocated, largest_chunk, stats = _btrfs_layout(
+                fd, original_size, devid
+            )
+            initial_highwater = highwater
             initial_gap_bytes = sum(gap.length for gap in gaps)
-            moved_chunks = 0
-            no_progress = 0
-            previous_gap_bytes = initial_gap_bytes
-            previous_gap_start = gaps[0].start
-            previous_highwater = highwater
-            while gaps and no_progress < MAX_NO_PROGRESS:
+            if not gaps:
+                print(
+                    "Btrfs Compact: allocated chunks are already packed from the beginning "
+                    "of the device.",
+                    flush=True,
+                )
+                print("100.00 percent completed", flush=True)
+                return 0
+
+            print(
+                f"Btrfs Compact: {len(gaps):,} internal physical chunk gaps total "
+                f"{initial_gap_bytes / (1024**3):.2f} GiB below chunk high-water byte "
+                f"{highwater:,}.",
+                flush=True,
+            )
+            print(
+                f"Current chunk layout was read through {stats.get('tree_search_calls', 0):,} "
+                "kernel tree-search calls.",
+                flush=True,
+            )
+
+            for target in _candidate_shrink_targets(allocated, largest_chunk, highwater):
+                if target >= highwater:
+                    continue
                 if _stop_requested:
-                    print("Stop requested; cancelling the active Btrfs balance transaction.", flush=True)
+                    print("Stop requested before the next Btrfs resize transaction.", flush=True)
                     return EXIT_STOPPED
-                target = gaps[0]
-                request = _balance_request(devid, target.start, total)
+                print(
+                    f"Btrfs Compact cycle {cycles + 1}: temporarily shrinking from "
+                    f"{original_size / (1024**3):.2f} GiB to {target / (1024**3):.2f} GiB.",
+                    flush=True,
+                )
+                shrunk = False
                 try:
-                    fcntl.ioctl(fd, BTRFS_IOC_BALANCE_V2, request, True)
+                    _btrfs_resize(fd, devid, target)
+                    shrunk = True
+                    restored = False
+                    if hasattr(os, "syncfs"):
+                        os.syncfs(fd)
+                    new_gaps, new_highwater, new_allocated, new_largest, new_stats = _btrfs_layout(
+                        fd, original_size, devid
+                    )
+                    reduction = max(0, highwater - new_highwater)
+                    gap_reduction = max(
+                        0, sum(gap.length for gap in gaps) - sum(gap.length for gap in new_gaps)
+                    )
+                    total_reduction += reduction
+                    cycles += 1
+                    print(
+                        f"Btrfs Compact cycle {cycles}: chunk high-water byte "
+                        f"{highwater:,} -> {new_highwater:,}; internal chunk gaps reduced by "
+                        f"{gap_reduction / (1024**3):.2f} GiB.",
+                        flush=True,
+                    )
+                    highwater = new_highwater
+                    gaps = new_gaps
+                    allocated = new_allocated
+                    largest_chunk = new_largest
+                    stats = new_stats
                 except OSError as exc:
-                    if _stop_requested or exc.errno in (errno.ECANCELED, errno.EINTR):
-                        return EXIT_STOPPED
-                    if exc.errno in (errno.ENOSPC, errno.EBUSY):
+                    if exc.errno in (errno.ENOSPC, errno.EFBIG):
                         print(
-                            f"Btrfs balance could not relocate another high chunk: {os.strerror(exc.errno)}.",
+                            f"Btrfs could not reach the temporary {target / (1024**3):.2f} GiB "
+                            "boundary because insufficient relocation workspace remained. "
+                            "No tighter boundary will be attempted.",
                             flush=True,
                         )
                         break
-                    raise
-                moved_chunks += 1
-                if hasattr(os, "syncfs"):
-                    os.syncfs(fd)
-                total, devid, gaps, highwater, allocated = _btrfs_layout(device)
-                remaining = sum(gap.length for gap in gaps)
-                next_gap_start = gaps[0].start if gaps else highwater
-                progressed = (
-                    remaining < previous_gap_bytes
-                    or next_gap_start > previous_gap_start
-                    or highwater < previous_highwater
-                )
-                no_progress = 0 if progressed else no_progress + 1
-                previous_gap_bytes = remaining
-                previous_gap_start = next_gap_start
-                previous_highwater = highwater
-                reduced = max(0, initial_gap_bytes - remaining)
-                percent = min(100.0, 100.0 * reduced / max(1, initial_gap_bytes))
+                    if _stop_requested and exc.errno in (errno.EINTR, errno.ECANCELED):
+                        return EXIT_STOPPED
+                    raise CompactError(f"Btrfs resize failed: {os.strerror(exc.errno)}") from exc
+                finally:
+                    if shrunk:
+                        try:
+                            _btrfs_resize(fd, devid, original_size)
+                            if hasattr(os, "syncfs"):
+                                os.syncfs(fd)
+                            restored = True
+                        except OSError as grow_exc:
+                            restored = False
+                            raise CompactError(
+                                "Btrfs data relocation completed but restoring the original "
+                                f"filesystem size failed: {os.strerror(grow_exc.errno)}"
+                            ) from grow_exc
+
+                if not gaps or total_reduction <= 0:
+                    break
+
+            final_gaps, final_highwater, _final_allocated, _largest, final_stats = _btrfs_layout(
+                fd, original_size, devid
+            )
+            final_gap_bytes = sum(gap.length for gap in final_gaps)
+            actual_reduction = max(0, initial_highwater - final_highwater)
+            print(
+                f"Btrfs Compact completed {cycles} shrink-and-restore cycle(s). Chunk "
+                f"high-water byte {initial_highwater:,} -> {final_highwater:,}, a physical "
+                f"tail reduction of {actual_reduction / (1024**3):.2f} GiB.",
+                flush=True,
+            )
+            print(
+                f"Internal chunk gaps: {initial_gap_bytes / (1024**3):.2f} GiB -> "
+                f"{final_gap_bytes / (1024**3):.2f} GiB. Final layout required "
+                f"{final_stats.get('tree_search_calls', 0):,} kernel tree-search calls.",
+                flush=True,
+            )
+            if actual_reduction == 0:
                 print(
-                    f"Btrfs Compact: completed {moved_chunks} balance transaction(s); "
-                    f"chunk high-water byte {highwater:,}; internal chunk gaps "
-                    f"{remaining / (1024**3):.2f} GiB.", flush=True
+                    "No effective Btrfs physical compaction was achieved; the kernel could "
+                    "not move the current chunk boundary lower without more workspace.",
+                    flush=True,
                 )
-                print(f"{percent:.2f} percent completed", flush=True)
-            if not gaps:
-                print("Btrfs Compact packed all allocated chunks into one physical prefix.", flush=True)
-            elif no_progress >= MAX_NO_PROGRESS:
+            elif final_gaps:
                 print(
-                    "Btrfs Compact stopped because the allocator made no further physical progress "
-                    f"for {MAX_NO_PROGRESS} balance transactions.", flush=True
+                    "Btrfs remains partially compacted because fixed or profile-constrained "
+                    "chunk allocations still separate some free physical ranges.",
+                    flush=True,
                 )
             else:
-                print("Btrfs Compact completed the available native balance work.", flush=True)
-            return 0
+                print("Btrfs physical chunks are packed with no internal gaps.", flush=True)
+            print("100.00 percent completed", flush=True)
+            return EXIT_STOPPED if _stop_requested else 0
         finally:
+            if not restored:
+                try:
+                    _btrfs_resize(fd, devid, original_size)
+                    if hasattr(os, "syncfs"):
+                        os.syncfs(fd)
+                except OSError:
+                    pass
             _active_btrfs_fd = None
             os.close(fd)
-
-
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Native kernel-journalled free-space compaction for ext4, XFS and Btrfs"
-    )
-    parser.add_argument("operation", choices=("compact",))
-    parser.add_argument("device")
-    parser.add_argument("--filesystem", required=True, choices=("ext4", "xfs", "btrfs"))
-    parser.add_argument("--write", action="store_true")
-    parser.add_argument("--confirm")
-    parser.add_argument("--journal")
-    parser.add_argument("--ram-buffer", default="auto")
-    parser.add_argument("--workers", default="auto")
-    parser.add_argument("--live-map-cells", type=int, default=0)
-    return parser.parse_args(argv)
-
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)

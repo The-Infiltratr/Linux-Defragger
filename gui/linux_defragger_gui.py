@@ -1230,8 +1230,9 @@ class MainWindow(Gtk.ApplicationWindow):
             )
         elif operation == "compact" and volume.normalized_fstype == "btrfs":
             extra_warning = (
-                "\n\nBtrfs Compact uses native one-chunk balance transactions to consolidate "
-                "physical chunk allocation. It does not run file defragmentation."
+                "\n\nBtrfs Compact temporarily shrinks the filesystem so the kernel "
+                "relocates high physical chunks into lower free chunk ranges, then restores "
+                "the exact original size. It does not run file defragmentation."
             )
         elif volume.normalized_fstype == "ntfs":
             if operation == "compact":

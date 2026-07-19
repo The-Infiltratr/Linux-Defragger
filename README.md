@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-25
+# Linux Defragger 1.8.0-26
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT/exFAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -53,7 +53,7 @@ During ext4/XFS Compact, each completed exchange sends a physical source/destina
 
 EXT filesystems contain fixed structures distributed through block groups. The analyser marks known superblock/descriptor areas, block and inode bitmaps, inode tables, and low-numbered system-inode allocations as **Bad/reserved**, while directory extents remain purple. These allocations can remain as islands inside the free tail because the online regular-file extent-exchange interface cannot relocate them. Compact therefore packs all movable regular-file data as low as those fixed structures permit rather than claiming that every allocated block can be made contiguous.
 
-Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It uses filtered native balance transactions to relocate high physical chunks into lower unallocated device gaps. It never invokes the file-defragmentation ioctl. The engine measures the physical chunk layout after each balance transaction and stops if the allocator no longer moves the boundary.
+Btrfs Compact is necessarily different because allocated extents are copy-on-write and back-referenced. It reads the live chunk tree through the kernel, temporarily shrinks the single-device filesystem so high chunks must relocate below the temporary boundary, and then restores the original filesystem size. It never invokes the file-defragmentation ioctl. Analyse also uses the kernel tree-search interface on real block devices, avoiding stale raw-tree snapshots and repeated small block reads.
 
 ### FAT and exFAT Compact semantics
 

@@ -10,8 +10,17 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
+import ctypes
+import errno
+import fcntl
+import os
 import stat
+import struct
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
 
 from .base import *
 
@@ -60,6 +69,41 @@ _STRIPED_PROFILES = _BLOCK_GROUP_RAID0 | _BLOCK_GROUP_RAID10 | _BLOCK_GROUP_RAID
 
 _MAX_TREE_LEVEL = 8
 _MAX_TREE_BLOCKS = 8_000_000
+
+# Kernel tree-search ABI.  Physical block-device analysis uses this interface
+# whenever possible so a mounted Btrfs filesystem supplies one coherent
+# transaction snapshot instead of requiring millions of small raw reads.
+_IOC_NRBITS = 8
+_IOC_TYPEBITS = 8
+_IOC_SIZEBITS = 14
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
+_IOC_WRITE = 1
+_IOC_READ = 2
+_SEARCH_KEY_SIZE = 104
+_SEARCH_ARGS_V2_SIZE = 112
+_SEARCH_HEADER = struct.Struct("=QQQII")
+_SEARCH_BUFFER = 4 * 1024 * 1024
+_U64_MAX = (1 << 64) - 1
+
+
+def _ioc(direction: int, kind: int, number: int, size: int) -> int:
+    return (
+        (direction << _IOC_DIRSHIFT)
+        | (kind << _IOC_TYPESHIFT)
+        | (number << _IOC_NRSHIFT)
+        | (size << _IOC_SIZESHIFT)
+    )
+
+
+BTRFS_IOC_TREE_SEARCH_V2 = _ioc(_IOC_READ | _IOC_WRITE, 0x94, 17, _SEARCH_ARGS_V2_SIZE)
+MS_RDONLY = 1
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_NOEXEC = 8
+MS_NOATIME = 1024
 
 
 @dataclass(frozen=True)
@@ -245,12 +289,19 @@ class _TreeReader:
         self.mapper = mapper
         self.nodesize = nodesize
         self.blocks_read = 0
+        self._block_cache: dict[int, bytes] = {}
 
     def block(self, logical: int, expected_level: int | None = None) -> bytes:
         if logical <= 0 or logical % self.nodesize:
             raise BackendError("invalid Btrfs tree-block address")
-        physical = self.mapper.read_physical(logical, self.nodesize)
-        raw = self.reader.read(physical, self.nodesize)
+        raw = self._block_cache.get(logical)
+        if raw is None:
+            physical = self.mapper.read_physical(logical, self.nodesize)
+            raw = self.reader.read(physical, self.nodesize)
+            self._block_cache[logical] = raw
+            self.blocks_read += 1
+            if self.blocks_read > _MAX_TREE_BLOCKS:
+                raise BackendError("Btrfs tree traversal exceeded the safety limit")
         if u64le(raw, 48) != logical:
             raise BackendError("Btrfs tree-block bytenr mismatch")
         level = raw[100]
@@ -260,9 +311,6 @@ class _TreeReader:
         element_size = _ITEM_SIZE if level == 0 else _KEY_PTR_SIZE
         if _HEADER_SIZE + nritems * element_size > self.nodesize:
             raise BackendError("invalid Btrfs tree item count")
-        self.blocks_read += 1
-        if self.blocks_read > _MAX_TREE_BLOCKS:
-            raise BackendError("Btrfs tree traversal exceeded the safety limit")
         return raw
 
     def walk(self, root: int, root_level: int) -> tuple[list[_TreeItem], list[int]]:
@@ -465,6 +513,346 @@ def _scan_filesystem_trees(tree_reader: _TreeReader, roots: dict[int, tuple[int,
     }
 
 
+class _KernelTreeSearch:
+    """Small TREE_SEARCH_V2 reader for a coherent kernel transaction view."""
+
+    def __init__(self, fd: int, buffer_size: int = _SEARCH_BUFFER):
+        self.fd = fd
+        self.buffer_size = max(64 * 1024, buffer_size)
+        self.calls = 0
+        self.items_returned = 0
+        self.payload_bytes = 0
+
+    def items(self, tree_id: int, item_type: int,
+              min_objectid: int = 0, max_objectid: int = _U64_MAX) -> Iterator[_TreeItem]:
+        min_offset = 0
+        current_objectid = min_objectid
+        while current_objectid <= max_objectid:
+            request = bytearray(_SEARCH_ARGS_V2_SIZE + self.buffer_size)
+            struct.pack_into(
+                "=QQQQQQQIIIIQQQQ", request, 0,
+                tree_id,
+                current_objectid,
+                max_objectid,
+                min_offset,
+                _U64_MAX,
+                0,
+                _U64_MAX,
+                item_type,
+                item_type,
+                4096,
+                0,
+                0, 0, 0, 0,
+            )
+            struct.pack_into("=Q", request, _SEARCH_KEY_SIZE, self.buffer_size)
+            try:
+                fcntl.ioctl(self.fd, BTRFS_IOC_TREE_SEARCH_V2, request, True)
+            except OSError as exc:
+                if exc.errno == errno.EOVERFLOW:
+                    needed = u64le(request, _SEARCH_KEY_SIZE)
+                    if needed <= self.buffer_size or needed > 64 * 1024 * 1024:
+                        raise BackendError("invalid Btrfs tree-search buffer requirement") from exc
+                    self.buffer_size = int(needed)
+                    continue
+                raise BackendError(f"Btrfs kernel tree search failed: {os.strerror(exc.errno)}") from exc
+
+            self.calls += 1
+            nr_items = u32le(request, 64)
+            if nr_items == 0:
+                break
+            position = _SEARCH_ARGS_V2_SIZE
+            last_key: _Key | None = None
+            for _index in range(nr_items):
+                if position + _SEARCH_HEADER.size > len(request):
+                    raise BackendError("truncated Btrfs tree-search header")
+                _transid, objectid, offset, returned_type, length = _SEARCH_HEADER.unpack_from(
+                    request, position
+                )
+                position += _SEARCH_HEADER.size
+                end = position + length
+                if end > len(request):
+                    raise BackendError("truncated Btrfs tree-search payload")
+                if returned_type != item_type:
+                    raise BackendError("Btrfs tree search returned an unexpected item type")
+                item_key = _Key(objectid, returned_type, offset)
+                payload = bytes(request[position:end])
+                position = end
+                last_key = item_key
+                self.items_returned += 1
+                self.payload_bytes += length
+                yield _TreeItem(item_key, payload)
+
+            if last_key is None:
+                break
+            if last_key.offset < _U64_MAX:
+                current_objectid = last_key.objectid
+                min_offset = last_key.offset + 1
+            elif last_key.objectid < max_objectid:
+                current_objectid = last_key.objectid + 1
+                min_offset = 0
+            else:
+                break
+
+
+def kernel_chunk_layout(fd: int, total_bytes: int, devid: int) -> tuple[_Mapper, list[tuple[int, int]], dict]:
+    """Return current physical chunk allocations from the mounted kernel view."""
+    search = _KernelTreeSearch(fd)
+    chunks = [
+        _parse_chunk(item.data, item.key.offset)
+        for item in search.items(3, _CHUNK_ITEM)
+    ]
+    if not chunks:
+        raise BackendError("Btrfs chunk tree contains no chunk items")
+    mapper = _Mapper(chunks, devid, total_bytes)
+    physical: list[tuple[int, int]] = []
+    for chunk in mapper.chunks:
+        for stripe_devid, stripe_offset in chunk.stripes:
+            if stripe_devid == devid:
+                physical.append((stripe_offset, stripe_offset + chunk.length))
+    return mapper, _merge_ranges(physical), {
+        "tree_search_calls": search.calls,
+        "tree_search_items": search.items_returned,
+        "tree_search_payload_bytes": search.payload_bytes,
+    }
+
+
+def _decode_mount_field(value: str) -> str:
+    return (value.replace("\\040", " ").replace("\\011", "\t")
+            .replace("\\012", "\n").replace("\\134", "\\"))
+
+
+def _existing_btrfs_mount(path: str) -> str | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISBLK(st.st_mode):
+        return None
+    dev_number = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10 or fields[2] != dev_number:
+            continue
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if separator + 1 < len(fields) and fields[separator + 1] == "btrfs":
+            return _decode_mount_field(fields[4])
+    return None
+
+
+@contextlib.contextmanager
+def _mounted_for_analysis(path: str) -> Iterator[str]:
+    existing = _existing_btrfs_mount(path)
+    if existing is not None:
+        yield existing
+        return
+
+    st = os.stat(path)
+    if not stat.S_ISBLK(st.st_mode):
+        raise BackendError("kernel Btrfs analysis requires a block device")
+    base = Path("/run/linux-defragger")
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mountpoint = tempfile.mkdtemp(prefix="analyse-btrfs-", dir=str(base))
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                           ctypes.c_ulong, ctypes.c_void_p]
+    libc.mount.restype = ctypes.c_int
+    libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.umount2.restype = ctypes.c_int
+    flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME
+    mounted = False
+    try:
+        for options in (b"nologreplay", b""):
+            if libc.mount(path.encode(), mountpoint.encode(), b"btrfs", flags,
+                          ctypes.c_char_p(options)) == 0:
+                mounted = True
+                break
+            err = ctypes.get_errno()
+            if err not in (errno.EINVAL, errno.ENOTSUP):
+                break
+        if not mounted:
+            raise BackendError(
+                f"unable to mount Btrfs read-only for fast analysis: {os.strerror(err)}"
+            )
+        yield mountpoint
+    finally:
+        if mounted:
+            libc.umount2(mountpoint.encode(), 0)
+        try:
+            Path(mountpoint).rmdir()
+        except OSError:
+            pass
+
+
+def _kernel_scan_filesystem_trees(search: _KernelTreeSearch,
+                                  roots: dict[int, tuple[int, int, int]],
+                                  mapper: _Mapper) -> dict:
+    regular_files = directories = fragmented_files = 0
+    malformed_items = 0
+    fragmented_physical: list[tuple[int, int]] = []
+    root_ids = [
+        objectid for objectid, (_bytenr, _level, refs) in roots.items()
+        if refs and (objectid == _FS_TREE_OBJECTID or objectid >= _FIRST_FREE_OBJECTID)
+    ]
+
+    for objectid in sorted(root_ids):
+        inode_modes: dict[int, int] = {}
+        file_runs: dict[int, list[_FileRun]] = {}
+        try:
+            for item in search.items(objectid, _INODE_ITEM):
+                if len(item.data) >= 56:
+                    inode_modes[item.key.objectid] = stat.S_IFMT(u32le(item.data, 52))
+            for item in search.items(objectid, _EXTENT_DATA):
+                if len(item.data) < 21:
+                    continue
+                extent_type = item.data[20]
+                if extent_type == _FILE_EXTENT_INLINE:
+                    continue
+                if extent_type not in (_FILE_EXTENT_REG, _FILE_EXTENT_PREALLOC) or len(item.data) < 53:
+                    malformed_items += 1
+                    continue
+                disk_bytenr = u64le(item.data, 21)
+                disk_num_bytes = u64le(item.data, 29)
+                extent_offset = u64le(item.data, 37)
+                num_bytes = u64le(item.data, 45)
+                if disk_bytenr == 0 or num_bytes == 0:
+                    continue
+                encoded = bool(item.data[16] or item.data[17] or u16le(item.data, 18))
+                logical_cursor = item.key.offset
+                if encoded:
+                    physical_ranges = mapper.physical_ranges(disk_bytenr, disk_num_bytes)
+                else:
+                    physical_ranges = mapper.physical_ranges(disk_bytenr + extent_offset, num_bytes)
+                for start, end in physical_ranges:
+                    run_length = end - start
+                    file_runs.setdefault(item.key.objectid, []).append(
+                        _FileRun(logical_cursor, start, run_length, start, run_length, encoded)
+                    )
+                    logical_cursor += run_length
+        except BackendError:
+            malformed_items += 1
+            continue
+
+        for inode, mode in inode_modes.items():
+            if mode == stat.S_IFREG:
+                regular_files += 1
+                runs = _coalesce_file_runs(file_runs.get(inode, []))
+                if len(runs) > 1:
+                    fragmented_files += 1
+                    fragmented_physical.extend(
+                        (run.disk_start, run.disk_start + run.disk_length) for run in runs
+                    )
+            elif mode == stat.S_IFDIR:
+                directories += 1
+
+    return {
+        "regular_files": regular_files,
+        "directories": directories,
+        "fragmented_files": fragmented_files,
+        "fragmented_directories": 0,
+        "fragmentation_percent": 100.0 * fragmented_files / max(1, regular_files),
+        "fragmented_ranges": _merge_ranges(fragmented_physical),
+        "filesystem_roots_scanned": len(root_ids),
+        "malformed_items": malformed_items,
+    }
+
+
+def _kernel_map(path: str, cells: int) -> dict:
+    with Reader(path) as reader:
+        superblock = reader.read(_SUPER_OFFSET, _SUPER_SIZE)
+    if superblock[0x40:0x48] != _BTRFS_MAGIC:
+        raise BackendError("not a Btrfs volume")
+    total_bytes = u64le(superblock, 112)
+    bytes_used_logical = u64le(superblock, 120)
+    num_devices = u64le(superblock, 136)
+    sectorsize = u32le(superblock, 144)
+    nodesize = u32le(superblock, 148)
+    devid = u64le(superblock, 201)
+    if num_devices != 1:
+        raise BackendError("native exact Btrfs analysis currently supports single-device filesystems only")
+
+    with _mounted_for_analysis(path) as mountpoint:
+        fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            search = _KernelTreeSearch(fd)
+            chunk_items = list(search.items(3, _CHUNK_ITEM))
+            chunks = [_parse_chunk(item.data, item.key.offset) for item in chunk_items]
+            mapper = _Mapper(chunks, devid, total_bytes)
+            root_items = list(search.items(1, _ROOT_ITEM))
+            roots = _root_records(root_items)
+
+            used_bytes_ranges: list[tuple[int, int]] = []
+            for item_type in (_EXTENT_ITEM, _METADATA_ITEM):
+                for item in search.items(_EXTENT_TREE_OBJECTID, item_type):
+                    length = item.key.offset if item_type == _EXTENT_ITEM else nodesize
+                    if item.key.objectid and length:
+                        used_bytes_ranges.extend(mapper.physical_ranges(item.key.objectid, length))
+
+            for mirror in (64 * 1024, 64 * 1024 * 1024, 256 * 1024**3):
+                if mirror + _SUPER_SIZE <= total_bytes:
+                    used_bytes_ranges.append((mirror, mirror + _SUPER_SIZE))
+
+            used_units = _merge_ranges([
+                (start // sectorsize, (end + sectorsize - 1) // sectorsize)
+                for start, end in used_bytes_ranges
+            ])
+            total_units = (total_bytes + sectorsize - 1) // sectorsize
+            used_units = [
+                (max(0, start), min(total_units, end)) for start, end in used_units
+                if start < total_units and end > 0
+            ]
+            free_units = _complement(total_units, used_units)
+            ranges = [(start, end, 0) for start, end in free_units]
+            ranges.extend((start, end, 1) for start, end in used_units)
+
+            result = aggregate_ranges(
+                total_units, cells, sectorsize, "btrfs", ranges, "exact-single-device",
+                {
+                    "sector_size": sectorsize,
+                    "node_size": nodesize,
+                    "device_id": devid,
+                    "chunks": len(mapper.chunks),
+                    "logical_bytes_used": bytes_used_logical,
+                    "analysis_source": "kernel-tree-search-v2",
+                },
+            )
+            summary = _kernel_scan_filesystem_trees(search, roots, mapper)
+            fragmented_units = _merge_ranges([
+                (start // sectorsize, (end + sectorsize - 1) // sectorsize)
+                for start, end in summary["fragmented_ranges"]
+            ])
+            fragmented_mapped = _overlay_ranges(result["cells"], fragmented_units, "fragmented")
+            result.update({
+                "regular_files": summary["regular_files"],
+                "directories": summary["directories"],
+                "fragmented_files": summary["fragmented_files"],
+                "fragmented_directories": summary["fragmented_directories"],
+                "fragmentation_percent": summary["fragmentation_percent"],
+            })
+            result["details"].update({
+                "fragmentation_available": True,
+                "fragmentation_basis": "kernel TREE_SEARCH_V2 inode and FILE_EXTENT_ITEM records",
+                "directory_fragmentation_note": (
+                    "Btrfs directory records share filesystem-tree blocks and do not form private block chains"
+                ),
+                "filesystem_roots_scanned": summary["filesystem_roots_scanned"],
+                "malformed_items": summary["malformed_items"],
+                "fragmented_sectors_mapped": fragmented_mapped,
+                "tree_search_calls": search.calls,
+                "tree_search_items": search.items_returned,
+                "tree_search_payload_bytes": search.payload_bytes,
+            })
+            return result
+        finally:
+            os.close(fd)
+
+
 class BtrfsBackend:
     info = INFO
 
@@ -473,6 +861,17 @@ class BtrfsBackend:
             return reader.read(_SUPER_OFFSET + 0x40, 8) == _BTRFS_MAGIC
 
     def map(self, path: str, cells: int) -> dict:
+        # Real block devices are analysed through the mounted kernel tree-search
+        # interface.  It is both substantially faster and transaction-consistent.
+        # Regular-file images retain the raw walker for deterministic tests and
+        # offline forensic use.
+        try:
+            mode = os.stat(path).st_mode
+        except OSError as exc:
+            raise BackendError(str(exc)) from exc
+        if stat.S_ISBLK(mode) and os.geteuid() == 0:
+            return _kernel_map(path, cells)
+
         with Reader(path) as reader:
             superblock = reader.read(_SUPER_OFFSET, _SUPER_SIZE)
             if superblock[0x40:0x48] != _BTRFS_MAGIC:

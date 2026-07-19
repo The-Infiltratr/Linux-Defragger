@@ -25,16 +25,24 @@ def test_ioctl_layouts():
     assert n.FS_IOC_FSGETXATTR == 2149341215
     assert n.XFS_IOC_EXCHANGE_RANGE == 1076385921
     assert n.EXT4_IOC_MOVE_EXT == 3223873039
-    assert n.BTRFS_IOC_BALANCE_V2 == 3288372256
-    assert n.BTRFS_IOC_BALANCE_CTL == 1074041889
-    assert len(n._balance_request(7, 4096, 8192)) == 1024
-    request = n._balance_request(7, 4096, 8192)
-    assert struct.unpack_from('=Q', request, 0)[0] == 7
-    for offset in (16, 152, 288):
-        assert struct.unpack_from('=Q', request, offset + 16)[0] == 7
-        assert struct.unpack_from('=Q', request, offset + 24)[0] == 4096
-        assert struct.unpack_from('=Q', request, offset + 32)[0] == 8192
-        assert struct.unpack_from('=Q', request, offset + 72)[0] == 1
+    assert n.BTRFS_IOC_RESIZE == 1342215171
+    captured = {}
+    original = n.fcntl.ioctl
+    def fake_ioctl(fd, request_code, request, mutate=True):
+        captured['fd'] = fd
+        captured['request_code'] = request_code
+        captured['amount'] = bytes(request[8:]).split(b'\0', 1)[0]
+        return 0
+    try:
+        n.fcntl.ioctl = fake_ioctl
+        n._btrfs_resize(17, 7, 123456789)
+    finally:
+        n.fcntl.ioctl = original
+    assert captured == {
+        'fd': 17,
+        'request_code': n.BTRFS_IOC_RESIZE,
+        'amount': b'7:123456789',
+    }
 
 
 def test_tail_source_selection_and_partial_suffix():
@@ -206,6 +214,16 @@ def test_extent_compactor_repeats_until_fixed_point_and_gui_applies_live_ranges(
     assert '@@LIVE_RANGE ' in engine
     assert 'range_prefix = "@@LIVE_RANGE "' in gui
     assert 'fragmentation recalculated at completion' in gui
+
+
+def test_btrfs_compact_uses_resize_not_balance():
+    source = (ROOT / 'gui' / 'native_compact_engine.py').read_text()
+    assert 'BTRFS_IOC_RESIZE' in source
+    assert 'BTRFS_IOC_BALANCE_V2' not in source
+    assert 'online shrink-and-restore transaction' in source
+    targets = n._candidate_shrink_targets(15 * 1024**3, 1024**3, 22 * 1024**3)
+    assert targets and all(15 * 1024**3 < value < 22 * 1024**3 for value in targets)
+    assert targets == sorted(targets, reverse=True)
 
 
 if __name__ == '__main__':
