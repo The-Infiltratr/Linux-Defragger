@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #define PROGRAM_NAME "linux-defragger-engine"
-#define PROGRAM_VERSION "1.8.0-15"
+#define PROGRAM_VERSION "1.8.0-16"
 #define FAT32_MASK UINT32_C(0x0FFFFFFF)
 #define FAT32_EOC_MIN UINT32_C(0x0FFFFFF8)
 #define FAT32_BAD UINT32_C(0x0FFFFFF7)
@@ -2256,6 +2256,8 @@ typedef struct {
     size_t compact_transactions;
     size_t reserve_clusters;
     unsigned applied_percent;
+    bool interrupted;
+    bool layout_started;
 } GrowthStats;
 
 static void growth_object_list_push(GrowthObjectList *list, GrowthObject object) {
@@ -2519,14 +2521,23 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
     CompactStats compact_stats = compact_volume(fs, journal_path, 0, batch_clusters, 0);
     stats.compact_clusters = compact_stats.clusters_moved;
     stats.compact_transactions = compact_stats.transactions;
-    fprintf(stderr,
-            "Growth Defrag phase 1 complete: %zu cluster%s moved in %zu transaction%s.\n",
-            compact_stats.clusters_moved, compact_stats.clusters_moved == 1 ? "" : "s",
-            compact_stats.transactions, compact_stats.transactions == 1 ? "" : "s");
     if (g_stop_requested) {
-        fprintf(stderr, "interrupt requested; growth layout was not started after compaction\n");
+        stats.interrupted = true;
+        fprintf(stderr,
+                "Growth Defrag stopped safely during preparation after moving %zu cluster%s "
+                "in %zu completed transaction%s.\n",
+                compact_stats.clusters_moved,
+                compact_stats.clusters_moved == 1 ? "" : "s",
+                compact_stats.transactions,
+                compact_stats.transactions == 1 ? "" : "s");
+        fprintf(stderr,
+                "The growth-space layout was not started, so no expansion gaps were applied.\n");
         return stats;
     }
+    fprintf(stderr,
+            "Growth Defrag preparation complete: %zu cluster%s moved in %zu transaction%s.\n",
+            compact_stats.clusters_moved, compact_stats.clusters_moved == 1 ? "" : "s",
+            compact_stats.transactions, compact_stats.transactions == 1 ? "" : "s");
 
     DirRefList refs = {0};
     FileList files = scan_files(fs, &refs);
@@ -2556,6 +2567,7 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
     }
     stats.applied_percent = applied_percent;
     stats.reserve_clusters = reserve_total;
+    stats.layout_started = true;
     fprintf(stderr,
             "Growth Defrag phase 2: %zu regular file%s, %zu director%s, %u%% growth reserve (%zu clusters).\n",
             regular_files, regular_files == 1 ? "" : "s",
@@ -2569,7 +2581,9 @@ static GrowthStats growth_defrag_volume(Fat32 *fs, const char *journal_path,
 
     for (size_t reverse = objects.len; reverse != 0; reverse--) {
         if (g_stop_requested) {
-            fprintf(stderr, "interrupt requested; stopping Growth Defrag between complete objects\n");
+            stats.interrupted = true;
+            fprintf(stderr,
+                    "Growth Defrag stopped safely during layout between complete objects.\n");
             break;
         }
         GrowthObject *object = &objects.v[reverse - 1];
@@ -3614,17 +3628,41 @@ int main(int argc, char **argv) {
         filelist_free(&files);
         dirreflist_free(&dir_refs);
         GrowthStats growth = growth_defrag_volume(&fs, journal_path, growth_percent, batch_clusters);
-        printf("Growth Defrag applied reserve: %u%% (%zu clusters)\n",
-               growth.applied_percent, growth.reserve_clusters);
-        printf("Growth Defrag compact phase:  %zu clusters in %zu transaction%s\n",
-               growth.compact_clusters, growth.compact_transactions,
-               growth.compact_transactions == 1 ? "" : "s");
-        printf("Growth Defrag layout phase:   %zu file%s and %zu director%s repositioned\n",
-               growth.files_moved, growth.files_moved == 1 ? "" : "s",
-               growth.directories_moved, growth.directories_moved == 1 ? "y" : "ies");
-        printf("Growth Defrag layout I/O:     %zu clusters in %zu transaction%s\n",
-               growth.clusters_copied, growth.transactions,
-               growth.transactions == 1 ? "" : "s");
+        if (growth.interrupted && !growth.layout_started) {
+            printf("Growth Defrag status:          Stopped safely during preparation\n");
+            printf("Growth Defrag preparation:     %zu clusters in %zu completed transaction%s\n",
+                   growth.compact_clusters, growth.compact_transactions,
+                   growth.compact_transactions == 1 ? "" : "s");
+            printf("Growth Defrag reserve applied: No\n");
+            printf("Growth Defrag layout phase:    Not started\n");
+        } else if (growth.interrupted) {
+            printf("Growth Defrag status:          Stopped safely during layout\n");
+            printf("Growth Defrag preparation:     %zu clusters in %zu transaction%s\n",
+                   growth.compact_clusters, growth.compact_transactions,
+                   growth.compact_transactions == 1 ? "" : "s");
+            printf("Growth Defrag planned reserve: %u%% (%zu clusters)\n",
+                   growth.applied_percent, growth.reserve_clusters);
+            printf("Growth Defrag layout progress: %zu file%s and %zu director%s repositioned\n",
+                   growth.files_moved, growth.files_moved == 1 ? "" : "s",
+                   growth.directories_moved, growth.directories_moved == 1 ? "y" : "ies");
+            printf("Growth Defrag layout I/O:      %zu clusters in %zu completed transaction%s\n",
+                   growth.clusters_copied, growth.transactions,
+                   growth.transactions == 1 ? "" : "s");
+            printf("Growth Defrag reserve applied: Partial; the requested layout is incomplete\n");
+        } else {
+            printf("Growth Defrag status:          Completed\n");
+            printf("Growth Defrag applied reserve: %u%% (%zu clusters)\n",
+                   growth.applied_percent, growth.reserve_clusters);
+            printf("Growth Defrag compact phase:   %zu clusters in %zu transaction%s\n",
+                   growth.compact_clusters, growth.compact_transactions,
+                   growth.compact_transactions == 1 ? "" : "s");
+            printf("Growth Defrag layout phase:    %zu file%s and %zu director%s repositioned\n",
+                   growth.files_moved, growth.files_moved == 1 ? "" : "s",
+                   growth.directories_moved, growth.directories_moved == 1 ? "y" : "ies");
+            printf("Growth Defrag layout I/O:      %zu clusters in %zu transaction%s\n",
+                   growth.clusters_copied, growth.transactions,
+                   growth.transactions == 1 ? "" : "s");
+        }
         files = scan_files(&fs, NULL);
         print_analysis(&fs, &files);
     } else if (strcmp(command, "compact") == 0) {
@@ -3664,5 +3702,5 @@ int main(int argc, char **argv) {
     free(g_live_map_previous);
     g_live_map_previous = NULL;
     free(journal_path);
-    return EXIT_SUCCESS;
+    return g_stop_requested ? 130 : EXIT_SUCCESS;
 }

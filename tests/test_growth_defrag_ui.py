@@ -17,4 +17,8 @@ assert 'Gtk.Button.new_with_label("Growth Defrag")' in gui
 assert 'self.start_mutation("growth-defrag")' in gui
 assert '"--growth-percent", "10"' in gui
 assert '"growth-defrag"' in helper
+assert 'stopped_safely = returncode == 130' in gui
+assert 'self.progress.set_text("Stopped safely")' in gui
+assert 'Growth Defrag stopped safely · allocation map refreshed' not in gui
+assert 'f"{display_name} stopped safely · allocation map refreshed"' in gui
 print("FAT Growth Defrag GUI wiring test passed")

@@ -44,7 +44,7 @@ except (ImportError, ValueError) as exc:
 APP_ID = "io.github.linuxdefragger"
 APP_NAME = "Linux Defragger"
 BASE_VERSION = "1.8.0"
-PACKAGE_REVISION = "15"
+PACKAGE_REVISION = "16"
 VERSION = f"{BASE_VERSION}-{PACKAGE_REVISION}"
 PROJECT_URL = "https://github.com/The-Infiltratr/Linux-Defragger"
 MIN_MAP_CELLS = 256
@@ -426,6 +426,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.busy = False
         self.pulse_id: int | None = None
         self.determinate_progress = False
+        self.post_analysis_status: str | None = None
         self.map_resize_timeout_id: int | None = None
         self.last_map_cell_target = 0
 
@@ -1077,6 +1078,11 @@ class MainWindow(Gtk.ApplicationWindow):
                             f"Analysis complete: {human_bytes(int(data['used_bytes']))} allocated, "
                             f"{human_bytes(int(data['free_bytes']))} free." + suffix
                         )
+            if self.post_analysis_status is not None:
+                self.status_label.set_text(self.post_analysis_status)
+                self.progress.set_fraction(1.0)
+                self.progress.set_text("Stopped safely")
+                self.post_analysis_status = None
 
         self._run_engine_with_permission_retry(args, "analysis", parsed)
 
@@ -1578,11 +1584,29 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.pulse_id is not None:
             GLib.source_remove(self.pulse_id)
             self.pulse_id = None
-        self.progress.set_fraction(1.0 if returncode == 0 else 0.0)
-        self.progress.set_text("Complete" if returncode == 0 else "Failed")
+        stopped_safely = returncode == 130
+        self.progress.set_fraction(1.0 if returncode == 0 or stopped_safely else 0.0)
+        self.progress.set_text(
+            "Stopped safely" if stopped_safely else ("Complete" if returncode == 0 else "Failed")
+        )
         self._update_controls()
         if raw_completion is not None:
             raw_completion(returncode, output)
+        elif stopped_safely:
+            display_name = {
+                "analysis": "Analysis",
+                "compact": "Compact",
+                "defrag": "Defragment",
+                "growth-defrag": "Growth Defrag",
+                "recover": "Recovery",
+            }.get(purpose, purpose.capitalize())
+            self.append_log(
+                f"{display_name} stopped safely. The active journalled transaction completed before exit."
+            )
+            self.status_label.set_text(f"{display_name} stopped safely.")
+            self.post_analysis_status = f"{display_name} stopped safely · allocation map refreshed"
+            if on_success:
+                on_success(output)
         elif returncode == 0:
             display_name = {
                 "analysis": "Analysis",

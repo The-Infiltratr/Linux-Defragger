@@ -171,9 +171,37 @@ grep -q 'Buffered data written:   8.0 MiB in 4 extents' "$TMP/batched-defrag.txt
 interrupt_pid=$!
 sleep 0.02
 kill -INT "$interrupt_pid" 2>/dev/null || true
+set +e
 wait "$interrupt_pid"
+interrupt_status=$?
+set -e
+test "$interrupt_status" -eq 130
 test ! -e "$TMP/interrupt.journal"
 "$BIN" analyze "$TMP/interrupt.img" >/dev/null
+
+"$ROOT/tests/make_interleaved_compact_image.py" "$TMP/growth-stop.img" >/dev/null
+set +e
+"$BIN" growth-defrag "$TMP/growth-stop.img" --write \
+  --confirm "$TMP/growth-stop.img" --growth-percent 10 --batch-clusters 16 \
+  --ram-buffer 64K --workers 1 >"$TMP/growth-stop.out" 2>"$TMP/growth-stop.err" &
+growth_stop_pid=$!
+sleep 0.01
+kill -INT "$growth_stop_pid" 2>/dev/null || true
+wait "$growth_stop_pid"
+growth_stop_status=$?
+set -e
+test "$growth_stop_status" -eq 130
+grep -q 'Growth Defrag stopped safely during preparation' "$TMP/growth-stop.err"
+grep -q 'The growth-space layout was not started, so no expansion gaps were applied.' \
+  "$TMP/growth-stop.err"
+grep -q 'Growth Defrag status:          Stopped safely during preparation' \
+  "$TMP/growth-stop.out"
+grep -q 'Growth Defrag reserve applied: No' "$TMP/growth-stop.out"
+grep -q 'Growth Defrag layout phase:    Not started' "$TMP/growth-stop.out"
+! grep -q 'phase 1 complete' "$TMP/growth-stop.err"
+! grep -q 'Growth Defrag applied reserve: 0%' "$TMP/growth-stop.out"
+test ! -e "$TMP/growth-stop.img.linux-defragger.journal"
+"$BIN" analyze "$TMP/growth-stop.img" >/dev/null
 
 for fat_kind in fat12 fat16; do
   "$ROOT/tests/make_fat12_16_image.py" "$fat_kind" "$TMP/growth-$fat_kind.img" fragmented >/dev/null

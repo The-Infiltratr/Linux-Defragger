@@ -1,4 +1,4 @@
-# Linux Defragger 1.8.0-15
+# Linux Defragger 1.8.0-16
 
 Linux Defragger provides graphical allocation maps, fragmentation analysis, offline free-space compaction, file defragmentation, FAT growth-space layouts and journalled recovery for supported filesystems.
 
@@ -55,3 +55,9 @@ The current native writer deliberately leaves NTFS system files and directories,
 ## Interface
 
 The title bar, engine/GUI build label and About dialog show the complete package revision. The File menu provides image opening, volume refresh and Quit. The About menu provides program, author, version and project information. The Growth Defrag button is enabled only when the selected backend advertises the FAT growth-layout capability.
+
+## Safe stopping
+
+A Stop request finishes the active journalled transaction and exits between complete transactions or complete Growth Defrag objects. The engine returns status `130` for this deliberate safe stop. The GTK interface treats that status as **Stopped safely**, refreshes the allocation map and does not claim that the interrupted operation completed.
+
+If Growth Defrag is stopped during its preparation compaction, no growth-space layout has begun and no expansion gaps have been applied. If it is stopped during layout, only the complete objects reported in the summary have been repositioned and the requested reserve layout is explicitly marked partial.
