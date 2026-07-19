@@ -197,6 +197,15 @@ def current_data_run(path: Path) -> tuple[int, int]:
     return int(runs[0].lcn), runs[0].length
 
 
+def current_data_payload(path: Path, length: int) -> bytes:
+    runs = current_data_runs(path)
+    volume = ntfs_engine._open_volume(str(path), False)
+    try:
+        return ntfs_engine._read_stream(volume, runs, 0, length)
+    finally:
+        ntfs_engine._close_volume(volume)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="linux-defragger-native-ntfs-") as directory:
         tmp = Path(directory)
@@ -208,13 +217,17 @@ def main() -> None:
         ntfs_engine._stop_requested = False
         assert ntfs_engine.compact(str(image), journal) == 0
         assert not journal.exists()
-        destination, count = current_data_run(image)
-        assert count == DATA_CLUSTERS and destination < DATA_LCN
-        actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
+        runs = current_data_runs(image)
+        assert sum(run.length for run in runs) == DATA_CLUSTERS
+        assert all(run.lcn is not None and run.lcn < DATA_LCN for run in runs)
+        actual = current_data_payload(image, len(payload))
         assert hashlib.sha256(actual).hexdigest() == expected
         raw = image.read_bytes()
         bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
-        assert all(bitmap[c >> 3] & (1 << (c & 7)) for c in range(destination, destination + count))
+        assert all(
+            bitmap[c >> 3] & (1 << (c & 7))
+            for run in runs for c in range(int(run.lcn), int(run.lcn) + run.length)
+        )
         assert all(not (bitmap[c >> 3] & (1 << (c & 7))) for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
 
         # No single lower hole is large enough for the file.  The high-water
@@ -240,25 +253,24 @@ def main() -> None:
         bitmap = raw[BITMAP_LCN * CLUSTER_SIZE:(BITMAP_LCN + 1) * CLUSTER_SIZE]
         assert all(not (bitmap[c >> 3] & (1 << (c & 7)))
                    for c in range(DATA_LCN, DATA_LCN + DATA_CLUSTERS))
-        assert "1 transactions and 16 clusters" in captured.getvalue()
+        assert "3 transactions and moved 16 clusters" in captured.getvalue()
 
-        # An immovable object above an ordinary file must be diagnosed before
-        # any unrelated lower file is moved.  This models the real-world case
-        # where $MFTMirr fixes the high-water boundary near mid-volume.
+        # An immovable high object must no longer prevent unrelated movable
+        # data from filling lower gaps.  The boundary remains fixed by
+        # $MFTMirr, but the packed prefix advances and the payload is intact.
         payload = make_image(image, high_mftmirr_blocker=True)
-        before_run = current_data_run(image)
+        before_runs = current_data_runs(image)
         captured = io.StringIO()
         ntfs_engine._stop_requested = False
         with contextlib.redirect_stdout(captured):
             assert ntfs_engine.compact(str(image), journal) == 0
-        assert current_data_run(image) == before_run
-        assert hashlib.sha256(payload).hexdigest() == hashlib.sha256(
-            image.read_bytes()[DATA_LCN * CLUSTER_SIZE:(DATA_LCN + DATA_CLUSTERS) * CLUSTER_SIZE]
-        ).hexdigest()
+        after_runs = current_data_runs(image)
+        assert after_runs != before_runs
+        assert hashlib.sha256(current_data_payload(image, len(payload))).hexdigest() == hashlib.sha256(payload).hexdigest()
         report = captured.getvalue()
-        assert "moved 0 file streams" in report
-        assert "No effective NTFS volume compaction was achieved" in report
-        assert "Compaction limited by $MFTMirr $DATA" in report
+        assert "used 1 file streams" in report
+        assert "Allocated high-water mark: cluster 3,807 -> 3,807" in report
+        assert "Lowest internal free gap advanced" in report
 
         # Simulate a crash after metadata switched but before old clusters were
         # released. Recovery must complete forward and retain the payload.
@@ -287,8 +299,7 @@ def main() -> None:
         finally:
             ntfs_engine._close_volume(volume)
         assert ntfs_engine.recover(str(image), journal) == 0
-        destination, count = current_data_run(image)
-        actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
+        actual = current_data_payload(image, len(payload))
         assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
 
         # Schema-3 recovery must also complete a partial move whose destination
@@ -383,8 +394,7 @@ def main() -> None:
         ntfs_engine._stop_requested = False
         assert ntfs_engine.compact(str(image), journal) == 0
         assert current_volume_flags(image) == 0x0080
-        destination, count = current_data_run(image)
-        actual = image.read_bytes()[destination * CLUSTER_SIZE:(destination + count) * CLUSTER_SIZE]
+        actual = current_data_payload(image, len(payload))
         assert hashlib.sha256(actual).hexdigest() == hashlib.sha256(payload).hexdigest()
 
         # The actual dirty bit is still a hard stop, and an unrecognised flag

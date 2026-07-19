@@ -6,11 +6,12 @@
 """Conservative native NTFS compaction.
 
 The engine relocates ordinary, uncompressed, non-sparse, non-encrypted unnamed
-file data streams from high clusters into lower free extents.  It can relocate
-only the high-water extent or a suffix of that extent, and may use several lower
-free extents when no single destination is large enough.  It edits only the
-stream's mapping pairs, the volume $Bitmap and the affected MFT record.  System
-files, directories and attribute-list streams are deliberately left untouched.
+file data streams from higher clusters into the lowest internal free extents.
+It repeatedly fills holes from the beginning of the volume, preferring complete
+physical extents and using safe suffix splits only when required.  It edits only
+the stream's mapping pairs, the volume $Bitmap and the affected MFT record.
+System files, directories and attribute-list streams are deliberately left
+untouched.
 
 Each stream move is a separate externally journalled transaction.  Destination
 clusters are copied first, then reserved in $Bitmap, then the MFT mapping pairs
@@ -194,6 +195,7 @@ class StreamInfo:
 class AllocationPlan:
     streams: dict[tuple[int, int], StreamInfo]
     heap: list[tuple[int, int, int, int]]
+    movable_heap: list[tuple[int, int, int, int]]
     movable_count: int
     malformed_records: int
     hibernation_active: bool
@@ -829,6 +831,58 @@ def _find_free_run(bitmap: bytes | bytearray, length: int, before: int) -> int |
     return None
 
 
+def _next_free_run(bitmap: bytes | bytearray, start: int, before: int) -> Run | None:
+    """Return the first free physical extent at or above *start*.
+
+    The scan uses whole-byte fast paths so a large mostly allocated prefix is
+    traversed once rather than one Python iteration per cluster.
+    """
+    limit = max(0, min(before, len(bitmap) * 8))
+    cluster = max(0, start)
+    while cluster < limit:
+        if cluster % 8 == 0 and cluster + 8 <= limit:
+            value = bitmap[cluster >> 3]
+            if value == 0xFF:
+                cluster += 8
+                continue
+            if value == 0x00:
+                break
+        if not _bit(bitmap, cluster):
+            break
+        cluster += 1
+    if cluster >= limit:
+        return None
+    run_start = cluster
+    while cluster < limit:
+        if cluster % 8 == 0 and cluster + 8 <= limit:
+            value = bitmap[cluster >> 3]
+            if value == 0x00:
+                cluster += 8
+                continue
+            if value == 0xFF:
+                break
+        if _bit(bitmap, cluster):
+            break
+        cluster += 1
+    return Run(run_start, cluster - run_start)
+
+
+def _free_gap_stats(bitmap: bytes | bytearray, before: int,
+                    start: int = 0) -> tuple[int, int, int | None]:
+    """Return (gap count, free clusters, first gap LCN) below *before*."""
+    count = 0
+    clusters = 0
+    first: int | None = None
+    cursor = max(0, start)
+    while (run := _next_free_run(bitmap, cursor, before)) is not None:
+        if first is None:
+            first = int(run.lcn)
+        count += 1
+        clusters += run.length
+        cursor = int(run.lcn) + run.length
+    return count, clusters, first
+
+
 def _coalesce_runs(runs: Iterable[Run]) -> tuple[Run, ...]:
     merged: list[Run] = []
     for run in runs:
@@ -1043,8 +1097,13 @@ def _scan_allocation_plan(layout: NtfsLayout) -> AllocationPlan:
 
     heap = [(-info.highest_lcn, info.record_number, info.attribute_offset, info.generation)
             for info in streams.values() if info.highest_lcn]
+    movable_heap = [
+        (-info.highest_lcn, info.record_number, info.attribute_offset, info.generation)
+        for info in streams.values() if info.movable and info.highest_lcn
+    ]
     heapq.heapify(heap)
-    return AllocationPlan(streams, heap, movable_count, malformed, hibernation)
+    heapq.heapify(movable_heap)
+    return AllocationPlan(streams, heap, movable_heap, movable_count, malformed, hibernation)
 
 
 def _heap_entry_current(plan: AllocationPlan, entry: tuple[int, int, int, int]) -> bool:
@@ -1056,6 +1115,11 @@ def _heap_entry_current(plan: AllocationPlan, entry: tuple[int, int, int, int]) 
 def _clean_plan_heap(plan: AllocationPlan) -> None:
     while plan.heap and not _heap_entry_current(plan, plan.heap[0]):
         heapq.heappop(plan.heap)
+
+
+def _clean_movable_heap(plan: AllocationPlan) -> None:
+    while plan.movable_heap and not _heap_entry_current(plan, plan.movable_heap[0]):
+        heapq.heappop(plan.movable_heap)
 
 
 def _owners_at_high_water(plan: AllocationPlan, high_water: int) -> tuple[int, list[StreamInfo]]:
@@ -1117,8 +1181,10 @@ def _update_moved_stream(plan: AllocationPlan, info: StreamInfo,
         generation=info.generation + 1,
     )
     plan.streams[updated.key] = updated
-    heapq.heappush(plan.heap, (-updated.highest_lcn, updated.record_number,
-                               updated.attribute_offset, updated.generation))
+    entry = (-updated.highest_lcn, updated.record_number,
+             updated.attribute_offset, updated.generation)
+    heapq.heappush(plan.heap, entry)
+    heapq.heappush(plan.movable_heap, entry)
     return updated
 
 
@@ -1205,6 +1271,158 @@ def _plan_extent_move(layout: NtfsLayout, candidate: Candidate,
             "the available space in the existing MFT record"
         )
     return best, ""
+
+
+def _highest_physical_run_index(runs: tuple[Run, ...]) -> int | None:
+    physical = [(int(run.lcn) + run.length, index)
+                for index, run in enumerate(runs) if run.lcn is not None and run.length]
+    if not physical:
+        return None
+    return max(physical)[1]
+
+
+def _plan_hole_fill_move(candidate: Candidate, hole: Run, *,
+                         allow_partial: bool = True) -> tuple[ExtentMove | None, str]:
+    """Plan a transaction that fills the beginning of one internal free gap.
+
+    Data is taken from the suffix of the stream's highest physical extent.  A
+    whole extent is preferred when it fits the gap because that normally keeps
+    the mapping-pair count unchanged.  A partial suffix is accepted only when
+    the regenerated runlist still fits in the existing MFT record.
+    """
+    if hole.lcn is None or hole.length <= 0:
+        return None, "the selected destination gap is invalid"
+    runs = tuple(candidate.attribute.runs)
+    source_index = _highest_physical_run_index(runs)
+    if source_index is None:
+        return None, "the stream has no physical extent"
+    source = runs[source_index]
+    if source.lcn is None:
+        return None, "the selected source extent is sparse"
+    hole_start = int(hole.lcn)
+    hole_end = hole_start + hole.length
+    source_start = int(source.lcn)
+    source_end = source_start + source.length
+    if source_start < hole_end:
+        return None, "the stream has no physical extent completely above the selected gap"
+
+    if not allow_partial and source.length > hole.length:
+        return None, "the complete source extent does not fit this gap"
+    maximum = min(hole.length, source.length)
+    # Try the largest useful suffix first.  If a partial split does not fit,
+    # smaller run-length encodings occasionally do; the geometric candidates
+    # avoid an O(n) search on very large extents.
+    attempts: list[int] = [maximum]
+    value = maximum
+    while value > 1:
+        value //= 2
+        if value not in attempts:
+            attempts.append(value)
+    if 1 not in attempts:
+        attempts.append(1)
+
+    capacity = _maximum_mapping_capacity(candidate)
+    best_reason = "the replacement mapping pairs do not fit the existing MFT record"
+    for take in attempts:
+        prefix = source.length - take
+        replacement: list[Run] = list(runs[:source_index])
+        if prefix:
+            replacement.append(Run(source_start, prefix))
+        replacement.append(Run(hole_start, take))
+        replacement.extend(runs[source_index + 1:])
+        new_runs = _coalesce_runs(replacement)
+        if len(_encode_runlist(new_runs)) > capacity:
+            continue
+        source_run = Run(source_end - take, take)
+        return ExtentMove((source_run,), (Run(hole_start, take),), new_runs), ""
+    return None, best_reason
+
+
+def _select_hole_source(layout: NtfsLayout, plan: AllocationPlan,
+                        hole: Run, *, max_attempts: int = 4096
+                        ) -> tuple[StreamInfo | None, Candidate | None,
+                                   ExtentMove | None, str]:
+    """Choose a safely movable extent above *hole*.
+
+    Whole physical extents are preferred because they do not unnecessarily
+    fragment a file.  Only when no suitable whole extent is found do we split a
+    suffix from a larger high extent.  Heap entries are restored afterward; the
+    selected stream's old entry becomes stale when its generation is updated.
+    """
+    held: list[tuple[int, int, int, int]] = []
+    hole_end = int(hole.lcn) + hole.length
+    reasons: dict[str, int] = {}
+    try:
+        while len(held) < max_attempts:
+            _clean_movable_heap(plan)
+            if not plan.movable_heap:
+                break
+            entry = heapq.heappop(plan.movable_heap)
+            if not _heap_entry_current(plan, entry):
+                continue
+            info = plan.streams[(entry[1], entry[2])]
+            if info.highest_lcn <= hole_end:
+                heapq.heappush(plan.movable_heap, entry)
+                break
+            held.append(entry)
+
+        def try_entries(*, allow_partial: bool) -> tuple[StreamInfo | None,
+                                                         Candidate | None,
+                                                         ExtentMove | None]:
+            for entry in held:
+                info = plan.streams[(entry[1], entry[2])]
+                index = _highest_physical_run_index(info.runs)
+                if index is None:
+                    continue
+                source = info.runs[index]
+                if source.lcn is None or int(source.lcn) < hole_end:
+                    continue
+                if not allow_partial and source.length > hole.length:
+                    continue
+                try:
+                    candidate = _load_candidate(layout, info)
+                    move, reason = _plan_hole_fill_move(
+                        candidate, hole, allow_partial=allow_partial
+                    )
+                except NtfsCompactError as exc:
+                    candidate = None
+                    move = None
+                    reason = str(exc)
+                if move is not None and candidate is not None:
+                    return info, candidate, move
+                reasons[reason] = reasons.get(reason, 0) + 1
+            return None, None, None
+
+        selected = try_entries(allow_partial=False)
+        if selected[0] is not None:
+            return selected[0], selected[1], selected[2], ""
+        selected = try_entries(allow_partial=True)
+        if selected[0] is not None:
+            return selected[0], selected[1], selected[2], ""
+    finally:
+        for entry in held:
+            heapq.heappush(plan.movable_heap, entry)
+
+    if not held:
+        return None, None, None, "no supported movable file extent remains above the gap"
+    if len(held) >= max_attempts:
+        return None, None, None, (
+            f"the first {max_attempts:,} higher movable streams could not safely fill the gap"
+        )
+    if reasons:
+        reason = max(reasons.items(), key=lambda item: item[1])[0]
+        return None, None, None, reason
+    return None, None, None, "no supported movable file extent remains above the gap"
+
+
+def _packing_progress(initial_first_gap: int | None, current_first_gap: int | None,
+                      theoretical_floor: int) -> float:
+    if initial_first_gap is None:
+        return 100.0
+    current = theoretical_floor if current_first_gap is None else current_first_gap
+    possible = max(1, theoretical_floor - initial_first_gap)
+    advanced = max(0, current - initial_first_gap)
+    return max(0.0, min(100.0, 100.0 * advanced / possible))
 
 
 def _attribute_display(info: StreamInfo) -> str:
@@ -1548,8 +1766,9 @@ def _move_extent(layout: NtfsLayout, candidate: Candidate, move: ExtentMove,
     )
     _detail(
         diagnostic,
-        f"MFT record {candidate.record_number}: moved {move.clusters} high-water clusters "
-        f"from {int(move.source_runs[0].lcn)} to extents [{destination_text}]",
+        f"MFT record {candidate.record_number}: moved {move.clusters} clusters "
+        f"from physical extent {int(move.source_runs[0].lcn)} "
+        f"to extents [{destination_text}]",
     )
     _copy_run_sequences(volume, move.source_runs, move.destination_runs)
     state = _journal_state(
@@ -1630,6 +1849,14 @@ def _blocker_message(high_water: int, metadata_high: int,
 
 def compact(device: str, journal_path: Path,
             diagnostic_path: Path | None = None) -> int:
+    """Pack movable NTFS file extents into the lowest internal free gaps.
+
+    The planner maintains a monotonically advancing packed prefix.  For each
+    lowest gap it selects a supported extent above the gap, moves a whole extent
+    or a safe high suffix into the gap, then repeats.  Unsupported NTFS metadata
+    may still leave an unavoidable gap, but unrelated movable data is no longer
+    ignored merely because the physical high-water owner is immovable.
+    """
     if _is_mounted(device):
         raise NtfsCompactError("NTFS compaction requires an unmounted volume")
     if journal_path.exists():
@@ -1654,7 +1881,15 @@ def compact(device: str, journal_path: Path,
             )
         before_high = _highest_used(layout.bitmap, volume.total_clusters)
         allocated = _allocated_cluster_count(layout.bitmap, volume.total_clusters)
-        theoretical_floor = allocated
+        # Cluster zero contains the primary NTFS boot sector even on damaged or
+        # synthetic volumes where $Bitmap fails to reserve it.  Never use it as
+        # a destination.  Normal NTFS volumes also describe $Boot through MFT
+        # record 7, but this independent guard prevents catastrophic overwrite.
+        packing_start = 1
+        theoretical_floor = allocated + (0 if _bit(layout.bitmap, 0) else packing_start)
+        initial_gap_count, initial_gap_clusters, initial_first_gap = _free_gap_stats(
+            layout.bitmap, before_high, packing_start
+        )
         print(
             f"Native NTFS scan found {plan.movable_count:,} movable ordinary file streams "
             f"and tracked {len(plan.streams):,} physical NTFS streams.",
@@ -1672,42 +1907,42 @@ def compact(device: str, journal_path: Path,
             f"cluster {max(0, theoretical_floor - 1):,}.",
             flush=True,
         )
+        if initial_gap_count:
+            print(
+                f"Internal free space before packing: {initial_gap_count:,} gaps containing "
+                f"{initial_gap_clusters:,} clusters "
+                f"({_human_bytes(initial_gap_clusters * volume.cluster_size)}); "
+                f"lowest gap begins at cluster {initial_first_gap:,}.",
+                flush=True,
+            )
+        else:
+            print("No internal free gaps were found below the allocation boundary.", flush=True)
         print("0.00 percent completed", flush=True)
 
         moved_streams: set[tuple[int, int]] = set()
         moved_transactions = 0
         moved_clusters = 0
         blocker = ""
-        last_report_files = 0
+        packed_cursor = initial_first_gap if initial_first_gap is not None else before_high
+        last_report_transactions = 0
         last_report_clusters = 0
         last_report_time = time.monotonic()
+        last_progress = 0.0
 
         while True:
             if _stop_requested:
                 break
             current_high = _highest_used(layout.bitmap, volume.total_clusters)
-            if current_high <= theoretical_floor:
-                break
-            metadata_high, owners = _owners_at_high_water(plan, current_high)
-            if metadata_high != current_high or len(owners) != 1:
-                blocker = _blocker_message(current_high, metadata_high, owners)
-                break
-            owner = owners[0]
-            if not owner.movable:
-                blocker = _blocker_message(current_high, metadata_high, owners)
+            hole = _next_free_run(layout.bitmap, max(packing_start, packed_cursor), current_high)
+            if hole is None:
+                packed_cursor = current_high
                 break
 
-            candidate = _load_candidate(layout, owner)
-            if candidate.highest_lcn != current_high:
+            owner, candidate, move, reason = _select_hole_source(layout, plan, hole)
+            if owner is None or candidate is None or move is None:
                 blocker = (
-                    f"{_stream_display(owner)} changed while the offline compact plan was active; "
-                    "no further streams were moved"
-                )
-                break
-            move, reason = _plan_extent_move(layout, candidate, current_high)
-            if move is None:
-                blocker = (
-                    f"{_stream_display(owner)} at cluster {current_high - 1:,}; {reason}"
+                    f"internal free gap at cluster {int(hole.lcn):,}+{hole.length:,} "
+                    f"({_human_bytes(hole.length * volume.cluster_size)}) cannot be filled; {reason}"
                 )
                 break
 
@@ -1716,36 +1951,44 @@ def compact(device: str, journal_path: Path,
             moved_transactions += 1
             moved_clusters += move.clusters
             _update_moved_stream(plan, owner, move.new_runs)
-            new_high = _highest_used(layout.bitmap, volume.total_clusters)
-            if new_high >= current_high:
-                blocker = (
-                    f"moving {_stream_display(owner)} did not lower the allocated boundary; "
-                    "compaction stopped rather than relocating unrelated lower files"
-                )
-                break
-            progress = _boundary_progress(before_high, new_high, theoretical_floor)
-            print(f"{progress:.2f} percent completed", flush=True)
 
+            # The destination always starts at the current lowest gap, so the
+            # packed prefix advances by exactly the number of clusters copied.
+            packed_cursor = int(hole.lcn) + move.clusters
+            new_high = _highest_used(layout.bitmap, volume.total_clusters)
+            next_gap = _next_free_run(layout.bitmap, packed_cursor, new_high)
+            current_first_gap = int(next_gap.lcn) if next_gap is not None else None
+            progress = _packing_progress(initial_first_gap, current_first_gap, theoretical_floor)
             now = time.monotonic()
-            if (moved_transactions - last_report_files >= REPORT_EVERY_FILES or
+            if progress >= 100.0 or progress - last_progress >= 0.25:
+                print(f"{progress:.2f} percent completed", flush=True)
+                last_progress = progress
+
+            if (moved_transactions - last_report_transactions >= REPORT_EVERY_FILES or
                     moved_clusters - last_report_clusters >= REPORT_EVERY_CLUSTERS or
                     now - last_report_time >= REPORT_EVERY_SECONDS):
+                gap_text = (f"cluster {current_first_gap:,}" if current_first_gap is not None
+                            else "none")
                 print(
-                    f"Moved {len(moved_streams):,} high-water file streams in "
-                    f"{moved_transactions:,} transactions "
-                    f"({_human_bytes(moved_clusters * volume.cluster_size)}); "
-                    f"current high-water cluster {new_high - 1:,}.",
+                    f"Filled {moved_transactions:,} internal-gap transactions using "
+                    f"{len(moved_streams):,} file streams "
+                    f"({_human_bytes(moved_clusters * volume.cluster_size)} moved); "
+                    f"lowest remaining gap: {gap_text}.",
                     flush=True,
                 )
-                last_report_files = moved_transactions
+                last_report_transactions = moved_transactions
                 last_report_clusters = moved_clusters
                 last_report_time = now
 
         after_high = _highest_used(layout.bitmap, volume.total_clusters)
+        final_gap_count, final_gap_clusters, final_first_gap = _free_gap_stats(
+            layout.bitmap, after_high, packing_start
+        )
         reduced = max(0, before_high - after_high)
+        filled = max(0, initial_gap_clusters - final_gap_clusters)
         print(
-            f"Native NTFS compact moved {len(moved_streams):,} file streams in "
-            f"{moved_transactions:,} transactions and {moved_clusters:,} clusters "
+            f"Native NTFS compact used {len(moved_streams):,} file streams in "
+            f"{moved_transactions:,} transactions and moved {moved_clusters:,} clusters "
             f"({_human_bytes(moved_clusters * volume.cluster_size)}).",
             flush=True,
         )
@@ -1759,22 +2002,38 @@ def compact(device: str, journal_path: Path,
                 f"({_human_bytes(reduced * volume.cluster_size)}).",
                 flush=True,
             )
-        else:
+        if initial_first_gap is not None:
+            final_gap_text = (f"cluster {final_first_gap:,}" if final_first_gap is not None
+                              else "the allocation boundary")
             print(
-                "No effective NTFS volume compaction was achieved; the allocated high-water "
-                "boundary did not move.",
+                f"Lowest internal free gap advanced from cluster {initial_first_gap:,} "
+                f"to {final_gap_text}.",
+                flush=True,
+            )
+        print(
+            f"Internal free space below the final boundary: {final_gap_count:,} gaps containing "
+            f"{final_gap_clusters:,} clusters "
+            f"({_human_bytes(final_gap_clusters * volume.cluster_size)}).",
+            flush=True,
+        )
+        if filled:
+            print(
+                f"Net internal-gap reduction: {filled:,} clusters "
+                f"({_human_bytes(filled * volume.cluster_size)}).",
                 flush=True,
             )
         if blocker:
             print(f"Compaction limited by {blocker}.", flush=True)
+        elif final_gap_count == 0:
+            print(
+                "All free clusters below the allocation boundary were eliminated; "
+                "free space is consolidated at the physical end of the volume.",
+                flush=True,
+            )
         elif after_high <= theoretical_floor:
             print("The allocation boundary reached the theoretical packed limit.", flush=True)
-        print(
-            "Only the stream that currently owns the physical high-water cluster is considered; "
-            "its high extent may be split across several lower free extents, while unrelated lower "
-            "files are not moved.",
-            flush=True,
-        )
+        if moved_transactions == 0 and initial_gap_count:
+            print("No internal NTFS gaps could be removed in this run.", flush=True)
         if _stop_requested:
             print("Stopped safely after the current NTFS stream transaction.", flush=True)
         return 0
@@ -1782,7 +2041,6 @@ def compact(device: str, journal_path: Path,
         if diagnostic is not None:
             diagnostic.close()
         _close_volume(volume)
-
 
 def _validate_confirmation(device: str, confirmed: str | None, write: bool) -> None:
     if not write:

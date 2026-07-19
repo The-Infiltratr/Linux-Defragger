@@ -1,13 +1,12 @@
-# Linux Defragger 1.8.0 package revision 10
+# Linux Defragger 1.8.0 package revision 11
 
-- Replaced whole-file contiguous NTFS relocation with high-water extent relocation.
-- A large file no longer needs one lower free run equal to its complete size.
-- The engine can move only the extent or suffix that owns the final allocated cluster.
-- One logical source extent can be copied into several lower physical free extents in a single journalled transaction.
-- Mapping pairs are rebuilt while preserving the file's logical VCN order.
-- When the new mapping pairs need more room, the data attribute is expanded safely within unused space in the existing MFT record; `$ATTRIBUTE_LIST` creation remains unsupported and is not attempted.
-- Recovery journal schema 3 records the exact released and destination extents. Revision 10 can still recover schema-2 journals created by revisions 7 through 9.
-- Corrected NTFS mapping-pair run-length encoding so positive lengths with the high bit set receive the required sign-preserving zero byte.
-- Added multi-extent forward-recovery and rollback tests plus an independently formatted real NTFS split-hole test.
-- Python bytecode generation is disabled by the launcher, and package upgrade cleanup removes stale `__pycache__` directories.
+- Replaced the NTFS high-water-only planner with genuine lowest-gap-first compaction.
+- Compact now fills the earliest free extent inside the allocated region using supported file extents from higher physical locations.
+- An immovable object at the physical end no longer prevents lower holes from being filled by unrelated movable files.
+- Whole source extents are preferred to minimise additional fragmentation; safe suffix splitting is used only when a whole extent cannot fill the current gap.
+- The packed prefix advances monotonically, driving free space toward the physical end of the NTFS volume.
+- Progress is based on movement of the lowest remaining internal gap rather than only on high-water reduction.
+- The final report includes the number and size of free gaps remaining below the allocation boundary and names the first gap that cannot be filled.
+- Cluster zero is independently protected as the NTFS boot-sector cluster even if a malformed or synthetic `$Bitmap` incorrectly marks it free.
+- Transaction journalling, forward recovery, rollback recovery, volume dirty-state handling, multi-extent mapping pairs and MFT-record growth remain unchanged.
 - There remains no NTFS-3G runtime dependency.
